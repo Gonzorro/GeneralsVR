@@ -35,6 +35,7 @@
 #include "GameClient/GameClient.h"
 #include "GameClient/DrawableInfo.h"
 #include "GameClient/InGameUI.h"
+#include "GameClient/CommandXlat.h"
 #include "GameLogic/Object.h"
 #include "GameClient/View.h"
 #include "GameClient/Mouse.h"
@@ -48,6 +49,7 @@
 #include "WW3D2/dx8wrapper.h"
 #include "WW3D2/line3d.h"
 #include "WW3D2/rendobj.h"
+#include "WW3D2/sphereobj.h"
 #include "WW3D2/scene.h"
 #include "WW3D2/ww3d.h"
 #include "WWMath/lineseg.h"
@@ -136,14 +138,24 @@ VRControls::VRControls()
 		m_boxLines[i]->Set_Hidden(true);
 	}
 
-	// A short post over each selected unit. Deliberately thin and short: enough to find your
-	// army at a glance, not enough to clutter the battlefield.
+	// A green bead over each selected unit, with its health slung underneath.
 	for (Int i = 0; i < MAX_SELECTION_MARKERS; ++i)
 	{
-		m_selectionMarkers[i] = NEW_REF(Line3DClass, (Vector3(0.0f, 0.0f, 0.0f),
-			Vector3(0.0f, 0.0f, 1.0f), 1.0f, 0.30f, 1.0f, 0.45f, 0.8f));
-		m_rayScene->Add_Render_Object(m_selectionMarkers[i]);
-		m_selectionMarkers[i]->Set_Hidden(true);
+		m_selectionBeads[i] = NEW_REF(SphereRenderObjClass, ());
+		m_selectionBeads[i]->Set_Color(Vector3(0.25f, 1.0f, 0.35f));
+		m_selectionBeads[i]->Set_Alpha(0.85f);
+		m_rayScene->Add_Render_Object(m_selectionBeads[i]);
+		m_selectionBeads[i]->Set_Hidden(true);
+
+		m_healthBack[i] = NEW_REF(Line3DClass, (Vector3(0.0f, 0.0f, 0.0f), Vector3(0.0f, 0.0f, 1.0f),
+			1.0f, 0.75f, 0.10f, 0.10f, 0.9f));
+		m_rayScene->Add_Render_Object(m_healthBack[i]);
+		m_healthBack[i]->Set_Hidden(true);
+
+		m_healthFill[i] = NEW_REF(Line3DClass, (Vector3(0.0f, 0.0f, 0.0f), Vector3(0.0f, 0.0f, 1.0f),
+			1.0f, 0.25f, 1.0f, 0.30f, 1.0f));
+		m_rayScene->Add_Render_Object(m_healthFill[i]);
+		m_healthFill[i]->Set_Hidden(true);
 	}
 
 	m_boxing = FALSE;
@@ -535,8 +547,35 @@ void VRControls::updateSelectionMarkers()
 		if (selected != nullptr)
 		{
 			const Real scale = TheOpenXR->getWorldUnitsPerMeter();
-			const Real height = 0.10f * scale;	// a hand's breadth, whatever size the player is
-			const Real width = 0.006f * scale;
+
+			// Everything is sized in metres of the PLAYER, so a bead stays a bead whether you
+			// are a giant over a tabletop or standing among the tanks.
+			const Real beadRadius = 0.012f * scale;
+			const Real lift = 0.05f * scale;
+			const Real barWidth = 0.10f * scale;
+			const Real barThickness = 0.008f * scale;
+
+			// Lay the health bar broadside to the player, so it reads from wherever they stand.
+			Matrix3D anchor;
+			Vector3 barRight(1.0f, 0.0f, 0.0f);
+			if (getAnchor((W3DView *)TheTacticalView, anchor))
+			{
+				const VREyeView &head = TheOpenXR->getEyeView(0);
+				Quaternion headQuat(head.quatX, head.quatY, head.quatZ, head.quatW);
+				Matrix3D headRot;
+				Build_Matrix3D(headQuat, headRot);
+				Matrix3D headWorld;
+				Matrix3D::Multiply(anchor, headRot, &headWorld);
+
+				Vector3 gaze = -headWorld.Get_Z_Vector();
+				gaze.Z = 0.0f;
+				if (gaze.Length2() > 0.0001f)
+				{
+					gaze.Normalize();
+					Vector3::Cross_Product(gaze, Vector3(0.0f, 0.0f, 1.0f), &barRight);
+					barRight.Normalize();
+				}
+			}
 
 			for (DrawableList::const_iterator it = selected->begin();
 				it != selected->end() && used < MAX_SELECTION_MARKERS; ++it)
@@ -549,11 +588,47 @@ void VRControls::updateSelectionMarkers()
 				if (pos == nullptr)
 					continue;
 
-				const Vector3 base(pos->x, pos->y, pos->z + height * 0.35f);
-				const Vector3 top(pos->x, pos->y, pos->z + height * 1.35f);
+				// The bead sits above the unit's own height, not above its feet, or it would be
+				// buried inside anything taller than a rifleman.
+				Real top = pos->z + lift;
+				const Object *obj = draw->getObject();
+				if (obj != nullptr)
+					top = pos->z + obj->getGeometryInfo().getMaxHeightAbovePosition() + lift;
 
-				m_selectionMarkers[used]->Reset(base, top, width);
-				m_selectionMarkers[used]->Set_Hidden(false);
+				const Vector3 beadPos(pos->x, pos->y, top + beadRadius * 2.0f);
+				m_selectionBeads[used]->Set_Position(beadPos);
+				m_selectionBeads[used]->Set_Extent(Vector3(beadRadius, beadRadius, beadRadius));
+				m_selectionBeads[used]->Set_Hidden(false);
+
+				// Health, slung just under the bead.
+				Real health = 1.0f;
+				if (obj != nullptr && obj->getBodyModule() != nullptr)
+				{
+					const Real maxHealth = obj->getBodyModule()->getMaxHealth();
+					if (maxHealth > 0.0f)
+						health = obj->getBodyModule()->getHealth() / maxHealth;
+				}
+				if (health < 0.0f) health = 0.0f;
+				if (health > 1.0f) health = 1.0f;
+
+				const Vector3 barCentre(pos->x, pos->y, top);
+				const Vector3 barLeft = barCentre - barRight * (barWidth * 0.5f);
+				const Vector3 barEnd = barCentre + barRight * (barWidth * 0.5f);
+				const Vector3 fillEnd = barLeft + barRight * (barWidth * health);
+
+				m_healthBack[used]->Reset(barLeft, barEnd, barThickness);
+				m_healthBack[used]->Set_Hidden(false);
+
+				if (health > 0.01f)
+				{
+					m_healthFill[used]->Reset(barLeft, fillEnd, barThickness * 1.25f);
+					m_healthFill[used]->Set_Hidden(false);
+				}
+				else
+				{
+					m_healthFill[used]->Set_Hidden(true);
+				}
+
 				++used;
 			}
 		}
@@ -561,8 +636,9 @@ void VRControls::updateSelectionMarkers()
 
 	for (Int i = used; i < MAX_SELECTION_MARKERS; ++i)
 	{
-		if (m_selectionMarkers[i] != nullptr)
-			m_selectionMarkers[i]->Set_Hidden(true);
+		if (m_selectionBeads[i] != nullptr) m_selectionBeads[i]->Set_Hidden(true);
+		if (m_healthBack[i] != nullptr) m_healthBack[i]->Set_Hidden(true);
+		if (m_healthFill[i] != nullptr) m_healthFill[i]->Set_Hidden(true);
 	}
 }
 
@@ -572,22 +648,84 @@ void VRControls::updateSelectionMarkers()
 //-------------------------------------------------------------------------------------------------
 void VRControls::commandUnderRay(const Vector3 &origin, const Vector3 &dir)
 {
-	if (TheMessageStream == nullptr)
+	if (TheGameClient == nullptr)
 		return;
 
+	// Hand it to the engine's own context evaluation - the very thing a right-click goes
+	// through. It decides between attack, capture, enter, repair, garrison and plain movement
+	// by looking at what is under the pointer and what is selected. Hard-coding attack-or-move
+	// here is why a building could never be captured: there is no message for "capture", only a
+	// context that resolves to one.
 	Drawable *draw = pickDrawable(origin, dir);
-	if (draw != nullptr && draw->getObject() != nullptr)
-	{
-		GameMessage *msg = TheMessageStream->appendMessage(GameMessage::MSG_DO_ATTACK_OBJECT);
-		msg->appendObjectIDArgument(draw->getObject()->getID());
-		return;
-	}
 
 	Coord3D ground;
-	if (traceTerrain(origin, dir, ground))
+	const Bool onGround = traceTerrain(origin, dir, ground);
+	if (draw == nullptr && !onGround)
+		return;
+
+	const Coord3D *pos = onGround ? &ground : nullptr;
+	if (pos == nullptr && draw != nullptr)
+		pos = draw->getPosition();
+
+	TheGameClient->evaluateContextCommand(draw, pos, CommandTranslator::DO_COMMAND);
+}
+
+//-------------------------------------------------------------------------------------------------
+/** The reticle. A cursor cannot follow the laser out here, so the BEAM is the cursor: it takes
+	* the colour of whatever the game would do if you pressed the button now. Red to attack, amber
+	* to take a building, green to move. You aim, and the beam tells you what will happen. */
+//-------------------------------------------------------------------------------------------------
+void VRControls::getReticleColor(const Vector3 &origin, const Vector3 &dir,
+	Real &outR, Real &outG, Real &outB) const
+{
+	// Idle: the plain pointing colour.
+	outR = 0.35f; outG = 0.85f; outB = 1.00f;
+
+	if (TheGameClient == nullptr || TheInGameUI == nullptr)
+		return;
+	if (TheInGameUI->getAllSelectedDrawables() == nullptr
+		|| TheInGameUI->getAllSelectedDrawables()->empty())
+		return;	// nothing selected: nothing would happen, so promise nothing
+
+	Drawable *draw = pickDrawable(origin, dir);
+	Coord3D ground;
+	const Bool onGround = traceTerrain(origin, dir, ground);
+
+	const Coord3D *pos = onGround ? &ground : (draw != nullptr ? draw->getPosition() : nullptr);
+	if (pos == nullptr)
+		return;
+
+	const GameMessage::Type command =
+		TheGameClient->evaluateContextCommand(draw, pos, CommandTranslator::EVALUATE_ONLY);
+
+	switch (command)
 	{
-		GameMessage *msg = TheMessageStream->appendMessage(GameMessage::MSG_DO_MOVETO);
-		msg->appendLocationArgument(ground);
+		case GameMessage::MSG_DO_ATTACK_OBJECT:
+		case GameMessage::MSG_DO_FORCE_ATTACK_OBJECT:
+		case GameMessage::MSG_DO_FORCE_ATTACK_GROUND:
+		case GameMessage::MSG_DO_WEAPON_AT_OBJECT:
+		case GameMessage::MSG_DO_WEAPON_AT_LOCATION:
+			outR = 1.00f; outG = 0.20f; outB = 0.15f;	// attack
+			break;
+
+		case GameMessage::MSG_DO_SPECIAL_POWER_AT_OBJECT:
+		case GameMessage::MSG_DO_SPECIAL_POWER_AT_LOCATION:
+		case GameMessage::MSG_ENTER:
+		case GameMessage::MSG_GET_REPAIRED:
+		case GameMessage::MSG_GET_HEALED:
+		case GameMessage::MSG_DOCK:
+		case GameMessage::MSG_DO_REPAIR:
+		case GameMessage::MSG_RESUME_CONSTRUCTION:
+			outR = 1.00f; outG = 0.75f; outB = 0.15f;	// take it, enter it, fix it
+			break;
+
+		case GameMessage::MSG_DO_MOVETO:
+		case GameMessage::MSG_DO_ATTACKMOVETO:
+			outR = 0.30f; outG = 1.00f; outB = 0.40f;	// move
+			break;
+
+		default:
+			break;
 	}
 }
 
@@ -1009,6 +1147,16 @@ void VRControls::updateRays(W3DView *view)
 
 		const Vector3 end = origin + dir * length;
 		line->Reset(origin, end, RAY_WIDTH_METERS * scale);
+
+		// The beam IS the reticle: it takes the colour of whatever the game would do if the
+		// player pressed the button now. Only the pointing hand - the other stays its own colour.
+		if (inGame && hand == VR_HAND_RIGHT)
+		{
+			Real r, g, b;
+			getReticleColor(origin, dir, r, g, b);
+			line->Re_Color(r, g, b);
+		}
+
 		line->Set_Hidden(false);
 		m_rayVisible[hand] = TRUE;
 	}

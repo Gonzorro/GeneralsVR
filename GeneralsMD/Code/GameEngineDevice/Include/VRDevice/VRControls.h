@@ -97,10 +97,19 @@ private:
 	/// A marker floating over everything currently selected - without one, a selection made from
 	/// across the map is invisible.
 	void updateSelectionMarkers();
+	/// What the game would do if the trigger went now - the beam wears this as its colour, since
+	/// a mouse cursor cannot follow a laser out into the world.
+	void getReticleColor(const Vector3 &origin, const Vector3 &dir,
+		Real &outR, Real &outG, Real &outB) const;
 
 	enum { MAX_SELECTION_MARKERS = 40 };
 	class Line3DClass *m_boxLines[4];
-	class Line3DClass *m_selectionMarkers[MAX_SELECTION_MARKERS];
+	/// A bead over each selected unit, and its health beneath: red for what it has lost, green
+	/// for what it has left. The flat game paints these in screen space, which does not exist
+	/// out here, so they are built from world geometry instead.
+	class SphereRenderObjClass *m_selectionBeads[MAX_SELECTION_MARKERS];
+	class Line3DClass *m_healthBack[MAX_SELECTION_MARKERS];
+	class Line3DClass *m_healthFill[MAX_SELECTION_MARKERS];
 	Bool m_boxing;                ///< the trigger is down and the sweep has grown past a nudge
 	Bool m_boxArmed;              ///< the trigger is down; we are watching to see if it becomes a sweep
 	Coord3D m_boxStart;
