@@ -1815,7 +1815,29 @@ void W3DDisplay::drawVRScene( W3DView *view )
 		return;
 
 	const Real scale = TheOpenXR->getWorldUnitsPerMeter();
-	const Matrix3D anchor = tacticalCamera->Get_Transform();
+
+	// The anchor is where the headset floats in the world. It must be *upright*: if we simply
+	// reused the tactical camera's transform, its 37.5 degree downward pitch would come with it
+	// and the whole world would sit at an angle - in a headset that reads as standing on a
+	// slope, which is exactly the kind of vestibular mismatch that makes people ill. So we keep
+	// the tactical camera's position and yaw but discard its pitch and roll: the player looks
+	// out level, and the battlefield lies below them like a table.
+	const Matrix3D &tacticalTransform = tacticalCamera->Get_Transform();
+	const Vector3 worldUp(0.0f, 0.0f, 1.0f);	// the game world is Z-up
+
+	// The camera looks down its -Z; flatten that onto the ground plane to recover pure yaw.
+	Vector3 forward = -tacticalTransform.Get_Z_Vector();
+	forward.Z = 0.0f;
+	if (forward.Length2() < 0.0001f)
+		forward = Vector3(1.0f, 0.0f, 0.0f);	// camera pointing straight down: pick any heading
+	forward.Normalize();
+
+	Vector3 right;
+	Vector3::Cross_Product(forward, worldUp, &right);
+	right.Normalize();
+
+	// W3D camera axes: X right, Y up, Z backward.
+	const Matrix3D anchor(right, worldUp, -forward, tacticalCamera->Get_Position());
 
 	// One reusable camera for the eye passes; the tactical camera is left untouched so the
 	// monitor pass that follows still renders the normal flat view.
