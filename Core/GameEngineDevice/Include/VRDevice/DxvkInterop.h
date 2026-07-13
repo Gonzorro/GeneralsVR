@@ -28,17 +28,8 @@
 #include <unknwn.h>
 #include <stdint.h>
 
-// Opaque Vulkan handle types (32-bit x86: dispatchable handles are pointers,
-// non-dispatchable handles are 64-bit integers). Full Vulkan headers arrive with the
-// stereo renderer; the bootstrap probe only passes these through.
-typedef struct VkInstance_T*       VkInstance;
-typedef struct VkPhysicalDevice_T* VkPhysicalDevice;
-typedef struct VkDevice_T*         VkDevice;
-typedef struct VkQueue_T*          VkQueue;
-typedef unsigned __int64           VkImage;
-typedef int                        VkImageLayout;
-struct VkImageSubresourceRange;
-struct VkImageCreateInfo;
+#include <vulkan/vulkan.h>
+
 struct D3D9VkExtImageDesc;
 struct IDirect3DResource9;
 

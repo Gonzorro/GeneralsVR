@@ -17,16 +17,41 @@
 */
 
 // FILE: OpenXRManager.h /////////////////////////////////////////////////////////////////////////
-// GeneralsVR @feature OpenXR session lifecycle for the VR port. Phase 1 scope: instance and
-// system bootstrap with graceful fallback to flat rendering when no runtime or headset is
-// available. Swapchains and the frame loop arrive with the stereo renderer.
+// GeneralsVR @feature OpenXR session, swapchains and frame loop for the VR port.
+//
+// The game renders through DXVK (D3D8 -> Vulkan), so the OpenXR session is created over the
+// VkDevice DXVK already owns (XR_KHR_vulkan_enable). Per frame the engine renders the 3D scene
+// once per eye into D3D8 render targets we own; those are copied on the Vulkan level into the
+// runtime's swapchain images and submitted as a projection layer.
+//
+// Everything degrades gracefully: with no runtime, no headset, or no DXVK the game keeps
+// rendering flat and every VR entry point becomes a no-op.
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 #pragma once
 
 #include "Lib/BaseType.h"
 
+#define XR_USE_GRAPHICS_API_VULKAN
+#include <vulkan/vulkan.h>
 #include <openxr/openxr.h>
+#include <openxr/openxr_platform.h>
+
+#include <vector>
+
+struct IDirect3DDevice8;
+struct IDirect3DTexture8;
+struct IDirect3DSurface8;
+
+/// One eye's head pose and projection for the current frame, in OpenXR conventions:
+/// right-handed, -Z forward, +Y up, metres. Angles are the (signed) frustum half-angles.
+struct VREyeView
+{
+	Real quatX, quatY, quatZ, quatW;
+	Real posX, posY, posZ;          ///< metres, relative to the VR reference space origin
+	Real angleLeft, angleRight;     ///< radians; left is negative
+	Real angleUp, angleDown;        ///< radians; down is negative
+};
 
 class OpenXRManager
 {
@@ -40,62 +65,105 @@ public:
 	void shutdown();
 
 	Bool isAvailable() const { return m_systemId != XR_NULL_SYSTEM_ID; }
+	Bool hasSession() const { return m_session != XR_NULL_HANDLE; }
 
-	XrInstance getInstance() const { return m_instance; }
-	XrSystemId getSystemId() const { return m_systemId; }
+	/// True between beginFrame() and submitEyes() while the runtime wants frames. The engine
+	/// only renders eyes when this is true.
+	Bool isFrameActive() const { return m_frameActive; }
 
-	/// Recommended per-eye render target size reported by the runtime.
+	/// Locate DXVK's Vulkan device behind the game's D3D8 device, create the session,
+	/// swapchains, eye render targets and the Vulkan copy machinery. Safe to call with a
+	/// null device or without DXVK: VR simply stays unavailable.
+	/// Pass DX8Wrapper::_Get_D3D_Device8().
+	void initGraphics(IDirect3DDevice8* d3d8Device);
+
+	/// Per-frame, from the engine's main update, before rendering: drains runtime events,
+	/// drives the session lifecycle, and (when running) starts a frame and locates the eyes.
+	void beginFrame();
+
+	Int getEyeCount() const { return m_eyeCount; }
 	Int getEyeWidth() const { return m_eyeWidth; }
 	Int getEyeHeight() const { return m_eyeHeight; }
 
-	/// Phase 2 spike: when running under DXVK's d3d8.dll, locate DXVK's D3D9 Vulkan interop
-	/// behind the game's D3D8 device and log the Vulkan handles OpenXR session creation will
-	/// need. Safe no-op on native D3D8. Pass DX8Wrapper::_Get_D3D_Device8().
-	void probeDxvkInterop(void* d3d8Device);
+	/// Valid only while isFrameActive().
+	const VREyeView& getEyeView(Int eye) const { return m_eyeViews[eye]; }
 
-	Bool hasDxvkVulkanDevice() const { return m_vkDevice != nullptr; }
-	Bool hasSession() const { return m_session != XR_NULL_HANDLE; }
+	/// The D3D8 surface the engine should render this eye into (eye-sized, colour only;
+	/// pair it with getDepthSurface()).
+	IDirect3DSurface8* getEyeSurface(Int eye) const { return m_eyeSurfaces[eye]; }
+	IDirect3DSurface8* getDepthSurface() const { return m_depthSurface; }
 
-	/// Per-frame service from the engine's main loop: drains session events (begins/ends
-	/// the session as the runtime dictates) and, while running, does one
-	/// xrWaitFrame/xrBeginFrame/xrEndFrame cycle. First-light scope: submits zero layers,
-	/// which visibly switches the headset into the app (black void, head tracking live).
-	void pumpFrame();
+	/// Copy the rendered eye render targets into the runtime's swapchain images and submit
+	/// them as a projection layer. Ends the frame either way, so a frame with nothing
+	/// rendered still keeps the session alive.
+	void submitEyes();
+
+	/// World units per real-world metre - the tabletop scale. Head motion and eye separation
+	/// are multiplied by this when composing the VR camera.
+	Real getWorldUnitsPerMeter() const { return m_worldUnitsPerMeter; }
 
 private:
+	enum { MAX_EYES = 2 };
+
 	Bool hasExtension(const char* name) const;
-
-	/// Phase 2 spike: create the XrSession (and a trial swapchain) over DXVK's Vulkan
-	/// device via XR_KHR_vulkan_enable. Logs every step; failure leaves the game flat.
-	void tryCreateSession();
-
-	/// Log what the OpenXR runtime requires from a Vulkan instance/device
-	/// (XR_KHR_vulkan_enable), so we can verify DXVK's device satisfies it.
 	void probeVulkanRequirements();
+	Bool findDxvkInterop(IDirect3DDevice8* d3d8Device);
+	Bool createSession();
+	Bool createSwapchains();
+	Bool createEyeTargets(IDirect3DDevice8* d3d8Device);
+	Bool loadVulkanFunctions();
+	Bool createVulkanCopyResources();
+	/// VkImage backing a D3D8 texture/surface created by DXVK (via ID3D9VkInteropTexture).
+	VkImage getVulkanImage(IUnknown* d3d8Resource, VkImageLayout* outLayout);
+	/// Record and submit one image copy per eye on DXVK's queue.
+	Bool copyEyesToSwapchains(const UnsignedInt* imageIndices);
 
 	XrInstance m_instance;
 	XrSystemId m_systemId;
 	XrSession m_session;
-	XrSwapchain m_trialSwapchain;
+	XrSpace m_appSpace;
 	XrSessionState m_sessionState;
 	XrEnvironmentBlendMode m_blendMode;
 	Bool m_sessionRunning;
-	Bool m_endFrameFailLogged;
-	UnsignedInt m_framesSubmitted;
+	Bool m_frameActive;
+	XrTime m_predictedDisplayTime;
+
+	XrSwapchain m_swapchains[MAX_EYES];
+	std::vector<VkImage> m_swapchainImages[MAX_EYES];
+	VREyeView m_eyeViews[MAX_EYES];
+	XrPosef m_eyePoses[MAX_EYES];
+	XrFovf m_eyeFovs[MAX_EYES];
+
+	Int m_eyeCount;
 	Int m_eyeWidth;
 	Int m_eyeHeight;
+	Real m_worldUnitsPerMeter;
+
 	Bool m_supportsVulkan;   ///< XR_KHR_vulkan_enable2
-	Bool m_supportsVulkan1;  ///< XR_KHR_vulkan_enable (works with an existing VkDevice - our path)
+	Bool m_supportsVulkan1;  ///< XR_KHR_vulkan_enable (accepts DXVK's existing VkDevice)
 	Bool m_supportsD3D11;
 
-	// DXVK interop results (Phase 2 spike; all null when not running under DXVK)
+	// DXVK / Vulkan interop
 	struct ID3D9VkInteropDevice* m_dxvkInterop;
-	struct VkInstance_T*       m_vkInstance;
-	struct VkPhysicalDevice_T* m_vkPhysicalDevice;
-	struct VkDevice_T*         m_vkDevice;
-	struct VkQueue_T*          m_vkQueue;
+	VkInstance m_vkInstance;
+	VkPhysicalDevice m_vkPhysicalDevice;
+	VkDevice m_vkDevice;
+	VkQueue m_vkQueue;
 	UnsignedInt m_vkQueueIndex;
 	UnsignedInt m_vkQueueFamilyIndex;
+	VkCommandPool m_vkCommandPool;
+	VkCommandBuffer m_vkCommandBuffer;
+	VkFence m_vkFence;
+
+	// Eye render targets (D3D8 side) and their Vulkan images
+	IDirect3DTexture8* m_eyeTextures[MAX_EYES];
+	IDirect3DSurface8* m_eyeSurfaces[MAX_EYES];
+	IDirect3DSurface8* m_depthSurface;
+	VkImage m_eyeImages[MAX_EYES];
+	VkImageLayout m_eyeImageLayout;
+
+	UnsignedInt m_framesSubmitted;
+	Bool m_submitFailLogged;
 };
 
 extern OpenXRManager* TheOpenXR; ///< nullptr unless the game was launched with -vr

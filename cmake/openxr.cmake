@@ -9,3 +9,13 @@ FetchContent_Declare(
 )
 
 FetchContent_MakeAvailable(openxr)
+
+# GeneralsVR: Vulkan headers only (no loader - we call through DXVK's device and
+# resolve entry points from vulkan-1.dll at runtime).
+FetchContent_Declare(
+    vulkan_headers
+    GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
+    GIT_TAG        v1.4.309
+)
+
+FetchContent_MakeAvailable(vulkan_headers)

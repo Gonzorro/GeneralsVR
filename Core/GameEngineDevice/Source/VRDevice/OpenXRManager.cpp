@@ -17,7 +17,7 @@
 */
 
 // FILE: OpenXRManager.cpp ////////////////////////////////////////////////////////////////////////
-// GeneralsVR @feature OpenXR instance/system bootstrap. See OpenXRManager.h.
+// GeneralsVR @feature OpenXR session, swapchains and stereo frame submission. See OpenXRManager.h.
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 #include "VRDevice/OpenXRManager.h"
@@ -27,35 +27,99 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <d3d8.h>
 
 #include <string.h>
 #include <vector>
 
 OpenXRManager* TheOpenXR = nullptr;
 
+//-------------------------------------------------------------------------------------------------
+// Vulkan entry points, resolved from the loader at runtime. We never create a Vulkan instance or
+// device ourselves - both belong to DXVK - so only the handful of functions used by the eye copy
+// are needed.
+//-------------------------------------------------------------------------------------------------
+namespace
+{
+	struct VulkanApi
+	{
+		PFN_vkGetDeviceProcAddr getDeviceProcAddr;
+		PFN_vkCreateCommandPool createCommandPool;
+		PFN_vkDestroyCommandPool destroyCommandPool;
+		PFN_vkAllocateCommandBuffers allocateCommandBuffers;
+		PFN_vkBeginCommandBuffer beginCommandBuffer;
+		PFN_vkEndCommandBuffer endCommandBuffer;
+		PFN_vkResetCommandBuffer resetCommandBuffer;
+		PFN_vkCmdPipelineBarrier cmdPipelineBarrier;
+		PFN_vkCmdCopyImage cmdCopyImage;
+		PFN_vkCmdBlitImage cmdBlitImage;
+		PFN_vkQueueSubmit queueSubmit;
+		PFN_vkCreateFence createFence;
+		PFN_vkDestroyFence destroyFence;
+		PFN_vkWaitForFences waitForFences;
+		PFN_vkResetFences resetFences;
+		PFN_vkDeviceWaitIdle deviceWaitIdle;
+	};
+
+	VulkanApi g_vk = {};
+
+	// GeneralsVR: the eye render targets are D3DFMT_A8R8G8B8, which DXVK backs with
+	// VK_FORMAT_B8G8R8A8_UNORM. Copying those bytes verbatim into a *_SRGB swapchain image of
+	// the same layout is what we want: the game already writes sRGB-encoded colour, and the
+	// compositor expects sRGB-encoded content in an sRGB format. Preferring a BGRA_SRGB
+	// swapchain therefore lets us use a raw vkCmdCopyImage (no channel swap, no gamma applied).
+	const int64_t kPreferredSwapchainFormats[] =
+	{
+		VK_FORMAT_B8G8R8A8_SRGB,   // ideal: byte-identical to the eye targets
+		VK_FORMAT_R8G8B8A8_SRGB,   // needs a blit (channel swap); gamma will be slightly off
+		VK_FORMAT_B8G8R8A8_UNORM,
+		VK_FORMAT_R8G8B8A8_UNORM,
+	};
+}
+
+//-------------------------------------------------------------------------------------------------
 OpenXRManager::OpenXRManager()
 	: m_instance(XR_NULL_HANDLE)
 	, m_systemId(XR_NULL_SYSTEM_ID)
 	, m_session(XR_NULL_HANDLE)
-	, m_trialSwapchain(XR_NULL_HANDLE)
+	, m_appSpace(XR_NULL_HANDLE)
 	, m_sessionState(XR_SESSION_STATE_UNKNOWN)
 	, m_blendMode(XR_ENVIRONMENT_BLEND_MODE_OPAQUE)
 	, m_sessionRunning(FALSE)
-	, m_endFrameFailLogged(FALSE)
-	, m_framesSubmitted(0)
+	, m_frameActive(FALSE)
+	, m_predictedDisplayTime(0)
+	, m_eyeCount(0)
 	, m_eyeWidth(0)
 	, m_eyeHeight(0)
+	, m_worldUnitsPerMeter(500.0f)
 	, m_supportsVulkan(FALSE)
 	, m_supportsVulkan1(FALSE)
 	, m_supportsD3D11(FALSE)
 	, m_dxvkInterop(nullptr)
-	, m_vkInstance(nullptr)
-	, m_vkPhysicalDevice(nullptr)
-	, m_vkDevice(nullptr)
-	, m_vkQueue(nullptr)
+	, m_vkInstance(VK_NULL_HANDLE)
+	, m_vkPhysicalDevice(VK_NULL_HANDLE)
+	, m_vkDevice(VK_NULL_HANDLE)
+	, m_vkQueue(VK_NULL_HANDLE)
 	, m_vkQueueIndex(0)
 	, m_vkQueueFamilyIndex(0)
+	, m_vkCommandPool(VK_NULL_HANDLE)
+	, m_vkCommandBuffer(VK_NULL_HANDLE)
+	, m_vkFence(VK_NULL_HANDLE)
+	, m_depthSurface(nullptr)
+	, m_eyeImageLayout(VK_IMAGE_LAYOUT_UNDEFINED)
+	, m_framesSubmitted(0)
+	, m_submitFailLogged(FALSE)
 {
+	for (int i = 0; i < MAX_EYES; ++i)
+	{
+		m_swapchains[i] = XR_NULL_HANDLE;
+		m_eyeTextures[i] = nullptr;
+		m_eyeSurfaces[i] = nullptr;
+		m_eyeImages[i] = VK_NULL_HANDLE;
+		m_eyeViews[i] = VREyeView();
+		m_eyePoses[i] = XrPosef();
+		m_eyeFovs[i] = XrFovf();
+	}
 }
 
 OpenXRManager::~OpenXRManager()
@@ -63,6 +127,7 @@ OpenXRManager::~OpenXRManager()
 	shutdown();
 }
 
+//-------------------------------------------------------------------------------------------------
 Bool OpenXRManager::hasExtension(const char* name) const
 {
 	uint32_t count = 0;
@@ -86,25 +151,22 @@ Bool OpenXRManager::hasExtension(const char* name) const
 	return FALSE;
 }
 
+//-------------------------------------------------------------------------------------------------
 Bool OpenXRManager::init()
 {
-	m_supportsVulkan = hasExtension("XR_KHR_vulkan_enable2");
-	m_supportsVulkan1 = hasExtension("XR_KHR_vulkan_enable");
+	m_supportsVulkan = hasExtension(XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME);
+	m_supportsVulkan1 = hasExtension(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
 	m_supportsD3D11 = hasExtension("XR_KHR_D3D11_enable");
 	DEBUG_LOG(("OpenXR: runtime graphics bindings: vulkan2=%d vulkan1=%d d3d11=%d",
 		m_supportsVulkan, m_supportsVulkan1, m_supportsD3D11));
 
-	if (!m_supportsVulkan && !m_supportsVulkan1 && !m_supportsD3D11)
+	if (!m_supportsVulkan1)
 	{
-		DEBUG_LOG(("OpenXR: no usable graphics binding extension, VR unavailable"));
+		DEBUG_LOG(("OpenXR: XR_KHR_vulkan_enable missing - cannot bind DXVK's device, VR unavailable"));
 		return FALSE;
 	}
 
-	// GeneralsVR: vulkan_enable (v1) is our primary path - it accepts the VkDevice DXVK
-	// already created, whereas vulkan_enable2 requires the runtime to create the device.
-	std::vector<const char*> enabledExts;
-	if (m_supportsVulkan1)
-		enabledExts.push_back("XR_KHR_vulkan_enable");
+	const char* enabledExts[] = { XR_KHR_VULKAN_ENABLE_EXTENSION_NAME };
 
 	XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO};
 	strcpy(ci.applicationInfo.applicationName, "GeneralsVR");
@@ -112,8 +174,8 @@ Bool OpenXRManager::init()
 	strcpy(ci.applicationInfo.engineName, "SAGE-W3D");
 	ci.applicationInfo.engineVersion = 1;
 	ci.applicationInfo.apiVersion = XR_API_VERSION_1_0;
-	ci.enabledExtensionCount = (uint32_t)enabledExts.size();
-	ci.enabledExtensionNames = enabledExts.empty() ? nullptr : enabledExts.data();
+	ci.enabledExtensionCount = 1;
+	ci.enabledExtensionNames = enabledExts;
 
 	XrResult result = xrCreateInstance(&ci, &m_instance);
 	if (XR_FAILED(result))
@@ -150,59 +212,49 @@ Bool OpenXRManager::init()
 	uint32_t viewCount = 0;
 	xrEnumerateViewConfigurationViews(m_instance, m_systemId,
 		XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &viewCount, nullptr);
-	if (viewCount > 0)
+	if (viewCount == 0)
 	{
-		std::vector<XrViewConfigurationView> views(viewCount);
-		for (uint32_t i = 0; i < viewCount; ++i)
-		{
-			views[i] = XrViewConfigurationView{};
-			views[i].type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
-		}
-		if (XR_SUCCEEDED(xrEnumerateViewConfigurationViews(m_instance, m_systemId,
-			XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, viewCount, &viewCount, views.data())))
-		{
-			m_eyeWidth = views[0].recommendedImageRectWidth;
-			m_eyeHeight = views[0].recommendedImageRectHeight;
-			DEBUG_LOG(("OpenXR: %u views, recommended eye target %dx%d", viewCount, m_eyeWidth, m_eyeHeight));
-		}
+		DEBUG_LOG(("OpenXR: no stereo views reported, VR unavailable"));
+		return FALSE;
 	}
 
-	if (m_supportsVulkan1)
-		probeVulkanRequirements();
+	std::vector<XrViewConfigurationView> views(viewCount);
+	for (uint32_t i = 0; i < viewCount; ++i)
+	{
+		views[i] = XrViewConfigurationView{};
+		views[i].type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
+	}
+	if (XR_FAILED(xrEnumerateViewConfigurationViews(m_instance, m_systemId,
+		XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, viewCount, &viewCount, views.data())))
+	{
+		DEBUG_LOG(("OpenXR: could not enumerate view configurations, VR unavailable"));
+		return FALSE;
+	}
+
+	m_eyeCount = (Int)(viewCount < MAX_EYES ? viewCount : MAX_EYES);
+	m_eyeWidth = views[0].recommendedImageRectWidth;
+	m_eyeHeight = views[0].recommendedImageRectHeight;
+	DEBUG_LOG(("OpenXR: %d views, recommended eye target %dx%d", m_eyeCount, m_eyeWidth, m_eyeHeight));
+
+	probeVulkanRequirements();
 
 	DEBUG_LOG(("OpenXR: bootstrap complete, VR available"));
 	return TRUE;
 }
 
 //-------------------------------------------------------------------------------------------------
-// GeneralsVR: XR_KHR_vulkan_enable function types and the graphics-requirements struct, declared
-// locally so the bootstrap needs no Vulkan headers (openxr_platform.h would demand vulkan.h).
-typedef XrResult (XRAPI_PTR *PFN_local_xrGetVulkanExtensionsKHR)(
-	XrInstance, XrSystemId, uint32_t, uint32_t*, char*);
-
-struct LocalXrGraphicsRequirementsVulkanKHR
-{
-	XrStructureType type;
-	void* next;
-	XrVersion minApiVersionSupported;
-	XrVersion maxApiVersionSupported;
-};
-typedef XrResult (XRAPI_PTR *PFN_local_xrGetVulkanGraphicsRequirementsKHR)(
-	XrInstance, XrSystemId, LocalXrGraphicsRequirementsVulkanKHR*);
-
 void OpenXRManager::probeVulkanRequirements()
 {
-	PFN_local_xrGetVulkanGraphicsRequirementsKHR pGetReqs = nullptr;
-	PFN_local_xrGetVulkanExtensionsKHR pGetInstExts = nullptr;
-	PFN_local_xrGetVulkanExtensionsKHR pGetDevExts = nullptr;
+	PFN_xrGetVulkanGraphicsRequirementsKHR pGetReqs = nullptr;
+	PFN_xrGetVulkanInstanceExtensionsKHR pGetInstExts = nullptr;
+	PFN_xrGetVulkanDeviceExtensionsKHR pGetDevExts = nullptr;
 	xrGetInstanceProcAddr(m_instance, "xrGetVulkanGraphicsRequirementsKHR", (PFN_xrVoidFunction*)&pGetReqs);
 	xrGetInstanceProcAddr(m_instance, "xrGetVulkanInstanceExtensionsKHR", (PFN_xrVoidFunction*)&pGetInstExts);
 	xrGetInstanceProcAddr(m_instance, "xrGetVulkanDeviceExtensionsKHR", (PFN_xrVoidFunction*)&pGetDevExts);
 
 	if (pGetReqs != nullptr)
 	{
-		LocalXrGraphicsRequirementsVulkanKHR reqs = {};
-		reqs.type = XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR;
+		XrGraphicsRequirementsVulkanKHR reqs = {XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR};
 		if (XR_SUCCEEDED(pGetReqs(m_instance, m_systemId, &reqs)))
 		{
 			DEBUG_LOG(("OpenXR: vulkan API version required: min %u.%u.%u max %u.%u.%u",
@@ -213,10 +265,10 @@ void OpenXRManager::probeVulkanRequirements()
 		}
 	}
 
-	struct { const char* label; PFN_local_xrGetVulkanExtensionsKHR fn; } queries[] =
+	struct { const char* label; PFN_xrGetVulkanInstanceExtensionsKHR fn; } queries[] =
 	{
 		{ "instance", pGetInstExts },
-		{ "device",   pGetDevExts },
+		{ "device",   (PFN_xrGetVulkanInstanceExtensionsKHR)pGetDevExts },
 	};
 	for (int i = 0; i < 2; ++i)
 	{
@@ -234,12 +286,11 @@ void OpenXRManager::probeVulkanRequirements()
 }
 
 //-------------------------------------------------------------------------------------------------
-// GeneralsVR: DXVK's D3D8 device wraps its D3D9 device as a private member with no public
-// accessor (verified against dxvk v3.0.1 and master 2026-07). We recover it by scanning the
-// first few pointer slots of the D3D8Device object for a pointer whose vtable lives inside
-// d3d9.dll and which answers QueryInterface(ID3D9VkInteropDevice). Every dereference is
-// SEH-guarded and the vtable-module check runs before any call, so a miss is just a log line.
-
+// DXVK's D3D8 objects wrap their D3D9 counterparts as a private member with no public accessor.
+// We recover the wrapped object by scanning the first few pointer slots for one whose vtable
+// lives inside d3d9.dll and which answers the interop QueryInterface. Every dereference is
+// SEH-guarded and the vtable check runs before any call, so a miss is just a log line.
+//-------------------------------------------------------------------------------------------------
 static void* readPtrGuarded(void* addr)
 {
 	__try
@@ -252,13 +303,13 @@ static void* readPtrGuarded(void* addr)
 	}
 }
 
-static IUnknown* tryQueryInteropDevice(void* candidate)
+static IUnknown* tryQueryInterfaceGuarded(void* candidate, const GUID& iid)
 {
 	__try
 	{
 		IUnknown* unk = (IUnknown*)candidate;
 		void* out = nullptr;
-		if (SUCCEEDED(unk->QueryInterface(IID_ID3D9VkInteropDevice, &out)) && out != nullptr)
+		if (SUCCEEDED(unk->QueryInterface(iid, &out)) && out != nullptr)
 			return (IUnknown*)out;
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER)
@@ -279,110 +330,166 @@ static Bool vtableLivesInModule(void* object, HMODULE module)
 	return owner == module;
 }
 
-void OpenXRManager::probeDxvkInterop(void* d3d8Device)
+/// Find the D3D9 object wrapped by a DXVK D3D8 object and query \a iid on it.
+static IUnknown* queryWrappedD3D9Interface(void* d3d8Object, const GUID& iid)
 {
-	if (d3d8Device == nullptr)
-	{
-		DEBUG_LOG(("OpenXR: dxvk probe: no D3D8 device, skipping"));
-		return;
-	}
-
 	HMODULE d3d9Module = GetModuleHandleA("d3d9.dll");
-	if (d3d9Module == nullptr)
-	{
-		DEBUG_LOG(("OpenXR: dxvk probe: d3d9.dll not loaded - not running under DXVK d3d8, skipping"));
-		return;
-	}
+	if (d3d9Module == nullptr || d3d8Object == nullptr)
+		return nullptr;
 
-	ID3D9VkInteropDevice* interop = nullptr;
-	for (int offset = sizeof(void*); offset <= 64 && interop == nullptr; offset += sizeof(void*))
+	for (int offset = sizeof(void*); offset <= 64; offset += sizeof(void*))
 	{
-		void* candidate = readPtrGuarded((char*)d3d8Device + offset);
-		if (candidate == nullptr || candidate == d3d8Device)
+		void* candidate = readPtrGuarded((char*)d3d8Object + offset);
+		if (candidate == nullptr || candidate == d3d8Object)
 			continue;
 		if (!vtableLivesInModule(candidate, d3d9Module))
 			continue;
-		interop = (ID3D9VkInteropDevice*)tryQueryInteropDevice(candidate);
-		if (interop != nullptr)
-		{
-			DEBUG_LOG(("OpenXR: dxvk probe: found D3D9 device at D3D8Device+%d, interop acquired", offset));
-		}
+		IUnknown* found = tryQueryInterfaceGuarded(candidate, iid);
+		if (found != nullptr)
+			return found;
 	}
+	return nullptr;
+}
 
-	if (interop == nullptr)
+Bool OpenXRManager::findDxvkInterop(IDirect3DDevice8* d3d8Device)
+{
+	if (d3d8Device == nullptr)
 	{
-		DEBUG_LOG(("OpenXR: dxvk probe: no ID3D9VkInteropDevice found behind the D3D8 device"));
-		return;
+		DEBUG_LOG(("OpenXR: dxvk: no D3D8 device"));
+		return FALSE;
+	}
+	if (GetModuleHandleA("d3d9.dll") == nullptr)
+	{
+		DEBUG_LOG(("OpenXR: dxvk: d3d9.dll not loaded - not running under DXVK, VR unavailable"));
+		return FALSE;
 	}
 
-	m_dxvkInterop = interop;
-	interop->GetVulkanHandles(&m_vkInstance, &m_vkPhysicalDevice, &m_vkDevice);
+	m_dxvkInterop = (ID3D9VkInteropDevice*)queryWrappedD3D9Interface(d3d8Device, IID_ID3D9VkInteropDevice);
+	if (m_dxvkInterop == nullptr)
+	{
+		DEBUG_LOG(("OpenXR: dxvk: no ID3D9VkInteropDevice behind the D3D8 device, VR unavailable"));
+		return FALSE;
+	}
+
+	m_dxvkInterop->GetVulkanHandles(&m_vkInstance, &m_vkPhysicalDevice, &m_vkDevice);
 	uint32_t queueIndex = 0, queueFamily = 0;
-	VkQueue queue = nullptr;
-	interop->GetSubmissionQueue(&queue, &queueIndex, &queueFamily);
+	VkQueue queue = VK_NULL_HANDLE;
+	m_dxvkInterop->GetSubmissionQueue(&queue, &queueIndex, &queueFamily);
 	m_vkQueue = queue;
 	m_vkQueueIndex = queueIndex;
 	m_vkQueueFamilyIndex = queueFamily;
 
 	DEBUG_LOG(("OpenXR: dxvk vulkan handles: instance=%p physicalDevice=%p device=%p queue=%p family=%u index=%u",
 		m_vkInstance, m_vkPhysicalDevice, m_vkDevice, m_vkQueue, m_vkQueueFamilyIndex, m_vkQueueIndex));
-
-	if (m_supportsVulkan1)
-		tryCreateSession();
+	return m_vkDevice != VK_NULL_HANDLE && m_vkQueue != VK_NULL_HANDLE;
 }
 
 //-------------------------------------------------------------------------------------------------
-// GeneralsVR: XR_KHR_vulkan_enable session structs, declared locally (see note above).
-struct LocalXrGraphicsBindingVulkanKHR
+Bool OpenXRManager::loadVulkanFunctions()
 {
-	XrStructureType type;
-	const void* next;
-	VkInstance instance;
-	VkPhysicalDevice physicalDevice;
-	VkDevice device;
-	uint32_t queueFamilyIndex;
-	uint32_t queueIndex;
-};
-typedef XrResult (XRAPI_PTR *PFN_local_xrGetVulkanGraphicsDeviceKHR)(
-	XrInstance, XrSystemId, VkInstance, VkPhysicalDevice*);
+	HMODULE vulkanModule = GetModuleHandleA("vulkan-1.dll");
+	if (vulkanModule == nullptr)
+		vulkanModule = LoadLibraryA("vulkan-1.dll");
+	if (vulkanModule == nullptr)
+	{
+		DEBUG_LOG(("OpenXR: vulkan-1.dll not available"));
+		return FALSE;
+	}
 
-struct LocalXrSwapchainImageVulkanKHR
-{
-	XrStructureType type;
-	void* next;
-	VkImage image;
-};
+	PFN_vkGetInstanceProcAddr getInstanceProcAddr =
+		(PFN_vkGetInstanceProcAddr)GetProcAddress(vulkanModule, "vkGetInstanceProcAddr");
+	if (getInstanceProcAddr == nullptr)
+		return FALSE;
 
-void OpenXRManager::tryCreateSession()
+	g_vk.getDeviceProcAddr =
+		(PFN_vkGetDeviceProcAddr)getInstanceProcAddr(m_vkInstance, "vkGetDeviceProcAddr");
+	if (g_vk.getDeviceProcAddr == nullptr)
+		return FALSE;
+
+	#define LOAD_VK(member, name) \
+		g_vk.member = (PFN_##name)g_vk.getDeviceProcAddr(m_vkDevice, #name); \
+		if (g_vk.member == nullptr) { DEBUG_LOG(("OpenXR: vulkan: missing %s", #name)); return FALSE; }
+
+	LOAD_VK(createCommandPool, vkCreateCommandPool)
+	LOAD_VK(destroyCommandPool, vkDestroyCommandPool)
+	LOAD_VK(allocateCommandBuffers, vkAllocateCommandBuffers)
+	LOAD_VK(beginCommandBuffer, vkBeginCommandBuffer)
+	LOAD_VK(endCommandBuffer, vkEndCommandBuffer)
+	LOAD_VK(resetCommandBuffer, vkResetCommandBuffer)
+	LOAD_VK(cmdPipelineBarrier, vkCmdPipelineBarrier)
+	LOAD_VK(cmdCopyImage, vkCmdCopyImage)
+	LOAD_VK(cmdBlitImage, vkCmdBlitImage)
+	LOAD_VK(queueSubmit, vkQueueSubmit)
+	LOAD_VK(createFence, vkCreateFence)
+	LOAD_VK(destroyFence, vkDestroyFence)
+	LOAD_VK(waitForFences, vkWaitForFences)
+	LOAD_VK(resetFences, vkResetFences)
+	LOAD_VK(deviceWaitIdle, vkDeviceWaitIdle)
+
+	#undef LOAD_VK
+
+	DEBUG_LOG(("OpenXR: vulkan entry points resolved"));
+	return TRUE;
+}
+
+Bool OpenXRManager::createVulkanCopyResources()
 {
-	// The spec requires confirming which physical device the runtime expects for our
-	// VkInstance; on multi-GPU systems using the wrong one fails later and worse.
-	PFN_local_xrGetVulkanGraphicsDeviceKHR pGetGraphicsDevice = nullptr;
+	VkCommandPoolCreateInfo poolInfo = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+	poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+	poolInfo.queueFamilyIndex = m_vkQueueFamilyIndex;
+	if (g_vk.createCommandPool(m_vkDevice, &poolInfo, nullptr, &m_vkCommandPool) != VK_SUCCESS)
+	{
+		DEBUG_LOG(("OpenXR: vulkan: vkCreateCommandPool failed"));
+		return FALSE;
+	}
+
+	VkCommandBufferAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+	allocInfo.commandPool = m_vkCommandPool;
+	allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+	allocInfo.commandBufferCount = 1;
+	if (g_vk.allocateCommandBuffers(m_vkDevice, &allocInfo, &m_vkCommandBuffer) != VK_SUCCESS)
+	{
+		DEBUG_LOG(("OpenXR: vulkan: vkAllocateCommandBuffers failed"));
+		return FALSE;
+	}
+
+	VkFenceCreateInfo fenceInfo = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+	if (g_vk.createFence(m_vkDevice, &fenceInfo, nullptr, &m_vkFence) != VK_SUCCESS)
+	{
+		DEBUG_LOG(("OpenXR: vulkan: vkCreateFence failed"));
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
+//-------------------------------------------------------------------------------------------------
+Bool OpenXRManager::createSession()
+{
+	PFN_xrGetVulkanGraphicsDeviceKHR pGetGraphicsDevice = nullptr;
 	xrGetInstanceProcAddr(m_instance, "xrGetVulkanGraphicsDeviceKHR", (PFN_xrVoidFunction*)&pGetGraphicsDevice);
 	if (pGetGraphicsDevice == nullptr)
 	{
-		DEBUG_LOG(("OpenXR: session: xrGetVulkanGraphicsDeviceKHR did not resolve - aborting session"));
-		return;
+		DEBUG_LOG(("OpenXR: session: xrGetVulkanGraphicsDeviceKHR did not resolve"));
+		return FALSE;
 	}
 
-	VkPhysicalDevice runtimePhysDev = nullptr;
+	VkPhysicalDevice runtimePhysDev = VK_NULL_HANDLE;
 	XrResult devResult = pGetGraphicsDevice(m_instance, m_systemId, m_vkInstance, &runtimePhysDev);
 	if (XR_FAILED(devResult))
 	{
-		DEBUG_LOG(("OpenXR: session: xrGetVulkanGraphicsDeviceKHR FAILED (%d) - runtime cannot use DXVK's VkInstance",
-			(int)devResult));
-		return;
+		DEBUG_LOG(("OpenXR: session: xrGetVulkanGraphicsDeviceKHR FAILED (%d)", (int)devResult));
+		return FALSE;
 	}
 	if (runtimePhysDev != m_vkPhysicalDevice)
 	{
-		DEBUG_LOG(("OpenXR: session: runtime wants physicalDevice=%p but DXVK renders on %p - aborting session",
+		DEBUG_LOG(("OpenXR: session: runtime wants physicalDevice=%p but DXVK renders on %p - aborting",
 			runtimePhysDev, m_vkPhysicalDevice));
-		return;
+		return FALSE;
 	}
 	DEBUG_LOG(("OpenXR: session: runtime confirmed DXVK's physical device"));
 
-	LocalXrGraphicsBindingVulkanKHR binding = {};
-	binding.type = XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR;
+	XrGraphicsBindingVulkanKHR binding = {XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR};
 	binding.instance = m_vkInstance;
 	binding.physicalDevice = m_vkPhysicalDevice;
 	binding.device = m_vkDevice;
@@ -393,19 +500,30 @@ void OpenXRManager::tryCreateSession()
 	sci.next = &binding;
 	sci.systemId = m_systemId;
 
-	// The runtime may submit setup work on our queue; DXVK's submission thread owns it,
-	// so follow the interop contract: flush pending D3D work, lock, call, unlock.
+	// The runtime may touch the shared queue; follow DXVK's interop contract.
 	m_dxvkInterop->FlushRenderingCommands();
 	m_dxvkInterop->LockSubmissionQueue();
 	XrResult result = xrCreateSession(m_instance, &sci, &m_session);
 	m_dxvkInterop->ReleaseSubmissionQueue();
+
 	if (XR_FAILED(result))
 	{
-		DEBUG_LOG(("OpenXR: session: xrCreateSession FAILED (%d) - DXVK device rejected", (int)result));
+		DEBUG_LOG(("OpenXR: session: xrCreateSession FAILED (%d)", (int)result));
 		m_session = XR_NULL_HANDLE;
-		return;
+		return FALSE;
 	}
 	DEBUG_LOG(("OpenXR: session: created over DXVK's Vulkan device"));
+
+	// Reference space: STAGE would pin us to the play area; LOCAL is head-relative-at-start,
+	// which is what a seated tabletop view wants.
+	XrReferenceSpaceCreateInfo spaceInfo = {XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+	spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+	spaceInfo.poseInReferenceSpace.orientation.w = 1.0f;
+	if (XR_FAILED(xrCreateReferenceSpace(m_session, &spaceInfo, &m_appSpace)))
+	{
+		DEBUG_LOG(("OpenXR: session: xrCreateReferenceSpace FAILED"));
+		return FALSE;
+	}
 
 	uint32_t blendCount = 0;
 	xrEnumerateEnvironmentBlendModes(m_instance, m_systemId,
@@ -417,67 +535,178 @@ void OpenXRManager::tryCreateSession()
 			XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, blendCount, &blendCount, modes.data())))
 		{
 			m_blendMode = modes[0];
-			DEBUG_LOG(("OpenXR: session: environment blend mode %d", (int)m_blendMode));
 		}
 	}
 
-	// Trial swapchain: proves the runtime will hand us renderable images on this device.
-	uint32_t formatCount = 0;
-	xrEnumerateSwapchainFormats(m_session, 0, &formatCount, nullptr);
-	std::vector<int64_t> formats(formatCount ? formatCount : 1);
-	if (formatCount > 0 &&
-		XR_SUCCEEDED(xrEnumerateSwapchainFormats(m_session, formatCount, &formatCount, formats.data())))
-	{
-		DEBUG_LOG(("OpenXR: session: %u swapchain formats, first=%lld (VkFormat)", formatCount, formats[0]));
+	return TRUE;
+}
 
+//-------------------------------------------------------------------------------------------------
+Bool OpenXRManager::createSwapchains()
+{
+	uint32_t formatCount = 0;
+	if (XR_FAILED(xrEnumerateSwapchainFormats(m_session, 0, &formatCount, nullptr)) || formatCount == 0)
+	{
+		DEBUG_LOG(("OpenXR: swapchain: no formats"));
+		return FALSE;
+	}
+	std::vector<int64_t> formats(formatCount);
+	if (XR_FAILED(xrEnumerateSwapchainFormats(m_session, formatCount, &formatCount, formats.data())))
+		return FALSE;
+
+	int64_t chosen = 0;
+	for (size_t p = 0; p < sizeof(kPreferredSwapchainFormats)/sizeof(int64_t) && chosen == 0; ++p)
+	{
+		for (uint32_t i = 0; i < formatCount; ++i)
+		{
+			if (formats[i] == kPreferredSwapchainFormats[p])
+			{
+				chosen = formats[i];
+				break;
+			}
+		}
+	}
+	if (chosen == 0)
+	{
+		chosen = formats[0];
+		DEBUG_LOG(("OpenXR: swapchain: no preferred format offered, falling back to %lld", chosen));
+	}
+	// A raw copy is only correct when the swapchain is BGRA (the layout D3DFMT_A8R8G8B8 gives us).
+	const Bool rawCopyOk = (chosen == VK_FORMAT_B8G8R8A8_SRGB || chosen == VK_FORMAT_B8G8R8A8_UNORM);
+	DEBUG_LOG(("OpenXR: swapchain: format %lld (%s)", chosen,
+		rawCopyOk ? "BGRA - raw copy" : "non-BGRA - blit (colour may shift)"));
+
+	for (Int eye = 0; eye < m_eyeCount; ++eye)
+	{
 		XrSwapchainCreateInfo swci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
-		swci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-		swci.format = formats[0];
+		swci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+		swci.format = chosen;
 		swci.sampleCount = 1;
-		swci.width = m_eyeWidth > 0 ? m_eyeWidth : 2064;
-		swci.height = m_eyeHeight > 0 ? m_eyeHeight : 2272;
+		swci.width = m_eyeWidth;
+		swci.height = m_eyeHeight;
 		swci.faceCount = 1;
 		swci.arraySize = 1;
 		swci.mipCount = 1;
 
-		result = xrCreateSwapchain(m_session, &swci, &m_trialSwapchain);
-		if (XR_SUCCEEDED(result))
+		if (XR_FAILED(xrCreateSwapchain(m_session, &swci, &m_swapchains[eye])))
 		{
-			uint32_t imageCount = 0;
-			xrEnumerateSwapchainImages(m_trialSwapchain, 0, &imageCount, nullptr);
-			std::vector<LocalXrSwapchainImageVulkanKHR> images(imageCount ? imageCount : 1);
-			for (uint32_t i = 0; i < imageCount; ++i)
-			{
-				images[i] = LocalXrSwapchainImageVulkanKHR{};
-				images[i].type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR;
-			}
-			if (imageCount > 0 &&
-				XR_SUCCEEDED(xrEnumerateSwapchainImages(m_trialSwapchain, imageCount, &imageCount,
-					(XrSwapchainImageBaseHeader*)images.data())))
-			{
-				DEBUG_LOG(("OpenXR: session: swapchain %ux%u created, %u VkImages (first=0x%llX)",
-					swci.width, swci.height, imageCount, (unsigned long long)images[0].image));
-			}
-			else
-			{
-				DEBUG_LOG(("OpenXR: session: swapchain created but image enumeration failed"));
-			}
+			DEBUG_LOG(("OpenXR: swapchain: xrCreateSwapchain FAILED for eye %d", eye));
+			return FALSE;
 		}
-		else
+
+		uint32_t imageCount = 0;
+		xrEnumerateSwapchainImages(m_swapchains[eye], 0, &imageCount, nullptr);
+		std::vector<XrSwapchainImageVulkanKHR> images(imageCount);
+		for (uint32_t i = 0; i < imageCount; ++i)
 		{
-			DEBUG_LOG(("OpenXR: session: xrCreateSwapchain FAILED (%d)", (int)result));
+			images[i] = XrSwapchainImageVulkanKHR{};
+			images[i].type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR;
+		}
+		if (XR_FAILED(xrEnumerateSwapchainImages(m_swapchains[eye], imageCount, &imageCount,
+			(XrSwapchainImageBaseHeader*)images.data())))
+		{
+			DEBUG_LOG(("OpenXR: swapchain: image enumeration FAILED for eye %d", eye));
+			return FALSE;
+		}
+
+		m_swapchainImages[eye].clear();
+		for (uint32_t i = 0; i < imageCount; ++i)
+			m_swapchainImages[eye].push_back(images[i].image);
+
+		DEBUG_LOG(("OpenXR: swapchain: eye %d, %dx%d, %u images", eye, m_eyeWidth, m_eyeHeight, imageCount));
+	}
+
+	return TRUE;
+}
+
+//-------------------------------------------------------------------------------------------------
+Bool OpenXRManager::createEyeTargets(IDirect3DDevice8* device)
+{
+	for (Int eye = 0; eye < m_eyeCount; ++eye)
+	{
+		if (FAILED(device->CreateTexture(m_eyeWidth, m_eyeHeight, 1, D3DUSAGE_RENDERTARGET,
+			D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &m_eyeTextures[eye])))
+		{
+			DEBUG_LOG(("OpenXR: eye targets: CreateTexture FAILED for eye %d (%dx%d)",
+				eye, m_eyeWidth, m_eyeHeight));
+			return FALSE;
+		}
+		if (FAILED(m_eyeTextures[eye]->GetSurfaceLevel(0, &m_eyeSurfaces[eye])))
+		{
+			DEBUG_LOG(("OpenXR: eye targets: GetSurfaceLevel FAILED for eye %d", eye));
+			return FALSE;
+		}
+
+		m_eyeImages[eye] = getVulkanImage(m_eyeTextures[eye], &m_eyeImageLayout);
+		if (m_eyeImages[eye] == VK_NULL_HANDLE)
+		{
+			DEBUG_LOG(("OpenXR: eye targets: no VkImage behind eye texture %d", eye));
+			return FALSE;
 		}
 	}
 
-	DEBUG_LOG(("OpenXR: session spike complete - Vulkan route through DXVK is VIABLE"));
+	// The engine's own depth buffer is backbuffer-sized, which is smaller than an eye target,
+	// so the eye passes need their own.
+	if (FAILED(device->CreateDepthStencilSurface(m_eyeWidth, m_eyeHeight, D3DFMT_D24S8,
+		D3DMULTISAMPLE_NONE, &m_depthSurface)))
+	{
+		DEBUG_LOG(("OpenXR: eye targets: CreateDepthStencilSurface FAILED"));
+		return FALSE;
+	}
+
+	DEBUG_LOG(("OpenXR: eye targets: %d D3D8 render targets %dx%d, VkImages bound (layout %d)",
+		m_eyeCount, m_eyeWidth, m_eyeHeight, (int)m_eyeImageLayout));
+	return TRUE;
 }
 
-void OpenXRManager::pumpFrame()
+VkImage OpenXRManager::getVulkanImage(IUnknown* d3d8Resource, VkImageLayout* outLayout)
+{
+	ID3D9VkInteropTexture* interopTex =
+		(ID3D9VkInteropTexture*)queryWrappedD3D9Interface(d3d8Resource, IID_ID3D9VkInteropTexture);
+	if (interopTex == nullptr)
+		return VK_NULL_HANDLE;
+
+	VkImage image = VK_NULL_HANDLE;
+	VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+	VkImageCreateInfo info = {};
+	HRESULT hr = interopTex->GetVulkanImageInfo(&image, &layout, &info);
+	interopTex->Release();
+
+	if (FAILED(hr))
+		return VK_NULL_HANDLE;
+	if (outLayout != nullptr)
+		*outLayout = layout;
+	return image;
+}
+
+//-------------------------------------------------------------------------------------------------
+void OpenXRManager::initGraphics(IDirect3DDevice8* d3d8Device)
+{
+	if (!isAvailable() || m_session != XR_NULL_HANDLE)
+		return;
+
+	if (!findDxvkInterop(d3d8Device))
+		return;
+	if (!loadVulkanFunctions())
+		return;
+	if (!createSession())
+		return;
+	if (!createVulkanCopyResources())
+		return;
+	if (!createSwapchains())
+		return;
+	if (!createEyeTargets(d3d8Device))
+		return;
+
+	DEBUG_LOG(("OpenXR: graphics ready - stereo path armed"));
+}
+
+//-------------------------------------------------------------------------------------------------
+void OpenXRManager::beginFrame()
 {
 	if (m_session == XR_NULL_HANDLE)
 		return;
 
-	// Drain the event queue; the runtime drives the session lifecycle through it.
 	for (;;)
 	{
 		XrEventDataBuffer ev = {XR_TYPE_EVENT_DATA_BUFFER};
@@ -503,7 +732,6 @@ void OpenXRManager::pumpFrame()
 			{
 				xrEndSession(m_session);
 				m_sessionRunning = FALSE;
-				DEBUG_LOG(("OpenXR: session stopped by runtime"));
 			}
 			else if (m_sessionState == XR_SESSION_STATE_EXITING
 				|| m_sessionState == XR_SESSION_STATE_LOSS_PENDING)
@@ -517,6 +745,11 @@ void OpenXRManager::pumpFrame()
 		}
 	}
 
+	// A frame was opened last tick but never rendered (game paused, render gated, window
+	// minimised). Close it out with no layers, or the runtime starves waiting for it.
+	if (m_frameActive)
+		submitEyes();
+
 	if (!m_sessionRunning)
 		return;
 
@@ -524,72 +757,315 @@ void OpenXRManager::pumpFrame()
 	XrFrameState frameState = {XR_TYPE_FRAME_STATE};
 	if (XR_FAILED(xrWaitFrame(m_session, &waitInfo, &frameState)))
 		return;
+	m_predictedDisplayTime = frameState.predictedDisplayTime;
 
 	XrFrameBeginInfo beginInfo = {XR_TYPE_FRAME_BEGIN_INFO};
 	if (XR_FAILED(xrBeginFrame(m_session, &beginInfo)))
 		return;
 
-	XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
-	endInfo.displayTime = frameState.predictedDisplayTime;
-	endInfo.environmentBlendMode = m_blendMode;
-	endInfo.layerCount = 0;
-	endInfo.layers = nullptr;
+	m_frameActive = TRUE;
 
-	// The compositor may use the shared Vulkan queue at frame submission.
-	if (m_dxvkInterop != nullptr)
+	// Locate the eyes for this frame. If the runtime cannot (tracking lost), the frame is
+	// still submitted - just without layers - so the session stays alive.
+	XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
+	locateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+	locateInfo.displayTime = m_predictedDisplayTime;
+	locateInfo.space = m_appSpace;
+
+	XrViewState viewState = {XR_TYPE_VIEW_STATE};
+	uint32_t viewCount = 0;
+	XrView views[MAX_EYES];
+	for (int i = 0; i < MAX_EYES; ++i)
 	{
-		m_dxvkInterop->FlushRenderingCommands();
-		m_dxvkInterop->LockSubmissionQueue();
+		views[i] = XrView{};
+		views[i].type = XR_TYPE_VIEW;
 	}
+
+	if (XR_FAILED(xrLocateViews(m_session, &locateInfo, &viewState, MAX_EYES, &viewCount, views)))
+		return;
+	if ((viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) == 0
+		|| (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) == 0)
+		return;
+
+	for (Int eye = 0; eye < m_eyeCount && (uint32_t)eye < viewCount; ++eye)
+	{
+		m_eyePoses[eye] = views[eye].pose;
+		m_eyeFovs[eye] = views[eye].fov;
+
+		VREyeView& v = m_eyeViews[eye];
+		v.quatX = views[eye].pose.orientation.x;
+		v.quatY = views[eye].pose.orientation.y;
+		v.quatZ = views[eye].pose.orientation.z;
+		v.quatW = views[eye].pose.orientation.w;
+		v.posX = views[eye].pose.position.x;
+		v.posY = views[eye].pose.position.y;
+		v.posZ = views[eye].pose.position.z;
+		v.angleLeft = views[eye].fov.angleLeft;
+		v.angleRight = views[eye].fov.angleRight;
+		v.angleUp = views[eye].fov.angleUp;
+		v.angleDown = views[eye].fov.angleDown;
+	}
+}
+
+//-------------------------------------------------------------------------------------------------
+Bool OpenXRManager::copyEyesToSwapchains(const UnsignedInt* imageIndices)
+{
+	VkCommandBufferBeginInfo cbBegin = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+	cbBegin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+	g_vk.resetCommandBuffer(m_vkCommandBuffer, 0);
+	if (g_vk.beginCommandBuffer(m_vkCommandBuffer, &cbBegin) != VK_SUCCESS)
+		return FALSE;
+
+	for (Int eye = 0; eye < m_eyeCount; ++eye)
+	{
+		VkImage src = m_eyeImages[eye];
+		VkImage dst = m_swapchainImages[eye][imageIndices[eye]];
+
+		VkImageSubresourceRange range = {};
+		range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		range.levelCount = 1;
+		range.layerCount = 1;
+
+		// src: whatever layout DXVK keeps its render targets in -> TRANSFER_SRC
+		// dst: swapchain images are handed to us in an undefined layout -> TRANSFER_DST
+		VkImageMemoryBarrier pre[2] = {};
+		pre[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+		pre[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+		pre[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+		pre[0].oldLayout = m_eyeImageLayout;
+		pre[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+		pre[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		pre[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		pre[0].image = src;
+		pre[0].subresourceRange = range;
+
+		pre[1] = pre[0];
+		pre[1].srcAccessMask = 0;
+		pre[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		pre[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		pre[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		pre[1].image = dst;
+
+		g_vk.cmdPipelineBarrier(m_vkCommandBuffer,
+			VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+			0, 0, nullptr, 0, nullptr, 2, pre);
+
+		VkImageCopy copy = {};
+		copy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		copy.srcSubresource.layerCount = 1;
+		copy.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		copy.dstSubresource.layerCount = 1;
+		copy.extent.width = (uint32_t)m_eyeWidth;
+		copy.extent.height = (uint32_t)m_eyeHeight;
+		copy.extent.depth = 1;
+
+		g_vk.cmdCopyImage(m_vkCommandBuffer,
+			src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			1, &copy);
+
+		// Restore the source to the layout DXVK believes it is in, and hand the swapchain
+		// image to the compositor in the layout OpenXR requires.
+		VkImageMemoryBarrier post[2] = {};
+		post[0] = pre[0];
+		post[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+		post[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+		post[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+		post[0].newLayout = m_eyeImageLayout;
+
+		post[1] = pre[1];
+		post[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		post[1].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+		post[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		post[1].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+		g_vk.cmdPipelineBarrier(m_vkCommandBuffer,
+			VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+			0, 0, nullptr, 0, nullptr, 2, post);
+	}
+
+	if (g_vk.endCommandBuffer(m_vkCommandBuffer) != VK_SUCCESS)
+		return FALSE;
+
+	VkSubmitInfo submit = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+	submit.commandBufferCount = 1;
+	submit.pCommandBuffers = &m_vkCommandBuffer;
+
+	// DXVK owns the queue: flush its pending work (our source images were just rendered by it),
+	// take the queue, submit, give it back.
+	m_dxvkInterop->FlushRenderingCommands();
+	m_dxvkInterop->LockSubmissionQueue();
+	g_vk.resetFences(m_vkDevice, 1, &m_vkFence);
+	VkResult submitResult = g_vk.queueSubmit(m_vkQueue, 1, &submit, m_vkFence);
+	m_dxvkInterop->ReleaseSubmissionQueue();
+
+	if (submitResult != VK_SUCCESS)
+	{
+		DEBUG_LOG(("OpenXR: eye copy: vkQueueSubmit failed (%d)", (int)submitResult));
+		return FALSE;
+	}
+
+	g_vk.waitForFences(m_vkDevice, 1, &m_vkFence, VK_TRUE, 1000000000ull);
+	return TRUE;
+}
+
+//-------------------------------------------------------------------------------------------------
+void OpenXRManager::submitEyes()
+{
+	if (!m_frameActive)
+		return;
+
+	XrCompositionLayerProjectionView projViews[MAX_EYES];
+	XrCompositionLayerProjection layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+	const XrCompositionLayerBaseHeader* layers[1];
+	uint32_t layerCount = 0;
+
+	Bool copied = FALSE;
+	UnsignedInt imageIndices[MAX_EYES] = {0, 0};
+
+	if (m_swapchains[0] != XR_NULL_HANDLE && m_eyeImages[0] != VK_NULL_HANDLE)
+	{
+		Bool acquiredAll = TRUE;
+		for (Int eye = 0; eye < m_eyeCount; ++eye)
+		{
+			XrSwapchainImageAcquireInfo acquireInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+			uint32_t index = 0;
+			if (XR_FAILED(xrAcquireSwapchainImage(m_swapchains[eye], &acquireInfo, &index)))
+			{
+				acquiredAll = FALSE;
+				break;
+			}
+			imageIndices[eye] = index;
+
+			XrSwapchainImageWaitInfo waitInfo = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+			waitInfo.timeout = XR_INFINITE_DURATION;
+			if (XR_FAILED(xrWaitSwapchainImage(m_swapchains[eye], &waitInfo)))
+			{
+				acquiredAll = FALSE;
+				break;
+			}
+		}
+
+		if (acquiredAll)
+		{
+			copied = copyEyesToSwapchains(imageIndices);
+
+			for (Int eye = 0; eye < m_eyeCount; ++eye)
+			{
+				XrSwapchainImageReleaseInfo releaseInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+				xrReleaseSwapchainImage(m_swapchains[eye], &releaseInfo);
+			}
+		}
+	}
+
+	if (copied)
+	{
+		for (Int eye = 0; eye < m_eyeCount; ++eye)
+		{
+			projViews[eye] = XrCompositionLayerProjectionView{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
+			projViews[eye].pose = m_eyePoses[eye];
+			projViews[eye].fov = m_eyeFovs[eye];
+			projViews[eye].subImage.swapchain = m_swapchains[eye];
+			projViews[eye].subImage.imageArrayIndex = 0;
+			projViews[eye].subImage.imageRect.offset = {0, 0};
+			projViews[eye].subImage.imageRect.extent = {m_eyeWidth, m_eyeHeight};
+		}
+
+		layer.space = m_appSpace;
+		layer.viewCount = (uint32_t)m_eyeCount;
+		layer.views = projViews;
+		layers[0] = (const XrCompositionLayerBaseHeader*)&layer;
+		layerCount = 1;
+	}
+
+	XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
+	endInfo.displayTime = m_predictedDisplayTime;
+	endInfo.environmentBlendMode = m_blendMode;
+	endInfo.layerCount = layerCount;
+	endInfo.layers = layerCount > 0 ? layers : nullptr;
+
+	m_dxvkInterop->FlushRenderingCommands();
+	m_dxvkInterop->LockSubmissionQueue();
 	XrResult endResult = xrEndFrame(m_session, &endInfo);
-	if (m_dxvkInterop != nullptr)
-		m_dxvkInterop->ReleaseSubmissionQueue();
+	m_dxvkInterop->ReleaseSubmissionQueue();
+
+	m_frameActive = FALSE;
 
 	if (XR_SUCCEEDED(endResult))
 	{
-		if (m_framesSubmitted == 0)
+		if (m_framesSubmitted == 0 && layerCount > 0)
 		{
-			DEBUG_LOG(("OpenXR: FIRST FRAME submitted - headset switched to the app"));
+			DEBUG_LOG(("OpenXR: FIRST STEREO FRAME submitted - the game is in the headset"));
 		}
 		++m_framesSubmitted;
 		if ((m_framesSubmitted % 1000) == 0)
 		{
-			DEBUG_LOG(("OpenXR: %u frames submitted", m_framesSubmitted));
+			DEBUG_LOG(("OpenXR: %u frames submitted (layers=%u)", m_framesSubmitted, layerCount));
 		}
 	}
-	else if (!m_endFrameFailLogged)
+	else if (!m_submitFailLogged)
 	{
-		m_endFrameFailLogged = TRUE;
-		DEBUG_LOG(("OpenXR: xrEndFrame FAILED (%d)", (int)endResult));
+		m_submitFailLogged = TRUE;
+		DEBUG_LOG(("OpenXR: xrEndFrame FAILED (%d), layers=%u", (int)endResult, layerCount));
 	}
 }
 
+//-------------------------------------------------------------------------------------------------
 void OpenXRManager::shutdown()
 {
+	if (m_vkDevice != VK_NULL_HANDLE && g_vk.deviceWaitIdle != nullptr)
+		g_vk.deviceWaitIdle(m_vkDevice);
+
+	for (Int eye = 0; eye < MAX_EYES; ++eye)
+	{
+		if (m_eyeSurfaces[eye] != nullptr) { m_eyeSurfaces[eye]->Release(); m_eyeSurfaces[eye] = nullptr; }
+		if (m_eyeTextures[eye] != nullptr) { m_eyeTextures[eye]->Release(); m_eyeTextures[eye] = nullptr; }
+		if (m_swapchains[eye] != XR_NULL_HANDLE)
+		{
+			xrDestroySwapchain(m_swapchains[eye]);
+			m_swapchains[eye] = XR_NULL_HANDLE;
+		}
+		m_eyeImages[eye] = VK_NULL_HANDLE;
+	}
+	if (m_depthSurface != nullptr) { m_depthSurface->Release(); m_depthSurface = nullptr; }
+
+	if (m_vkDevice != VK_NULL_HANDLE)
+	{
+		if (m_vkFence != VK_NULL_HANDLE && g_vk.destroyFence != nullptr)
+			g_vk.destroyFence(m_vkDevice, m_vkFence, nullptr);
+		if (m_vkCommandPool != VK_NULL_HANDLE && g_vk.destroyCommandPool != nullptr)
+			g_vk.destroyCommandPool(m_vkDevice, m_vkCommandPool, nullptr);
+	}
+	m_vkFence = VK_NULL_HANDLE;
+	m_vkCommandPool = VK_NULL_HANDLE;
+	m_vkCommandBuffer = VK_NULL_HANDLE;
+
 	if (m_sessionRunning)
 	{
 		xrEndSession(m_session);
 		m_sessionRunning = FALSE;
 	}
-	if (m_trialSwapchain != XR_NULL_HANDLE)
+	if (m_appSpace != XR_NULL_HANDLE)
 	{
-		xrDestroySwapchain(m_trialSwapchain);
-		m_trialSwapchain = XR_NULL_HANDLE;
+		xrDestroySpace(m_appSpace);
+		m_appSpace = XR_NULL_HANDLE;
 	}
 	if (m_session != XR_NULL_HANDLE)
 	{
 		xrDestroySession(m_session);
 		m_session = XR_NULL_HANDLE;
 	}
+
 	if (m_dxvkInterop != nullptr)
 	{
 		m_dxvkInterop->Release();
 		m_dxvkInterop = nullptr;
 	}
-	m_vkInstance = nullptr;
-	m_vkPhysicalDevice = nullptr;
-	m_vkDevice = nullptr;
-	m_vkQueue = nullptr;
+	m_vkInstance = VK_NULL_HANDLE;
+	m_vkPhysicalDevice = VK_NULL_HANDLE;
+	m_vkDevice = VK_NULL_HANDLE;
+	m_vkQueue = VK_NULL_HANDLE;
 
 	if (m_instance != XR_NULL_HANDLE)
 	{

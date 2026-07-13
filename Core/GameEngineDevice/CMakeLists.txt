@@ -235,7 +235,7 @@ if(RTS_BUILD_OPTION_VR AND (WIN32 OR "${CMAKE_SYSTEM}" MATCHES "Windows"))
         Include/VRDevice/OpenXRManager.h
         Source/VRDevice/OpenXRManager.cpp
     )
-    target_link_libraries(corei_gameenginedevice_public INTERFACE openxr_loader)
+    target_link_libraries(corei_gameenginedevice_public INTERFACE openxr_loader Vulkan::Headers)
     target_compile_definitions(corei_gameenginedevice_public INTERFACE RTS_HAS_OPENXR)
 endif()
 

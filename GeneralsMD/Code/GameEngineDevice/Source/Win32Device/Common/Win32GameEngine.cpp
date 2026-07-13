@@ -86,9 +86,9 @@ void Win32GameEngine::init()
 		TheOpenXR = NEW OpenXRManager;
 		if (TheOpenXR->init())
 		{
-			// Phase 2 spike: the D3D device exists by now (created during GameEngine::init).
-			// When running under DXVK this recovers the Vulkan handles session creation needs.
-			TheOpenXR->probeDxvkInterop(DX8Wrapper::_Get_D3D_Device8());
+			// The D3D device exists by now (created during GameEngine::init), so the session
+			// can be built on the Vulkan device DXVK created behind it.
+			TheOpenXR->initGraphics(DX8Wrapper::_Get_D3D_Device8());
 		}
 	}
 #endif
@@ -114,11 +114,11 @@ void Win32GameEngine::update()
 {
 
 #ifdef RTS_HAS_OPENXR
-	// GeneralsVR @feature Service the OpenXR session once per engine frame. With no layers
-	// submitted yet this only keeps the session alive (headset shows the app, black void);
-	// the stereo renderer will move the frame begin/end around the actual scene render.
+	// GeneralsVR @feature Open the OpenXR frame before the engine renders: this drains runtime
+	// events, drives the session lifecycle and locates the eyes for this frame. The eye render
+	// and the matching xrEndFrame happen inside W3DDisplay::drawVRScene.
 	if (TheOpenXR != nullptr)
-		TheOpenXR->pumpFrame();
+		TheOpenXR->beginFrame();
 #endif
 
 	// call the engine normal update

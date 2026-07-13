@@ -85,6 +85,12 @@ static void drawFramerateBar();
 #include "WWMath/wwmath.h"
 #include "WWLib/registry.h"
 #include "WW3D2/ww3d.h"
+#ifdef RTS_HAS_OPENXR
+#include "WW3D2/dx8wrapper.h"
+#include "WW3D2/camera.h"
+#include "WWMath/quat.h"
+#include "VRDevice/OpenXRManager.h"
+#endif
 #include "WW3D2/predlod.h"
 #include "WW3D2/part_emt.h"
 #include "WW3D2/part_ldr.h"
@@ -1786,6 +1792,79 @@ void W3DDisplay::step()
 	stepViews();
 }
 
+#ifdef RTS_HAS_OPENXR
+// W3DDisplay::drawVRScene ====================================================
+/** GeneralsVR @feature Stereo pass: render the 3D scene once per eye into the OpenXR render
+	* targets, then hand them to the runtime.
+	*
+	* The RTS tactical camera is the anchor: the headset floats where the tactical camera is,
+	* and head motion is added on top of it, scaled from metres into world units (the map
+	* becomes a tabletop). OpenXR's conventions match W3D's camera space exactly - both are
+	* right-handed with -Z forward and +Y up - so an eye pose composes onto the anchor as a
+	* plain matrix multiply, and the runtime's asymmetric per-eye frustum drops straight into
+	* CameraClass::Set_View_Plane, which already takes an off-centre view plane.
+	*/
+//=============================================================================
+void W3DDisplay::drawVRScene( W3DView *view )
+{
+	if (TheOpenXR == nullptr || !TheOpenXR->isFrameActive() || view == nullptr)
+		return;
+
+	CameraClass *tacticalCamera = view->get3DCamera();
+	if (tacticalCamera == nullptr || m_3DScene == nullptr)
+		return;
+
+	const Real scale = TheOpenXR->getWorldUnitsPerMeter();
+	const Matrix3D anchor = tacticalCamera->Get_Transform();
+
+	// One reusable camera for the eye passes; the tactical camera is left untouched so the
+	// monitor pass that follows still renders the normal flat view.
+	static CameraClass *vrCamera = nullptr;
+	if (vrCamera == nullptr)
+		vrCamera = NEW_REF(CameraClass, ());
+
+	for (Int eye = 0; eye < TheOpenXR->getEyeCount(); ++eye)
+	{
+		IDirect3DSurface8 *eyeSurface = TheOpenXR->getEyeSurface(eye);
+		if (eyeSurface == nullptr)
+			continue;
+
+		const VREyeView &v = TheOpenXR->getEyeView(eye);
+
+		// Head pose (metres, OpenXR space) -> world transform on top of the tactical camera.
+		Quaternion q(v.quatX, v.quatY, v.quatZ, v.quatW);
+		Matrix3D headPose;
+		Build_Matrix3D(q, headPose);
+		headPose.Set_Translation(Vector3(v.posX * scale, v.posY * scale, v.posZ * scale));
+
+		Matrix3D eyeTransform;
+		Matrix3D::Multiply(anchor, headPose, &eyeTransform);
+		vrCamera->Set_Transform(eyeTransform);
+
+		// The runtime's frustum half-angles are already off-centre; tangents at unit distance
+		// are exactly what Set_View_Plane wants.
+		Vector2 vMin(tanf(v.angleLeft), tanf(v.angleDown));
+		Vector2 vMax(tanf(v.angleRight), tanf(v.angleUp));
+		vrCamera->Set_View_Plane(vMin, vMax);
+		vrCamera->Set_Clip_Planes(0.05f * scale, 15000.0f);
+		vrCamera->Set_Viewport(Vector2(0.0f, 0.0f), Vector2(1.0f, 1.0f));
+
+		DX8Wrapper::Set_Render_Target(eyeSurface, TheOpenXR->getDepthSurface());
+
+		if (WW3D::Begin_Render(true, true, Vector3(0.0f, 0.0f, 0.0f)) == WW3D_ERROR_OK)
+		{
+			vrCamera->Apply();
+			WW3D::Render(m_3DScene, vrCamera);
+			WW3D::End_Render(false);  // no present: the image belongs to the headset
+		}
+
+		DX8Wrapper::Set_Render_Target((IDirect3DSurface8 *)nullptr);
+	}
+
+	TheOpenXR->submitEyes();
+}
+#endif // RTS_HAS_OPENXR
+
 //DECLARE_PERF_TIMER(BigAssRenderLoop)
 
 // W3DDisplay::draw ===========================================================
@@ -1959,6 +2038,13 @@ AGAIN:
 			if (TheW3DProjectedShadowManager)
 				TheW3DProjectedShadowManager->updateRenderTargetTextures();
 		}
+
+#ifdef RTS_HAS_OPENXR
+		// GeneralsVR @feature Render the 3D scene once per eye into the OpenXR render targets.
+		// This sits with the other render-to-texture passes (water reflection does exactly the
+		// same dance) so the main monitor pass below is untouched and still acts as the mirror.
+		drawVRScene(primaryW3DView);
+#endif
 
 		Debug_Statistics::End_Statistics();	//record number of polygons rendered in RenderTargetTextures.
 

@@ -83,6 +83,12 @@ public:
 	virtual void step() override; ///< Do one fixed time step
 	virtual void draw() override;  ///< redraw the entire display
 
+#ifdef RTS_HAS_OPENXR
+	/// GeneralsVR @feature Render the 3D scene once per eye into the OpenXR render targets and
+	/// submit them to the headset. No-op unless the game runs with -vr and a session is live.
+	void drawVRScene( class W3DView *view );
+#endif
+
 	/// @todo Replace these light management routines with a LightManager singleton
 	virtual void createLightPulse( const Coord3D *pos, const RGBColor *color, Real innerRadius,Real outerRadius,
 																 UnsignedInt increaseFrameTime, UnsignedInt decayFrameTime//, Bool donut = FALSE
