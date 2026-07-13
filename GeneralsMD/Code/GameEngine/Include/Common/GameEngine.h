@@ -75,6 +75,10 @@ public:
 	virtual Bool isActive() {return m_isActive;}	///< returns whether app has OS focus.
 	virtual void setIsActive(Bool isActive) { m_isActive = isActive; };
 
+	/// GeneralsVR @feature How far the renderer currently is between two sim ticks, 0..1.
+	/// Motion smoothing interpolates drawables by this. 1 when the sim runs every frame.
+	Real getLogicTimeAlpha() const { return m_logicTimeAlpha; }
+
 protected:
 
 	virtual void resetSubsystems();
@@ -98,6 +102,7 @@ protected:
 	virtual AudioManager *createAudioManager(Bool dummy) = 0;				///< Factory for Audio Manager
 
 	Real m_logicTimeAccumulator; ///< Frame time accumulated towards submitting a new logic frame
+	Real m_logicTimeAlpha; ///< GeneralsVR: m_logicTimeAccumulator as a fraction of one sim step
 
 	Bool m_quitting; ///< true when we need to quit the game
 	Bool m_isActive; ///< app has OS focus.

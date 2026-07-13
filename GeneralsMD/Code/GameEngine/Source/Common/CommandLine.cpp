@@ -413,8 +413,30 @@ Int parseMapName(char *args[], int num)
 Int parseVR(char *args[], int num)
 {
 	TheWritableGlobalData->m_vrMode = TRUE;
+	// 30Hz stepping is nauseating in a headset, so VR always smooths motion.
+	TheWritableGlobalData->m_smoothMotion = TRUE;
 
 	return 1;
+}
+
+// GeneralsVR @feature Interpolate drawable motion between sim ticks without VR.
+Int parseSmoothMotion(char *args[], int num)
+{
+	TheWritableGlobalData->m_smoothMotion = TRUE;
+
+	return 1;
+}
+
+// GeneralsVR @feature Tabletop scale: world units per real-world metre in VR.
+Int parseVRScale(char *args[], int num)
+{
+	if (num > 1)
+	{
+		const Real scale = (Real)atof(args[1]);
+		if (scale > 0.0f)
+			TheWritableGlobalData->m_vrWorldUnitsPerMeter = scale;
+	}
+	return 2;
 }
 
 Int parseHeadless(char *args[], int num)
@@ -1144,6 +1166,12 @@ static CommandLineParam paramsForStartup[] =
 
 	// GeneralsVR @feature Request OpenXR VR output.
 	{ "-vr", parseVR },
+
+	// GeneralsVR @feature Smooth 30Hz sim motion across render frames (implied by -vr).
+	{ "-smoothmotion", parseSmoothMotion },
+
+	// GeneralsVR @feature Tabletop scale in VR: world units per metre (default 500).
+	{ "-vrscale", parseVRScale },
 
 	// TheSuperHackers @feature helmutbuhler 13/04/2025
 	// Play back a replay. Pass the filename including .rep afterwards.

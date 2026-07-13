@@ -124,6 +124,14 @@ public:
 	// GeneralsVR @feature Run with OpenXR VR output when available (-vr).
 	Bool m_vrMode;
 
+	// GeneralsVR @feature Interpolate drawable motion between 30Hz sim ticks (-smoothmotion).
+	// Implied by -vr, where 30Hz stepping is nauseating. Render-only; the sim is untouched.
+	Bool m_smoothMotion;
+
+	// GeneralsVR @feature World units per real-world metre in VR: the tabletop scale
+	// (-vrscale). Larger means the map appears smaller / further away.
+	Real m_vrWorldUnitsPerMeter;
+
 	Bool m_windowed;
 	Int m_xResolution;
 	Int m_yResolution;

@@ -712,6 +712,15 @@ private:
 	Matrix3D m_instance;				///< The instance matrix that holds the initial/default position & orientation
 	Real m_instanceScale;				///< the uniform scale factor applied to the instance matrix before it is sent to W3D.
 
+	// GeneralsVR @feature Motion smoothing. GameLogic only moves objects at the sim rate (30Hz),
+	// so at any higher render rate units visibly step. These hold the transform at the last two
+	// sim ticks; draw() interpolates between them using the fraction of a sim step the renderer
+	// is currently between. Sim state is never touched - this is purely what gets drawn.
+	Matrix3D m_smoothPrevTransform;			///< transform as of the previous sim tick
+	Matrix3D m_smoothCurrTransform;			///< transform as of the latest sim tick
+	UnsignedInt m_smoothLastLogicFrame;	///< sim frame the pair above was rolled on
+	Bool m_smoothHasHistory;						///< false until two ticks have been seen
+
 	DrawableInfo				m_drawableInfo;		///< structure pointed to by W3D render objects so they know which drawable they belong to.
 
 	ModelConditionFlags	m_conditionState;				///< The Drawables current behavior state

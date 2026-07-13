@@ -42,6 +42,9 @@
 #include "Common/GameState.h"
 #include "Common/GameUtility.h"
 #include "Common/GlobalData.h"
+// GeneralsVR @feature Motion smoothing needs the sim/render phase and quaternion slerp.
+#include "Common/GameEngine.h"
+#include "WWMath/quat.h"
 #include "Common/ModuleFactory.h"
 #include "Common/PerfTimer.h"
 #include "Common/Player.h"
@@ -404,6 +407,13 @@ Drawable::Drawable( const ThingTemplate *thingTemplate, DrawableStatusBits statu
 
 	m_instance.Make_Identity();
 	m_instanceIsIdentity = true;
+
+	// GeneralsVR @feature Motion smoothing starts with no history: the first tick seen fills
+	// both transforms, so a freshly spawned drawable never lerps in from somewhere else.
+	m_smoothPrevTransform.Make_Identity();
+	m_smoothCurrTransform.Make_Identity();
+	m_smoothLastLogicFrame = 0;
+	m_smoothHasHistory = FALSE;
 
 	//Real scaleFuzziness = thingTemplate->getInstanceScaleFuzziness();
 	//Real fuzzyScale = ( 1.0f + GameClientRandomValueReal( -scaleFuzziness, scaleFuzziness ));
@@ -2634,6 +2644,41 @@ void Drawable::draw()
 
 	// call the database defined draw action method
 	Matrix3D transformMtx = *getTransformMatrix();
+
+	// GeneralsVR @feature Smooth 30Hz sim motion out over the render frames between ticks.
+	// Rendering trails the sim by one tick in exchange for continuous motion, which VR needs
+	// (stepping units at 30Hz are nauseating in a headset) and high-refresh flat play likes too.
+	if (TheGlobalData->m_smoothMotion)
+	{
+		const UnsignedInt logicFrame = TheGameLogic->getFrame();
+		if (logicFrame != m_smoothLastLogicFrame)
+		{
+			m_smoothPrevTransform = m_smoothHasHistory ? m_smoothCurrTransform : transformMtx;
+			m_smoothCurrTransform = transformMtx;
+			m_smoothLastLogicFrame = logicFrame;
+			m_smoothHasHistory = TRUE;
+		}
+
+		if (m_smoothHasHistory)
+		{
+			const Vector3 prevPos = m_smoothPrevTransform.Get_Translation();
+			const Vector3 currPos = m_smoothCurrTransform.Get_Translation();
+
+			// Spawns, teleports and warps must not be smeared across the gap.
+			const Real SMOOTH_MAX_STEP = 100.0f;	// world units per sim tick
+			if ((currPos - prevPos).Length2() <= SMOOTH_MAX_STEP * SMOOTH_MAX_STEP)
+			{
+				const Real alpha = TheGameEngine->getLogicTimeAlpha();
+
+				Quaternion rot;
+				Slerp(rot, Build_Quaternion(m_smoothPrevTransform),
+					Build_Quaternion(m_smoothCurrTransform), alpha);
+				Build_Matrix3D(rot, transformMtx);
+				transformMtx.Set_Translation(prevPos + (currPos - prevPos) * alpha);
+			}
+		}
+	}
+
 	if (!isInstanceIdentity())
 	{
 #ifdef ALLOW_TEMPORARIES

@@ -24,6 +24,7 @@
 #include "VRDevice/DxvkInterop.h"
 
 #include "Common/Debug.h"
+#include "Common/GlobalData.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -235,6 +236,10 @@ Bool OpenXRManager::init()
 	m_eyeWidth = views[0].recommendedImageRectWidth;
 	m_eyeHeight = views[0].recommendedImageRectHeight;
 	DEBUG_LOG(("OpenXR: %d views, recommended eye target %dx%d", m_eyeCount, m_eyeWidth, m_eyeHeight));
+
+	if (TheGlobalData != nullptr && TheGlobalData->m_vrWorldUnitsPerMeter > 0.0f)
+		m_worldUnitsPerMeter = TheGlobalData->m_vrWorldUnitsPerMeter;
+	DEBUG_LOG(("OpenXR: tabletop scale: %.1f world units per metre", m_worldUnitsPerMeter));
 
 	probeVulkanRequirements();
 

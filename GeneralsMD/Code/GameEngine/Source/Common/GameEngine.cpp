@@ -249,6 +249,7 @@ GameEngine::GameEngine()
 {
 	// initialize to non garbage values
 	m_logicTimeAccumulator = 0.0f;
+	m_logicTimeAlpha = 1.0f;
 	m_quitting = FALSE;
 	m_isActive = FALSE;
 
@@ -889,6 +890,8 @@ Bool GameEngine::canUpdateRegularGameLogic(UnsignedInt logicTimeQueryFlags)
 	if (useFastMode || logicTimeScaleFps >= maxRenderFps)
 	{
 		// Logic time scale is uncapped or larger equal Render FPS. Update straight away.
+		// GeneralsVR: the sim runs every render frame, so there is nothing to interpolate.
+		m_logicTimeAlpha = 1.0f;
 		return true;
 	}
 	else
@@ -898,11 +901,21 @@ Bool GameEngine::canUpdateRegularGameLogic(UnsignedInt logicTimeQueryFlags)
 		const Real targetFrameTime = 1.0f / logicTimeScaleFps;
 		m_logicTimeAccumulator += min(TheFramePacer->getUpdateTime(), targetFrameTime);
 
+		Bool updateLogic = FALSE;
 		if (m_logicTimeAccumulator >= targetFrameTime)
 		{
 			m_logicTimeAccumulator -= targetFrameTime;
-			return true;
+			updateLogic = TRUE;
 		}
+
+		// GeneralsVR: how far this render frame sits between two sim ticks. Drawables lerp by
+		// this to turn 30Hz steps into continuous motion.
+		m_logicTimeAlpha = m_logicTimeAccumulator / targetFrameTime;
+		if (m_logicTimeAlpha < 0.0f) m_logicTimeAlpha = 0.0f;
+		if (m_logicTimeAlpha > 1.0f) m_logicTimeAlpha = 1.0f;
+
+		if (updateLogic)
+			return true;
 	}
 
 	return false;

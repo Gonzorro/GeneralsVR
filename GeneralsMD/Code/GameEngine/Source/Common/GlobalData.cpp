@@ -637,6 +637,8 @@ GlobalData::GlobalData()
 	m_chipSetType = 0;
 	m_headless = FALSE;
 	m_vrMode = FALSE;
+	m_smoothMotion = FALSE;
+	m_vrWorldUnitsPerMeter = 500.0f;
 	m_windowed = 0;
 	m_xResolution = DEFAULT_DISPLAY_WIDTH;
 	m_yResolution = DEFAULT_DISPLAY_HEIGHT;
