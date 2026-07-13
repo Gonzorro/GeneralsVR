@@ -200,6 +200,11 @@ public:
 	/// are multiplied by this when composing the VR camera.
 	Real getWorldUnitsPerMeter() const { return m_worldUnitsPerMeter; }
 
+	/// Resize the player relative to the world. This MUST be how the scale changes: the value is
+	/// cached here, so writing it into GlobalData - which is only read once, at startup - looked
+	/// like it worked and did nothing at all.
+	void setWorldUnitsPerMeter(Real scale) { if (scale > 0.0f) m_worldUnitsPerMeter = scale; }
+
 private:
 	enum { MAX_EYES = 2 };
 

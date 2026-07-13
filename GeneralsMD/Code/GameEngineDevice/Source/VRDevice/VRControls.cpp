@@ -803,7 +803,7 @@ void VRControls::updateLocomotion(W3DView *view)
 			Real newScale = m_grabScale * (m_grabHandSpan / spanNow);
 			if (newScale < MIN_SCALE) newScale = MIN_SCALE;
 			if (newScale > MAX_SCALE) newScale = MAX_SCALE;
-			TheWritableGlobalData->m_vrWorldUnitsPerMeter = newScale;
+			TheOpenXR->setWorldUnitsPerMeter(newScale);
 		}
 	}
 	else
@@ -860,7 +860,17 @@ void VRControls::updateLocomotion(W3DView *view)
 	if (fabsf(turn) > fabsf(grow))
 	{
 		if (turn != 0.0f)
+		{
 			view->setAngle(view->getAngle() + turn * STICK_TURN_SPEED * dt);
+
+			// setAngle only stores the number. The camera is rebuilt from it just once, when the
+			// view is marked dirty - and setAngle does not mark it. So the stick was turning a
+			// value that nothing ever read, which is why the rotation never happened. lookAt sets
+			// the dirty flag, so asking the view to look where it is already looking rebuilds the
+			// camera with the new heading.
+			const Coord3D here = view->getPosition();
+			view->lookAt(&here);
+		}
 	}
 	else if (grow != 0.0f)
 	{
@@ -870,7 +880,7 @@ void VRControls::updateLocomotion(W3DView *view)
 		Real newScale = TheOpenXR->getWorldUnitsPerMeter() * (1.0f + grow * STICK_ZOOM_SPEED * dt);
 		if (newScale < MIN_SCALE) newScale = MIN_SCALE;
 		if (newScale > MAX_SCALE) newScale = MAX_SCALE;
-		TheWritableGlobalData->m_vrWorldUnitsPerMeter = newScale;
+		TheOpenXR->setWorldUnitsPerMeter(newScale);
 	}
 }
 
