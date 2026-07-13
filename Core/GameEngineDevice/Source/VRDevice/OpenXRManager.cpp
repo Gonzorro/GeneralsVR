@@ -1428,7 +1428,7 @@ void OpenXRManager::layoutUiPanels()
 		p.cropY = 0;
 		p.cropW = m_uiWidth;
 		p.cropH = m_uiHeight;
-		p.widthMeters = 0.55f;
+		p.widthMeters = 0.55f * 0.75f;	// three quarters of what it was
 		p.heightMeters = p.widthMeters * (Real)p.cropH / (Real)p.cropW;
 		p.pose.orientation = panelQuat;
 

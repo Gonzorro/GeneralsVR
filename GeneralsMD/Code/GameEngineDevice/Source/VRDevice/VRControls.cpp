@@ -1267,13 +1267,19 @@ void VRControls::update()
 	// stopMovie(). So we call the same thing: no keyboard needed in a headset.
 	if (TheDisplay != nullptr && TheDisplay->isMoviePlaying())
 	{
+		// No lasers across the intro. There is nothing to point at, and leaving them lit means
+		// two beams hanging over the film - this path returns early, so they must be put away
+		// here or they simply keep whatever state they were last left in.
 		for (Int hand = 0; hand < 2; ++hand)
 		{
+			if (m_rayLines[hand] != nullptr)
+				m_rayLines[hand]->Set_Hidden(true);
+			m_rayVisible[hand] = FALSE;
+
 			if (TheOpenXR->getController(hand).secondaryPressed)
 			{
 				TheDisplay->stopMovie();
 				DEBUG_LOG(("OpenXR: movie skipped by controller"));
-				break;
 			}
 		}
 		return;	// nothing else to do while a movie is on screen
