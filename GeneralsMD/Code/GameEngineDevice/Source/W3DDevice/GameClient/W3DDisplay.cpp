@@ -1880,7 +1880,10 @@ void W3DDisplay::drawVRScene( W3DView *view )
 		Vector2 vMin(tanf(v.angleLeft), tanf(v.angleDown));
 		Vector2 vMax(tanf(v.angleRight), tanf(v.angleUp));
 		vrCamera->Set_View_Plane(vMin, vMax);
-		vrCamera->Set_Clip_Planes(inGame ? (0.05f * scale) : 0.02f, inGame ? 15000.0f : 100.0f);
+		// Far enough to hold the whole battlefield. The flat game clips much closer because it
+		// only ever looks at a small patch of map; in VR you look across the entire thing, and a
+		// horizon that eats the far half of the map is glaring.
+		vrCamera->Set_Clip_Planes(inGame ? (0.05f * scale) : 0.02f, inGame ? 120000.0f : 100.0f);
 		vrCamera->Set_Viewport(Vector2(0.0f, 0.0f), Vector2(1.0f, 1.0f));
 
 		DX8Wrapper::Set_Render_Target(eyeSurface, TheOpenXR->getDepthSurface());
@@ -1923,8 +1926,9 @@ void W3DDisplay::drawVRScene( W3DView *view )
 
 		if (WW3D::Begin_Render(false, false, Vector3(0.0f, 0.0f, 0.0f)) == WW3D_ERROR_OK)
 		{
-			// Fully transparent: everything the UI does not cover must let the battlefield through.
-			DX8Wrapper::Clear(true, false, Vector3(0.0f, 0.0f, 0.0f), 0.0f);
+			// Opaque. The interface is a physical panel you hold, not a ghost: leaving the alpha
+			// at zero let the battlefield bleed through the buttons and washed the whole thing out.
+			DX8Wrapper::Clear(true, false, Vector3(0.0f, 0.0f, 0.0f), 1.0f);
 
 			TheInGameUI->DRAW();	// this repaints the whole window system, menus included
 			if (TheMouse != nullptr)

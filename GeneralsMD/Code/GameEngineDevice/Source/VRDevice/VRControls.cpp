@@ -31,8 +31,10 @@
 #include "Common/GlobalData.h"
 #include "Common/MessageStream.h"
 #include "GameClient/Display.h"
+#include "GameClient/Drawable.h"
 #include "GameClient/DrawableInfo.h"
 #include "GameClient/InGameUI.h"
+#include "GameLogic/Object.h"
 #include "GameClient/View.h"
 #include "GameClient/Mouse.h"
 #include "GameLogic/GameLogic.h"
@@ -285,17 +287,94 @@ Bool VRControls::traceScene(const Vector3 &origin, const Vector3 &dir, Coord3D &
 	if (info == nullptr || info->m_drawable == nullptr)
 		return FALSE;
 
-	// Where along the ray did it strike? ContactPoint is NOT dependable here - W3D's collision
-	// routines only fill it in for some geometry, and it comes back as the world origin for the
-	// rest, which then projects to nowhere and silently swallows the click. Fraction, on the
-	// other hand, is always set: it is the hit's distance along the segment we cast.
-	const Real distance = result.Fraction * AIM_MAX_DISTANCE;
-	const Vector3 point = origin + dir * distance;
+	// RTS3DScene::castRay does NOT fill in the CastResultStruct we hand it - it tests each object
+	// with a result of its own. What it gives back instead is a CLIPPED RAY: rayTest.Ray now ends
+	// exactly at the intersection. Reading Fraction (still 1.0, untouched) or ContactPoint (still
+	// the origin) puts the hit twenty thousand units away, underground, which then projects to
+	// nowhere and silently swallows every click on a unit.
+	const Vector3 point = rayTest.Ray.Get_P1();
 
 	outHit.x = point.X;
 	outHit.y = point.Y;
 	outHit.z = point.Z;
 	return TRUE;
+}
+
+//-------------------------------------------------------------------------------------------------
+/** The drawable under the ray, if any. */
+//-------------------------------------------------------------------------------------------------
+Drawable *VRControls::pickDrawable(const Vector3 &origin, const Vector3 &dir) const
+{
+	if (W3DDisplay::m_3DScene == nullptr)
+		return nullptr;
+
+	LineSegClass lineSeg;
+	lineSeg.Set(origin, origin + dir * AIM_MAX_DISTANCE);
+
+	CastResultStruct result;
+	RayCollisionTestClass rayTest(lineSeg, &result, COLL_TYPE_ALL, false, false);
+
+	if (!W3DDisplay::m_3DScene->castRay(rayTest, false, (Int)PICK_TYPE_ALL_DRAWABLES))
+		return nullptr;
+	if (rayTest.CollidedRenderObj == nullptr)
+		return nullptr;
+
+	DrawableInfo *info = (DrawableInfo *)rayTest.CollidedRenderObj->Get_User_Data();
+	return (info != nullptr) ? info->m_drawable : nullptr;
+}
+
+//-------------------------------------------------------------------------------------------------
+/** Select whatever the laser is on. This does NOT go through a screen pixel: the cursor lives in
+	* the flat camera's view, which is far narrower than the headset's, so most of what the player
+	* can plainly see does not project onto it and the click vanishes. We build the very message
+	* the mouse translator would have built, and hand it to the engine directly. */
+//-------------------------------------------------------------------------------------------------
+void VRControls::selectUnderRay(const Vector3 &origin, const Vector3 &dir)
+{
+	if (TheInGameUI == nullptr || TheMessageStream == nullptr)
+		return;
+
+	Drawable *draw = pickDrawable(origin, dir);
+
+	if (draw == nullptr || !draw->isSelectable() || draw->getObject() == nullptr)
+	{
+		// Empty ground: clear the selection, exactly as clicking bare terrain does.
+		TheInGameUI->deselectAllDrawables();
+		TheMessageStream->appendMessage(GameMessage::MSG_DESTROY_SELECTED_GROUP);
+		return;
+	}
+
+	TheInGameUI->deselectAllDrawables();
+	TheInGameUI->selectDrawable(draw);
+
+	GameMessage *msg = TheMessageStream->appendMessage(GameMessage::MSG_CREATE_SELECTED_GROUP);
+	msg->appendBooleanArgument(TRUE);	// a fresh group, not an addition
+	msg->appendObjectIDArgument(draw->getObject()->getID());
+}
+
+//-------------------------------------------------------------------------------------------------
+/** Order the selection to whatever the laser is on: attack an object, or move to a patch of
+	* ground. Also world-space, for the same reason. */
+//-------------------------------------------------------------------------------------------------
+void VRControls::commandUnderRay(const Vector3 &origin, const Vector3 &dir)
+{
+	if (TheMessageStream == nullptr)
+		return;
+
+	Drawable *draw = pickDrawable(origin, dir);
+	if (draw != nullptr && draw->getObject() != nullptr)
+	{
+		GameMessage *msg = TheMessageStream->appendMessage(GameMessage::MSG_DO_ATTACK_OBJECT);
+		msg->appendObjectIDArgument(draw->getObject()->getID());
+		return;
+	}
+
+	Coord3D ground;
+	if (traceTerrain(origin, dir, ground))
+	{
+		GameMessage *msg = TheMessageStream->appendMessage(GameMessage::MSG_DO_MOVETO);
+		msg->appendLocationArgument(ground);
+	}
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -497,6 +576,27 @@ void VRControls::updatePointer(W3DView *view)
 		}
 	}
 
+	// On the battlefield, selection and orders go through the WORLD, not through a pixel - and
+	// this must happen before the cursor bails out below, because the case it is fixing is
+	// exactly the one where the cursor cannot be placed at all. The cursor still follows along
+	// when it can (it drives the GUI, the hover highlight and building placement), but a click
+	// no longer depends on it.
+	if (pick == OpenXRManager::VR_PICK_NONE && view != nullptr
+		&& TheGameLogic != nullptr && TheGameLogic->isInGame()
+		&& (TheInGameUI == nullptr || TheInGameUI->getPendingPlaceType() == nullptr))
+	{
+		Vector3 origin, dir;
+		if (computeHandRay(VR_HAND_RIGHT, origin, dir))
+		{
+			if (rightState.triggerPressed)
+				selectUnderRay(origin, dir);
+
+			const VRControllerState &leftState = TheOpenXR->getController(VR_HAND_LEFT);
+			if (leftState.triggerPressed)
+				commandUnderRay(origin, dir);
+		}
+	}
+
 	if (!haveTarget)
 		return;	// pointing at nothing; leave the cursor where it is
 
@@ -507,6 +607,17 @@ void VRControls::updatePointer(W3DView *view)
 
 	const VRControllerState &right = TheOpenXR->getController(VR_HAND_RIGHT);
 	const VRControllerState &left = TheOpenXR->getController(VR_HAND_LEFT);
+
+	// Synthetic clicks are for the things that genuinely live in screen space: the UI panels,
+	// and placing a building (whose ghost follows the cursor). On the open battlefield the click
+	// was handled in world space above, and firing a second one here would fight it - a click on
+	// bare terrain at a stale cursor would undo the selection we just made.
+	const Bool clickThroughCursor = (pick != OpenXRManager::VR_PICK_NONE)
+		|| (TheInGameUI != nullptr && TheInGameUI->getPendingPlaceType() != nullptr)
+		|| (TheGameLogic == nullptr || !TheGameLogic->isInGame());
+
+	if (!clickThroughCursor)
+		return;
 
 	// Right trigger = left click (select, band box, confirm).
 	if (right.trigger && !m_leftDown)

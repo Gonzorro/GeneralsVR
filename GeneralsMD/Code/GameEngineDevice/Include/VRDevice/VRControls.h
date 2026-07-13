@@ -78,6 +78,15 @@ private:
 	/// Terrain-only tracing is not enough: a ray aimed at a tank passes straight through it and
 	/// lands on the dirt behind, and the game would then pick the dirt.
 	Bool traceScene(const Vector3 &origin, const Vector3 &dir, Coord3D &outHit) const;
+	/// The drawable the ray strikes, if any.
+	class Drawable *pickDrawable(const Vector3 &origin, const Vector3 &dir) const;
+	/// Select / command in WORLD space, with no screen pixel involved. The cursor we drive lives
+	/// in the flat camera's view, which is far narrower than the headset's: most of what the
+	/// player can see simply does not project onto it, so a click routed through a pixel is
+	/// swallowed. These go straight into the message stream instead - the same messages the
+	/// mouse translators would have produced.
+	void selectUnderRay(const Vector3 &origin, const Vector3 &dir);
+	void commandUnderRay(const Vector3 &origin, const Vector3 &dir);
 	/// Where the ray lands: an object if it hits one, otherwise the ground.
 	Bool traceAim(const Vector3 &origin, const Vector3 &dir, Coord3D &outHit) const;
 	void updateLocomotion(W3DView *view);

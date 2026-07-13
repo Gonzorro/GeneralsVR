@@ -1432,8 +1432,9 @@ void OpenXRManager::layoutUiPanels()
 		p.heightMeters = p.widthMeters * (Real)p.cropH / (Real)p.cropW;
 		p.pose.orientation = panelQuat;
 
-		// Out in front of the hand, where a whole screen has room to sit.
-		const XrVector3f offsetLocal = { 0.0f, 0.22f, -0.30f };
+		// Close to the hand, like something you are holding rather than something hovering
+		// out of reach.
+		const XrVector3f offsetLocal = { 0.0f, 0.05f, -0.13f };
 		const XrVector3f offsetWorld = rotate(handQuat, offsetLocal);
 		p.pose.position.x = c.posX + offsetWorld.x;
 		p.pose.position.y = c.posY + offsetWorld.y;
@@ -2075,7 +2076,8 @@ void OpenXRManager::submitFrame(Bool worldRendered)
 
 			XrCompositionLayerQuad& q = quadLayers[i];
 			q = XrCompositionLayerQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
-			q.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+			// No source-alpha blending: the panels are solid objects, not ghosts.
+			q.layerFlags = 0;
 			q.space = m_appSpace;
 			q.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
 			q.subImage.swapchain = p.isGroupBar ? m_groupBarSwapchain : m_uiSwapchain;
