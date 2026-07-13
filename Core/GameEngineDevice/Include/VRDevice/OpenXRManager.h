@@ -48,15 +48,36 @@ public:
 	Int getEyeWidth() const { return m_eyeWidth; }
 	Int getEyeHeight() const { return m_eyeHeight; }
 
+	/// Phase 2 spike: when running under DXVK's d3d8.dll, locate DXVK's D3D9 Vulkan interop
+	/// behind the game's D3D8 device and log the Vulkan handles OpenXR session creation will
+	/// need. Safe no-op on native D3D8. Pass DX8Wrapper::_Get_D3D_Device8().
+	void probeDxvkInterop(void* d3d8Device);
+
+	Bool hasDxvkVulkanDevice() const { return m_vkDevice != nullptr; }
+
 private:
 	Bool hasExtension(const char* name) const;
+
+	/// Log what the OpenXR runtime requires from a Vulkan instance/device
+	/// (XR_KHR_vulkan_enable), so we can verify DXVK's device satisfies it.
+	void probeVulkanRequirements();
 
 	XrInstance m_instance;
 	XrSystemId m_systemId;
 	Int m_eyeWidth;
 	Int m_eyeHeight;
-	Bool m_supportsVulkan;
+	Bool m_supportsVulkan;   ///< XR_KHR_vulkan_enable2
+	Bool m_supportsVulkan1;  ///< XR_KHR_vulkan_enable (works with an existing VkDevice - our path)
 	Bool m_supportsD3D11;
+
+	// DXVK interop results (Phase 2 spike; all null when not running under DXVK)
+	struct ID3D9VkInteropDevice* m_dxvkInterop;
+	struct VkInstance_T*       m_vkInstance;
+	struct VkPhysicalDevice_T* m_vkPhysicalDevice;
+	struct VkDevice_T*         m_vkDevice;
+	struct VkQueue_T*          m_vkQueue;
+	UnsignedInt m_vkQueueIndex;
+	UnsignedInt m_vkQueueFamilyIndex;
 };
 
 extern OpenXRManager* TheOpenXR; ///< nullptr unless the game was launched with -vr

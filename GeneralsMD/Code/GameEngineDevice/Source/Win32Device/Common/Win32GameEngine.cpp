@@ -39,6 +39,7 @@
 
 #ifdef RTS_HAS_OPENXR
 #include "VRDevice/OpenXRManager.h"
+#include "dx8wrapper.h"
 #endif
 
 extern DWORD TheMessageTime;
@@ -83,7 +84,12 @@ void Win32GameEngine::init()
 	if (TheGlobalData != nullptr && TheGlobalData->m_vrMode && TheOpenXR == nullptr)
 	{
 		TheOpenXR = NEW OpenXRManager;
-		TheOpenXR->init();
+		if (TheOpenXR->init())
+		{
+			// Phase 2 spike: the D3D device exists by now (created during GameEngine::init).
+			// When running under DXVK this recovers the Vulkan handles session creation needs.
+			TheOpenXR->probeDxvkInterop(DX8Wrapper::_Get_D3D_Device8());
+		}
 	}
 #endif
 
