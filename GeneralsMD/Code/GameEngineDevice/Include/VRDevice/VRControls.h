@@ -74,6 +74,12 @@ public:
 private:
 	Bool computeHandRay(Int hand, Vector3 &outOrigin, Vector3 &outDir) const;
 	Bool traceTerrain(const Vector3 &origin, const Vector3 &dir, Coord3D &outHit) const;
+	/// Cast the ray at the actual scene - units, buildings, everything the player can click.
+	/// Terrain-only tracing is not enough: a ray aimed at a tank passes straight through it and
+	/// lands on the dirt behind, and the game would then pick the dirt.
+	Bool traceScene(const Vector3 &origin, const Vector3 &dir, Coord3D &outHit) const;
+	/// Where the ray lands: an object if it hits one, otherwise the ground.
+	Bool traceAim(const Vector3 &origin, const Vector3 &dir, Coord3D &outHit) const;
 	void updateLocomotion(W3DView *view);
 	void updatePointer(W3DView *view);
 	void updateRays(W3DView *view);

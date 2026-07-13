@@ -31,16 +31,22 @@
 #include "Common/GlobalData.h"
 #include "Common/MessageStream.h"
 #include "GameClient/Display.h"
+#include "GameClient/DrawableInfo.h"
 #include "GameClient/View.h"
 #include "GameClient/Mouse.h"
 #include "GameLogic/GameLogic.h"
 #include "GameLogic/TerrainLogic.h"
+#include "W3DDevice/GameClient/W3DDisplay.h"
+#include "W3DDevice/GameClient/W3DScene.h"
 #include "W3DDevice/GameClient/W3DView.h"
 #include "Win32Device/GameClient/Win32Mouse.h"
+#include "WW3D2/coltest.h"
 #include "WW3D2/dx8wrapper.h"
 #include "WW3D2/line3d.h"
+#include "WW3D2/rendobj.h"
 #include "WW3D2/scene.h"
 #include "WW3D2/ww3d.h"
+#include "WWMath/lineseg.h"
 #include "WWMath/quat.h"
 
 VRControls *TheVRControls = nullptr;
@@ -247,6 +253,51 @@ Bool VRControls::traceTerrain(const Vector3 &origin, const Vector3 &dir, Coord3D
 	}
 
 	return FALSE;
+}
+
+//-------------------------------------------------------------------------------------------------
+/** Cast the ray at the things the player actually wants to click: units, buildings, everything
+	* in the scene. This is the same cast the engine performs for a mouse click - it just starts
+	* from the controller instead of from a pixel. */
+//-------------------------------------------------------------------------------------------------
+Bool VRControls::traceScene(const Vector3 &origin, const Vector3 &dir, Coord3D &outHit) const
+{
+	if (W3DDisplay::m_3DScene == nullptr)
+		return FALSE;
+
+	LineSegClass lineSeg;
+	lineSeg.Set(origin, origin + dir * AIM_MAX_DISTANCE);
+
+	CastResultStruct result;
+	result.ComputeContactPoint = true;	// we need WHERE it hit, not just that it did
+
+	RayCollisionTestClass rayTest(lineSeg, &result, COLL_TYPE_ALL, false, false);
+
+	if (!W3DDisplay::m_3DScene->castRay(rayTest, false, (Int)PICK_TYPE_ALL_DRAWABLES))
+		return FALSE;
+	if (rayTest.CollidedRenderObj == nullptr)
+		return FALSE;
+
+	// Only report things that belong to a drawable - the terrain has no drawable behind it and
+	// is handled by the ground trace instead.
+	DrawableInfo *info = (DrawableInfo *)rayTest.CollidedRenderObj->Get_User_Data();
+	if (info == nullptr || info->m_drawable == nullptr)
+		return FALSE;
+
+	outHit.x = result.ContactPoint.X;
+	outHit.y = result.ContactPoint.Y;
+	outHit.z = result.ContactPoint.Z;
+	return TRUE;
+}
+
+//-------------------------------------------------------------------------------------------------
+/** Where the laser lands: on an object if it hits one, otherwise on the ground. */
+//-------------------------------------------------------------------------------------------------
+Bool VRControls::traceAim(const Vector3 &origin, const Vector3 &dir, Coord3D &outHit) const
+{
+	if (traceScene(origin, dir, outHit))
+		return TRUE;
+	return traceTerrain(origin, dir, outHit);
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -489,11 +540,15 @@ void VRControls::updatePointer(W3DView *view)
 	}
 	else if (view != nullptr && TheGameLogic != nullptr && TheGameLogic->isInGame())
 	{
-		// Otherwise point at the battlefield itself.
+		// Otherwise point at the battlefield. Crucially this hits UNITS AND BUILDINGS, not just
+		// the ground: the cursor is placed on the point where the laser actually strikes the
+		// object, so when the engine then does its own pick from that pixel it finds the same
+		// object. Tracing only the terrain sent the cursor to the dirt behind the tank you were
+		// aiming at, which is why units could not be clicked.
 		Vector3 origin, dir;
 		Coord3D hit;
 		if (computeHandRay(VR_HAND_RIGHT, origin, dir)
-			&& traceTerrain(origin, dir, hit)
+			&& traceAim(origin, dir, hit)
 			&& view->worldToScreen(&hit, &screen))
 		{
 			m_hasAimPoint = TRUE;
@@ -628,8 +683,10 @@ void VRControls::updateRays(W3DView *view)
 		}
 		else if (inGame)
 		{
+			// Stop on whatever it strikes - a tank, a building, or the ground - so the beam
+			// visibly touches the thing you are about to click.
 			Coord3D hit;
-			if (traceTerrain(origin, dir, hit))
+			if (traceAim(origin, dir, hit))
 			{
 				const Vector3 hitVec(hit.x, hit.y, hit.z);
 				length = (hitVec - origin).Length();
