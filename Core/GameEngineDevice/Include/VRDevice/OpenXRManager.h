@@ -54,9 +54,14 @@ public:
 	void probeDxvkInterop(void* d3d8Device);
 
 	Bool hasDxvkVulkanDevice() const { return m_vkDevice != nullptr; }
+	Bool hasSession() const { return m_session != XR_NULL_HANDLE; }
 
 private:
 	Bool hasExtension(const char* name) const;
+
+	/// Phase 2 spike: create the XrSession (and a trial swapchain) over DXVK's Vulkan
+	/// device via XR_KHR_vulkan_enable. Logs every step; failure leaves the game flat.
+	void tryCreateSession();
 
 	/// Log what the OpenXR runtime requires from a Vulkan instance/device
 	/// (XR_KHR_vulkan_enable), so we can verify DXVK's device satisfies it.
@@ -64,6 +69,8 @@ private:
 
 	XrInstance m_instance;
 	XrSystemId m_systemId;
+	XrSession m_session;
+	XrSwapchain m_trialSwapchain;
 	Int m_eyeWidth;
 	Int m_eyeHeight;
 	Bool m_supportsVulkan;   ///< XR_KHR_vulkan_enable2

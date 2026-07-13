@@ -36,6 +36,8 @@ OpenXRManager* TheOpenXR = nullptr;
 OpenXRManager::OpenXRManager()
 	: m_instance(XR_NULL_HANDLE)
 	, m_systemId(XR_NULL_SYSTEM_ID)
+	, m_session(XR_NULL_HANDLE)
+	, m_trialSwapchain(XR_NULL_HANDLE)
 	, m_eyeWidth(0)
 	, m_eyeHeight(0)
 	, m_supportsVulkan(FALSE)
@@ -319,10 +321,150 @@ void OpenXRManager::probeDxvkInterop(void* d3d8Device)
 
 	DEBUG_LOG(("OpenXR: dxvk vulkan handles: instance=%p physicalDevice=%p device=%p queue=%p family=%u index=%u",
 		m_vkInstance, m_vkPhysicalDevice, m_vkDevice, m_vkQueue, m_vkQueueFamilyIndex, m_vkQueueIndex));
+
+	if (m_supportsVulkan1)
+		tryCreateSession();
+}
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsVR: XR_KHR_vulkan_enable session structs, declared locally (see note above).
+struct LocalXrGraphicsBindingVulkanKHR
+{
+	XrStructureType type;
+	const void* next;
+	VkInstance instance;
+	VkPhysicalDevice physicalDevice;
+	VkDevice device;
+	uint32_t queueFamilyIndex;
+	uint32_t queueIndex;
+};
+typedef XrResult (XRAPI_PTR *PFN_local_xrGetVulkanGraphicsDeviceKHR)(
+	XrInstance, XrSystemId, VkInstance, VkPhysicalDevice*);
+
+struct LocalXrSwapchainImageVulkanKHR
+{
+	XrStructureType type;
+	void* next;
+	VkImage image;
+};
+
+void OpenXRManager::tryCreateSession()
+{
+	// The spec requires confirming which physical device the runtime expects for our
+	// VkInstance; on multi-GPU systems using the wrong one fails later and worse.
+	PFN_local_xrGetVulkanGraphicsDeviceKHR pGetGraphicsDevice = nullptr;
+	xrGetInstanceProcAddr(m_instance, "xrGetVulkanGraphicsDeviceKHR", (PFN_xrVoidFunction*)&pGetGraphicsDevice);
+	if (pGetGraphicsDevice == nullptr)
+	{
+		DEBUG_LOG(("OpenXR: session: xrGetVulkanGraphicsDeviceKHR did not resolve - aborting session"));
+		return;
+	}
+
+	VkPhysicalDevice runtimePhysDev = nullptr;
+	XrResult devResult = pGetGraphicsDevice(m_instance, m_systemId, m_vkInstance, &runtimePhysDev);
+	if (XR_FAILED(devResult))
+	{
+		DEBUG_LOG(("OpenXR: session: xrGetVulkanGraphicsDeviceKHR FAILED (%d) - runtime cannot use DXVK's VkInstance",
+			(int)devResult));
+		return;
+	}
+	if (runtimePhysDev != m_vkPhysicalDevice)
+	{
+		DEBUG_LOG(("OpenXR: session: runtime wants physicalDevice=%p but DXVK renders on %p - aborting session",
+			runtimePhysDev, m_vkPhysicalDevice));
+		return;
+	}
+	DEBUG_LOG(("OpenXR: session: runtime confirmed DXVK's physical device"));
+
+	LocalXrGraphicsBindingVulkanKHR binding = {};
+	binding.type = XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR;
+	binding.instance = m_vkInstance;
+	binding.physicalDevice = m_vkPhysicalDevice;
+	binding.device = m_vkDevice;
+	binding.queueFamilyIndex = m_vkQueueFamilyIndex;
+	binding.queueIndex = m_vkQueueIndex;
+
+	XrSessionCreateInfo sci = {XR_TYPE_SESSION_CREATE_INFO};
+	sci.next = &binding;
+	sci.systemId = m_systemId;
+
+	// The runtime may submit setup work on our queue; DXVK's submission thread owns it,
+	// so follow the interop contract: flush pending D3D work, lock, call, unlock.
+	m_dxvkInterop->FlushRenderingCommands();
+	m_dxvkInterop->LockSubmissionQueue();
+	XrResult result = xrCreateSession(m_instance, &sci, &m_session);
+	m_dxvkInterop->ReleaseSubmissionQueue();
+	if (XR_FAILED(result))
+	{
+		DEBUG_LOG(("OpenXR: session: xrCreateSession FAILED (%d) - DXVK device rejected", (int)result));
+		m_session = XR_NULL_HANDLE;
+		return;
+	}
+	DEBUG_LOG(("OpenXR: session: created over DXVK's Vulkan device"));
+
+	// Trial swapchain: proves the runtime will hand us renderable images on this device.
+	uint32_t formatCount = 0;
+	xrEnumerateSwapchainFormats(m_session, 0, &formatCount, nullptr);
+	std::vector<int64_t> formats(formatCount ? formatCount : 1);
+	if (formatCount > 0 &&
+		XR_SUCCEEDED(xrEnumerateSwapchainFormats(m_session, formatCount, &formatCount, formats.data())))
+	{
+		DEBUG_LOG(("OpenXR: session: %u swapchain formats, first=%lld (VkFormat)", formatCount, formats[0]));
+
+		XrSwapchainCreateInfo swci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+		swci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+		swci.format = formats[0];
+		swci.sampleCount = 1;
+		swci.width = m_eyeWidth > 0 ? m_eyeWidth : 2064;
+		swci.height = m_eyeHeight > 0 ? m_eyeHeight : 2272;
+		swci.faceCount = 1;
+		swci.arraySize = 1;
+		swci.mipCount = 1;
+
+		result = xrCreateSwapchain(m_session, &swci, &m_trialSwapchain);
+		if (XR_SUCCEEDED(result))
+		{
+			uint32_t imageCount = 0;
+			xrEnumerateSwapchainImages(m_trialSwapchain, 0, &imageCount, nullptr);
+			std::vector<LocalXrSwapchainImageVulkanKHR> images(imageCount ? imageCount : 1);
+			for (uint32_t i = 0; i < imageCount; ++i)
+			{
+				images[i] = LocalXrSwapchainImageVulkanKHR{};
+				images[i].type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR;
+			}
+			if (imageCount > 0 &&
+				XR_SUCCEEDED(xrEnumerateSwapchainImages(m_trialSwapchain, imageCount, &imageCount,
+					(XrSwapchainImageBaseHeader*)images.data())))
+			{
+				DEBUG_LOG(("OpenXR: session: swapchain %ux%u created, %u VkImages (first=0x%llX)",
+					swci.width, swci.height, imageCount, (unsigned long long)images[0].image));
+			}
+			else
+			{
+				DEBUG_LOG(("OpenXR: session: swapchain created but image enumeration failed"));
+			}
+		}
+		else
+		{
+			DEBUG_LOG(("OpenXR: session: xrCreateSwapchain FAILED (%d)", (int)result));
+		}
+	}
+
+	DEBUG_LOG(("OpenXR: session spike complete - Vulkan route through DXVK is VIABLE"));
 }
 
 void OpenXRManager::shutdown()
 {
+	if (m_trialSwapchain != XR_NULL_HANDLE)
+	{
+		xrDestroySwapchain(m_trialSwapchain);
+		m_trialSwapchain = XR_NULL_HANDLE;
+	}
+	if (m_session != XR_NULL_HANDLE)
+	{
+		xrDestroySession(m_session);
+		m_session = XR_NULL_HANDLE;
+	}
 	if (m_dxvkInterop != nullptr)
 	{
 		m_dxvkInterop->Release();
