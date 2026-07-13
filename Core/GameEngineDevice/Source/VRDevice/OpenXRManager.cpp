@@ -1477,6 +1477,11 @@ Bool OpenXRManager::getPanelInfo(Int index, VRPanelInfo &out) const
 	if (!p.active)
 		return FALSE;
 
+	// During a movie the panel is a compositor layer showing the flat frame, not geometry: the
+	// interface texture holds nothing to draw.
+	if (m_showFlatFrame)
+		return FALSE;
+
 	out.quatX = p.pose.orientation.x;
 	out.quatY = p.pose.orientation.y;
 	out.quatZ = p.pose.orientation.z;
@@ -2004,10 +2009,16 @@ void OpenXRManager::submitFrame(Bool worldRendered)
 		}
 	}
 
-	// The panels are drawn as real geometry in the eye pass now (see W3DDisplay::drawVRPanels),
-	// not handed to the compositor as quad layers: a layer has no depth, so it buried the laser
-	// that was pointing at it and stamped a hard rectangle over the battlefield.
-	const Bool anyFramePanel = FALSE;
+	// Panels are drawn as real geometry in the eye pass now (see W3DDisplay::drawVRPanels), not
+	// handed to the compositor as quad layers: a layer has no depth, so it buried the laser that
+	// was pointing at it and stamped a hard rectangle over the battlefield.
+	//
+	// A MOVIE is the one exception. It is painted straight to the backbuffer and draws no
+	// interface at all, so there is nothing for a geometry panel to show - and with no layer
+	// either, the headset simply held the last image it had while the intro played on the
+	// monitor. For a movie, and only a movie, we go back through a quad layer showing the
+	// finished flat frame.
+	const Bool anyFramePanel = m_showFlatFrame && m_uiPanels[UI_PANEL_SCREEN].active;
 	const Bool anyGroupPanel = FALSE;
 
 	if (m_uiReady && anyFramePanel)

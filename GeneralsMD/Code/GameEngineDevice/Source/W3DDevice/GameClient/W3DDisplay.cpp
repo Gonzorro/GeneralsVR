@@ -2057,6 +2057,14 @@ void W3DDisplay::drawVRScene( W3DView *view )
 			// paint is simply not drawn - no black square, and the sprites stay solid.
 			DX8Wrapper::Clear(true, false, Vector3(0.0f, 0.0f, 0.0f), 0.0f);
 
+			// TEMPORARY. The panel is invisible and there are exactly two candidates: the quad is
+			// not being drawn, or the interface is not painting into this target. This marker
+			// tells them apart in one run - if a magenta frame hangs in the headset, the quad is
+			// fine and the interface is the problem.
+			drawOpenRect(8, 8, getWidth() - 16, getHeight() - 16, 12.0f,
+				GameMakeColor(255, 0, 255, 255));
+			drawFillRect(40, 40, 240, 120, GameMakeColor(255, 0, 255, 255));
+
 			TheInGameUI->DRAW();	// this repaints the whole window system, menus included
 			if (TheMouse != nullptr)
 				TheMouse->DRAW();
