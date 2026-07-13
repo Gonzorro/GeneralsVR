@@ -133,6 +133,7 @@ OpenXRManager::OpenXRManager()
 	, m_primaryAction(XR_NULL_HANDLE)
 	, m_secondaryAction(XR_NULL_HANDLE)
 	, m_menuAction(XR_NULL_HANDLE)
+	, m_stickClickAction(XR_NULL_HANDLE)
 	, m_menuButtonDown(FALSE)
 	, m_actionsReady(FALSE)
 	, m_framesSubmitted(0)
@@ -629,6 +630,7 @@ Bool OpenXRManager::createActions()
 		{ &m_primaryAction, "primary",  "Primary Button",XR_ACTION_TYPE_BOOLEAN_INPUT },
 		{ &m_secondaryAction, "secondary", "Secondary Button", XR_ACTION_TYPE_BOOLEAN_INPUT },
 		{ &m_menuAction,    "menu",     "Menu Button",   XR_ACTION_TYPE_BOOLEAN_INPUT },
+		{ &m_stickClickAction, "stickclick", "Thumbstick Click", XR_ACTION_TYPE_BOOLEAN_INPUT },
 	};
 
 	for (size_t i = 0; i < sizeof(defs)/sizeof(defs[0]); ++i)
@@ -660,6 +662,7 @@ Bool OpenXRManager::createActions()
 		// The three-bar button lives on the LEFT controller only (the right one belongs to the
 		// system), so both hands' menu action is bound to it.
 		"/user/hand/left/input/menu/click",          "/user/hand/left/input/menu/click",
+		"/user/hand/left/input/thumbstick/click",    "/user/hand/right/input/thumbstick/click",
 	};
 	XrAction bindingActions[] =
 	{
@@ -670,6 +673,7 @@ Bool OpenXRManager::createActions()
 		m_primaryAction, m_primaryAction,
 		m_secondaryAction, m_secondaryAction,
 		m_menuAction,    m_menuAction,
+		m_stickClickAction, m_stickClickAction,
 	};
 
 	std::vector<XrActionSuggestedBinding> bindings;
@@ -795,6 +799,13 @@ void OpenXRManager::syncControllers()
 		XrActionStateBoolean primaryState = {XR_TYPE_ACTION_STATE_BOOLEAN};
 		xrGetActionStateBoolean(m_session, &get, &primaryState);
 		c.primaryButton = primaryState.isActive && primaryState.currentState;
+
+		get.action = m_stickClickAction;
+		XrActionStateBoolean stickClickState = {XR_TYPE_ACTION_STATE_BOOLEAN};
+		xrGetActionStateBoolean(m_session, &get, &stickClickState);
+		const Bool stickDown = stickClickState.isActive && stickClickState.currentState;
+		c.stickClickPressed = stickDown && !c.stickClick;
+		c.stickClick = stickDown;
 
 		get.action = m_secondaryAction;
 		XrActionStateBoolean secondaryState = {XR_TYPE_ACTION_STATE_BOOLEAN};

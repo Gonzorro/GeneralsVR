@@ -71,8 +71,10 @@ struct VRControllerState
 	Real stickX, stickY;  ///< -1..1
 	Bool primaryButton;   ///< A / X  - hold while clicking a group slot to ASSIGN it
 	Bool primaryPressed;
-	Bool secondaryButton; ///< B / Y  - toggles this hand's panel
+	Bool secondaryButton; ///< B / Y  - left one forces attack; right one toggles the panel
 	Bool secondaryPressed;
+	Bool stickClick;      ///< pressing the thumbstick in
+	Bool stickClickPressed;
 };
 
 enum VRHand { VR_HAND_LEFT = 0, VR_HAND_RIGHT = 1, VR_HAND_COUNT = 2 };
@@ -278,6 +280,7 @@ private:
 	XrAction m_primaryAction;
 	XrAction m_secondaryAction;
 	XrAction m_menuAction;      ///< the three-bar button: recenter
+	XrAction m_stickClickAction;
 	Bool m_menuButtonDown;
 	XrPath m_handPaths[VR_HAND_COUNT];
 	XrSpace m_aimSpaces[VR_HAND_COUNT];

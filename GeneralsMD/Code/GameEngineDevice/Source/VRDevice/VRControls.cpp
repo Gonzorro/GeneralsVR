@@ -37,6 +37,7 @@
 #include "GameClient/InGameUI.h"
 #include "GameClient/CommandXlat.h"
 #include "GameLogic/Object.h"
+#include "Common/ThingTemplate.h"
 #include "GameClient/View.h"
 #include "GameClient/Mouse.h"
 #include "GameLogic/GameLogic.h"
@@ -160,6 +161,7 @@ VRControls::VRControls()
 
 	m_boxing = FALSE;
 	m_boxArmed = FALSE;
+	m_placing = FALSE;
 	m_boxStart.zero();
 	m_boxEnd.zero();
 }
@@ -323,6 +325,8 @@ Bool VRControls::traceScene(const Vector3 &origin, const Vector3 &dir, Coord3D &
 	DrawableInfo *info = (DrawableInfo *)rayTest.CollidedRenderObj->Get_User_Data();
 	if (info == nullptr || info->m_drawable == nullptr)
 		return FALSE;
+	if (info->m_drawable->getFullyObscuredByShroud())
+		return FALSE;	// the laser does not reach into the fog
 
 	// RTS3DScene::castRay does NOT fill in the CastResultStruct we hand it - it tests each object
 	// with a result of its own. What it gives back instead is a CLIPPED RAY: rayTest.Ray now ends
@@ -357,7 +361,15 @@ Drawable *VRControls::pickDrawable(const Vector3 &origin, const Vector3 &dir) co
 		return nullptr;
 
 	DrawableInfo *info = (DrawableInfo *)rayTest.CollidedRenderObj->Get_User_Data();
-	return (info != nullptr) ? info->m_drawable : nullptr;
+	Drawable *draw = (info != nullptr) ? info->m_drawable : nullptr;
+
+	// What the shroud hides, the laser cannot touch. The ray reaches into the dark parts of the
+	// map where a mouse could never click, so without this the player could pick enemies out of
+	// unexplored fog - and read their health off the bar.
+	if (draw != nullptr && draw->getFullyObscuredByShroud())
+		return nullptr;
+
+	return draw;
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -387,6 +399,75 @@ void VRControls::selectUnderRay(const Vector3 &origin, const Vector3 &dir)
 	GameMessage *msg = TheMessageStream->appendMessage(GameMessage::MSG_CREATE_SELECTED_GROUP);
 	msg->appendBooleanArgument(TRUE);	// a fresh group, not an addition
 	msg->appendObjectIDArgument(draw->getObject()->getID());
+}
+
+//-------------------------------------------------------------------------------------------------
+/** Putting a building down.
+	*
+	* This was the worst-behaved thing in the game and the reason is worth stating: the engine's
+	* placement ghost follows the MOUSE CURSOR, which it turns into a world position with
+	* screenToTerrain. Our cursor is a fiction - it only exists where the flat camera can see, and
+	* the flat camera sees a fraction of what the player does - so the ghost lurched, stuck, and
+	* refused to land where the laser pointed.
+	*
+	* So placement leaves the cursor out of it entirely. The laser gives a world position; a
+	* footprint is drawn there from the building's own geometry; and the trigger sends the same
+	* MSG_DOZER_CONSTRUCT the mouse would have sent, with that position. The angle comes from the
+	* way the player is facing, which is what you would want anyway.
+	*/
+//-------------------------------------------------------------------------------------------------
+void VRControls::updatePlacement(const Vector3 &origin, const Vector3 &dir)
+{
+	const ThingTemplate *build = (TheInGameUI != nullptr) ? TheInGameUI->getPendingPlaceType() : nullptr;
+	if (build == nullptr)
+	{
+		if (m_placing)
+		{
+			m_placing = FALSE;
+			updateBoxVisual(FALSE);
+		}
+		return;
+	}
+
+	m_placing = TRUE;
+
+	Coord3D spot;
+	if (!traceTerrain(origin, dir, spot))
+	{
+		updateBoxVisual(FALSE);
+		return;
+	}
+
+	// Show the footprint where it would land, sized from the building itself.
+	const Real radius = build->getTemplateGeometryInfo().getMajorRadius();
+	m_boxStart.x = spot.x - radius;
+	m_boxStart.y = spot.y - radius;
+	m_boxStart.z = spot.z;
+	m_boxEnd.x = spot.x + radius;
+	m_boxEnd.y = spot.y + radius;
+	m_boxEnd.z = spot.z;
+	updateBoxVisual(TRUE);
+
+	const VRControllerState &right = TheOpenXR->getController(VR_HAND_RIGHT);
+	if (!right.triggerPressed && !right.primaryPressed)
+		return;
+
+	// Face it the way the player is facing.
+	Real angle = 0.0f;
+	if (TheTacticalView != nullptr)
+		angle = TheTacticalView->getAngle();
+
+	GameMessage *msg = TheMessageStream->appendMessage(GameMessage::MSG_DOZER_CONSTRUCT);
+	msg->appendIntegerArgument(build->getTemplateID());
+	msg->appendLocationArgument(spot);
+	msg->appendRealArgument(angle);
+
+	// Leave placement mode, exactly as the mouse path does once it has placed.
+	TheInGameUI->placeBuildAvailable(nullptr, nullptr);
+	m_placing = FALSE;
+	updateBoxVisual(FALSE);
+
+	DEBUG_LOG(("OpenXR: placed building at (%.0f %.0f)", spot.x, spot.y));
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -581,8 +662,8 @@ void VRControls::updateSelectionMarkers()
 				it != selected->end() && used < MAX_SELECTION_MARKERS; ++it)
 			{
 				Drawable *draw = *it;
-				if (draw == nullptr)
-					continue;
+				if (draw == nullptr || draw->getFullyObscuredByShroud())
+					continue;	// nothing under the fog gives its health away
 
 				const Coord3D *pos = draw->getPosition();
 				if (pos == nullptr)
@@ -595,12 +676,11 @@ void VRControls::updateSelectionMarkers()
 				if (obj != nullptr)
 					top = pos->z + obj->getGeometryInfo().getMaxHeightAbovePosition() + lift;
 
-				const Vector3 beadPos(pos->x, pos->y, top + beadRadius * 2.0f);
-				m_selectionBeads[used]->Set_Position(beadPos);
-				m_selectionBeads[used]->Set_Extent(Vector3(beadRadius, beadRadius, beadRadius));
-				m_selectionBeads[used]->Set_Hidden(false);
+				// The health bar alone says which units are yours to command - a bead on top of it
+				// was saying the same thing twice.
+				(void)beadRadius;
 
-				// Health, slung just under the bead.
+				// Health, floating over the unit.
 				Real health = 1.0f;
 				if (obj != nullptr && obj->getBodyModule() != nullptr)
 				{
@@ -648,8 +728,29 @@ void VRControls::updateSelectionMarkers()
 //-------------------------------------------------------------------------------------------------
 void VRControls::commandUnderRay(const Vector3 &origin, const Vector3 &dir)
 {
-	if (TheGameClient == nullptr)
+	if (TheGameClient == nullptr || TheMessageStream == nullptr)
 		return;
+
+	// Holding the left hand's button forces the attack: shoot it whatever it is, ally, neutral
+	// building or empty dirt. This is the headset's Ctrl key.
+	if (TheOpenXR->getController(VR_HAND_LEFT).secondaryButton)
+	{
+		Drawable *target = pickDrawable(origin, dir);
+		if (target != nullptr && target->getObject() != nullptr)
+		{
+			GameMessage *msg = TheMessageStream->appendMessage(GameMessage::MSG_DO_FORCE_ATTACK_OBJECT);
+			msg->appendObjectIDArgument(target->getObject()->getID());
+			return;
+		}
+
+		Coord3D spot;
+		if (traceTerrain(origin, dir, spot))
+		{
+			GameMessage *msg = TheMessageStream->appendMessage(GameMessage::MSG_DO_FORCE_ATTACK_GROUND);
+			msg->appendLocationArgument(spot);
+		}
+		return;
+	}
 
 	// Hand it to the engine's own context evaluation - the very thing a right-click goes
 	// through. It decides between attack, capture, enter, repair, garrison and plain movement
@@ -941,6 +1042,15 @@ void VRControls::updatePointer(W3DView *view)
 		// aiming at, which is why units could not be clicked.
 		const Bool placing = (TheInGameUI != nullptr && TheInGameUI->getPendingPlaceType() != nullptr);
 
+		Vector3 placeOrigin, placeDir;
+		if (placing && computeHandRay(VR_HAND_RIGHT, placeOrigin, placeDir))
+		{
+			// Placement is world-space and owns the trigger while it lasts; the cursor plays no
+			// part in it. Nothing below should fire underneath it.
+			updatePlacement(placeOrigin, placeDir);
+			return;
+		}
+
 		Vector3 origin, dir;
 		Coord3D hit;
 		const Bool haveRay = computeHandRay(VR_HAND_RIGHT, origin, dir);
@@ -1057,11 +1167,58 @@ void VRControls::updatePointer(W3DView *view)
 	* the HUD is there when you want it and gone when you are commanding units. */
 void VRControls::updatePanelToggles()
 {
-	for (Int hand = 0; hand < 2; ++hand)
+	// The RIGHT hand's B summons the panel - onto the LEFT hand, where it belongs: you point with
+	// the right and read with the left, and a hand cannot aim at the panel it is holding anyway.
+	// The left hand's Y is no longer a toggle at all; it is the force-attack modifier.
+	if (TheOpenXR->getController(VR_HAND_RIGHT).secondaryPressed)
+		TheOpenXR->toggleWristPanel(VR_HAND_LEFT);
+
+	// Click the right stick to jump the view to what you have selected - the headset's spacebar.
+	if (TheOpenXR->getController(VR_HAND_RIGHT).stickClickPressed)
+		jumpToSelection();
+}
+
+//-------------------------------------------------------------------------------------------------
+/** Bring the view to the selected units. Across a battlefield you can now see all of, losing your
+	* army is easy; this is the spacebar you would have reached for. */
+//-------------------------------------------------------------------------------------------------
+void VRControls::jumpToSelection()
+{
+	if (TheInGameUI == nullptr || TheTacticalView == nullptr)
+		return;
+
+	const DrawableList *selected = TheInGameUI->getAllSelectedDrawables();
+	if (selected == nullptr || selected->empty())
+		return;
+
+	// The middle of the group, not whichever one happens to be first.
+	Coord3D centre;
+	centre.zero();
+	Int count = 0;
+
+	for (DrawableList::const_iterator it = selected->begin(); it != selected->end(); ++it)
 	{
-		if (TheOpenXR->getController(hand).secondaryPressed)
-			TheOpenXR->toggleWristPanel(hand);
+		Drawable *draw = *it;
+		if (draw == nullptr)
+			continue;
+		const Coord3D *pos = draw->getPosition();
+		if (pos == nullptr)
+			continue;
+		centre.x += pos->x;
+		centre.y += pos->y;
+		centre.z += pos->z;
+		++count;
 	}
+
+	if (count == 0)
+		return;
+
+	centre.x /= (Real)count;
+	centre.y /= (Real)count;
+	centre.z /= (Real)count;
+
+	TheTacticalView->lookAt(&centre);
+	DEBUG_LOG(("OpenXR: jumped to selection (%d units)", count));
 }
 
 //-------------------------------------------------------------------------------------------------
