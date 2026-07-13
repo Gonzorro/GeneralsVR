@@ -1798,6 +1798,80 @@ void W3DDisplay::step()
 }
 
 #ifdef RTS_HAS_OPENXR
+// W3DDisplay::solidifyVRUiAlpha ==============================================
+/** GeneralsVR @feature Make the interface solid in VR.
+	*
+	* The VR panel is a compositor layer that blends on the alpha the engine left in the render
+	* target - and the engine leaves only a partial alpha behind, so the buttons and menus came
+	* out see-through, with the battlefield glowing faintly through them.
+	*
+	* Alpha cannot simply be cleared to full: the background must stay at zero, or the panel
+	* becomes a rectangle of screen rather than the menu's own sprites. What is needed is to raise
+	* alpha wherever the interface painted ANYTHING, and leave the untouched background alone.
+	*
+	* So: draw over the whole target with the colour channels masked off, blending alpha as
+	* dst = dst*src + dst = 2*dst. Zero stays zero. Anything the interface touched doubles, and
+	* three passes take even a faint 0.15 to fully solid. The colour is never read or written.
+	*/
+//=============================================================================
+void W3DDisplay::solidifyVRUiAlpha()
+{
+	IDirect3DDevice8 *device = DX8Wrapper::_Get_D3D_Device8();
+	if (device == nullptr)
+		return;
+
+	struct ScreenVertex { Real x, y, z, rhw; DWORD color; };
+	const DWORD SCREEN_FVF = D3DFVF_XYZRHW | D3DFVF_DIFFUSE;
+
+	const Real w = (Real)getWidth();
+	const Real h = (Real)getHeight();
+	const DWORD white = 0xFFFFFFFF;
+
+	// Screen-space, so no camera or transforms are involved at all.
+	ScreenVertex quad[4] =
+	{
+		{ 0.0f, 0.0f, 0.0f, 1.0f, white },
+		{ w,    0.0f, 0.0f, 1.0f, white },
+		{ w,    h,    0.0f, 1.0f, white },
+		{ 0.0f, h,    0.0f, 1.0f, white },
+	};
+
+	device->SetVertexShader(SCREEN_FVF);
+	device->SetPixelShader(0);
+	device->SetTexture(0, nullptr);
+
+	device->SetRenderState(D3DRS_LIGHTING, FALSE);
+	device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+	device->SetRenderState(D3DRS_ZENABLE, FALSE);
+	device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+	device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+	device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+
+	// Touch the alpha channel and nothing else.
+	device->SetRenderState(D3DRS_COLORWRITEENABLE, D3DCOLORWRITEENABLE_ALPHA);
+	device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+	device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_DESTALPHA);
+	device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
+
+	device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+	device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+	device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+	device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
+	device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+	device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+
+	for (Int pass = 0; pass < 3; ++pass)
+		device->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, quad, sizeof(ScreenVertex));
+
+	// Give the device back exactly as we found it.
+	device->SetRenderState(D3DRS_COLORWRITEENABLE, D3DCOLORWRITEENABLE_RED
+		| D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE | D3DCOLORWRITEENABLE_ALPHA);
+	device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+	device->SetRenderState(D3DRS_ZENABLE, TRUE);
+	device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+	DX8Wrapper::Invalidate_Cached_Render_States();
+}
+
 // W3DDisplay::drawVRPanels ===================================================
 /** GeneralsVR @feature Draw the interface panels as real quads in the world.
 	*
@@ -2067,6 +2141,8 @@ void W3DDisplay::drawVRScene( W3DView *view )
 			TheInGameUI->DRAW();	// this repaints the whole window system, menus included
 			if (TheMouse != nullptr)
 				TheMouse->DRAW();
+
+			solidifyVRUiAlpha();
 
 			WW3D::End_Render(false);
 		}
