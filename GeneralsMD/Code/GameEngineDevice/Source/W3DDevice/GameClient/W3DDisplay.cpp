@@ -1948,7 +1948,10 @@ void W3DDisplay::drawVRScene( W3DView *view )
 	// oversizeTerrain is the engine's own hook for widening it (missions use it for cinematics)
 	// and it clamps to the map, so asking for far more tiles than any map has simply pins the
 	// window open at full size. Cheap to repeat: it returns immediately once the size matches.
-	if (inGame && TheTerrainRenderObject != nullptr)
+	//
+	// It reads the heightmap without checking it exists, and the game counts as 'in game' before
+	// the map is loaded - which is exactly the window the skirmish start passes through.
+	if (inGame && TheTerrainRenderObject != nullptr && TheTerrainRenderObject->getMap() != nullptr)
 		TheTerrainRenderObject->oversizeTerrain(256);
 
 	// In the menus there is no battlefield: the player is looking at the game's own 2D frame on

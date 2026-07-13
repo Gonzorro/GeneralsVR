@@ -447,6 +447,9 @@ void VRControls::updateBoxVisual(Bool visible)
 		return;
 	}
 
+	if (TheTerrainLogic == nullptr)
+		return;
+
 	const Real width = 3.0f + 0.004f * TheOpenXR->getWorldUnitsPerMeter();
 	const Real lift = 4.0f;	// float it clear of the ground so it is not swallowed by the terrain
 
