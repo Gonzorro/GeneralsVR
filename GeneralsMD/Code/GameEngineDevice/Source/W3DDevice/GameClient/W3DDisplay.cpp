@@ -1943,6 +1943,14 @@ void W3DDisplay::drawVRScene( W3DView *view )
 	const Bool inGame = (TheGameLogic != nullptr && TheGameLogic->isInGame());
 	TheOpenXR->setUiInGame(inGame);
 
+	// The ground is drawn in a window around the camera, and that window is re-sized every frame
+	// from the camera's pitch - so setting the map's draw width once at load was quietly undone.
+	// oversizeTerrain is the engine's own hook for widening it (missions use it for cinematics)
+	// and it clamps to the map, so asking for far more tiles than any map has simply pins the
+	// window open at full size. Cheap to repeat: it returns immediately once the size matches.
+	if (inGame && TheTerrainRenderObject != nullptr)
+		TheTerrainRenderObject->oversizeTerrain(256);
+
 	// In the menus there is no battlefield: the player is looking at the game's own 2D frame on
 	// a screen floating in front of them. We still run an eye pass, but it draws ONLY the laser
 	// pointers - without it the player would be aiming at that screen blind. There, the eye

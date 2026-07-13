@@ -32,6 +32,7 @@
 #include "Common/MessageStream.h"
 #include "GameClient/Display.h"
 #include "GameClient/Drawable.h"
+#include "GameClient/GameClient.h"
 #include "GameClient/DrawableInfo.h"
 #include "GameClient/InGameUI.h"
 #include "GameLogic/Object.h"
@@ -125,6 +126,30 @@ VRControls::VRControls()
 		m_rayLines[hand]->Set_Hidden(true);
 		m_rayVisible[hand] = FALSE;
 	}
+
+	// The four sides of the selection box drawn on the ground while sweeping.
+	for (Int i = 0; i < 4; ++i)
+	{
+		m_boxLines[i] = NEW_REF(Line3DClass, (Vector3(0.0f, 0.0f, 0.0f), Vector3(0.0f, 0.0f, 1.0f),
+			1.0f, 0.30f, 1.0f, 0.45f, 0.9f));
+		m_rayScene->Add_Render_Object(m_boxLines[i]);
+		m_boxLines[i]->Set_Hidden(true);
+	}
+
+	// A short post over each selected unit. Deliberately thin and short: enough to find your
+	// army at a glance, not enough to clutter the battlefield.
+	for (Int i = 0; i < MAX_SELECTION_MARKERS; ++i)
+	{
+		m_selectionMarkers[i] = NEW_REF(Line3DClass, (Vector3(0.0f, 0.0f, 0.0f),
+			Vector3(0.0f, 0.0f, 1.0f), 1.0f, 0.30f, 1.0f, 0.45f, 0.8f));
+		m_rayScene->Add_Render_Object(m_selectionMarkers[i]);
+		m_selectionMarkers[i]->Set_Hidden(true);
+	}
+
+	m_boxing = FALSE;
+	m_boxArmed = FALSE;
+	m_boxStart.zero();
+	m_boxEnd.zero();
 }
 
 VRControls::~VRControls()
@@ -353,6 +378,192 @@ void VRControls::selectUnderRay(const Vector3 &origin, const Vector3 &dir)
 }
 
 //-------------------------------------------------------------------------------------------------
+/** Everything inside the swept box, if it is yours. Mirrors what a mouse drag does. */
+//-------------------------------------------------------------------------------------------------
+namespace
+{
+	struct BoxSelectContext
+	{
+		GameMessage *msg;
+		Int count;
+	};
+
+	void addDrawableToSelection(Drawable *draw, void *userData)
+	{
+		BoxSelectContext *ctx = (BoxSelectContext *)userData;
+		if (draw == nullptr || ctx == nullptr || ctx->count >= 256)
+			return;
+		if (!draw->isSelectable())
+			return;
+
+		Object *obj = draw->getObject();
+		if (obj == nullptr || !obj->isLocallyControlled())
+			return;	// a box drag takes YOUR units, never the enemy's
+
+		TheInGameUI->selectDrawable(draw);
+		ctx->msg->appendObjectIDArgument(obj->getID());
+		++ctx->count;
+	}
+}
+
+void VRControls::selectInBox(const Coord3D &corner0, const Coord3D &corner1)
+{
+	if (TheGameClient == nullptr || TheInGameUI == nullptr || TheMessageStream == nullptr)
+		return;
+
+	Region3D region;
+	region.lo.x = min(corner0.x, corner1.x);
+	region.hi.x = max(corner0.x, corner1.x);
+	region.lo.y = min(corner0.y, corner1.y);
+	region.hi.y = max(corner0.y, corner1.y);
+	// Tall on purpose: aircraft and the tops of buildings are inside a box drawn on the ground.
+	region.lo.z = min(corner0.z, corner1.z) - 500.0f;
+	region.hi.z = max(corner0.z, corner1.z) + 2000.0f;
+
+	TheInGameUI->deselectAllDrawables();
+
+	BoxSelectContext ctx;
+	ctx.msg = TheMessageStream->appendMessage(GameMessage::MSG_CREATE_SELECTED_GROUP);
+	ctx.msg->appendBooleanArgument(TRUE);	// a fresh group
+	ctx.count = 0;
+
+	TheGameClient->iterateDrawablesInRegion(&region, addDrawableToSelection, &ctx);
+
+	DEBUG_LOG(("OpenXR: box select: %d units", ctx.count));
+}
+
+//-------------------------------------------------------------------------------------------------
+/** Draw the box on the ground as it is swept. */
+//-------------------------------------------------------------------------------------------------
+void VRControls::updateBoxVisual(Bool visible)
+{
+	if (!visible)
+	{
+		for (Int i = 0; i < 4; ++i)
+		{
+			if (m_boxLines[i] != nullptr)
+				m_boxLines[i]->Set_Hidden(true);
+		}
+		return;
+	}
+
+	const Real width = 3.0f + 0.004f * TheOpenXR->getWorldUnitsPerMeter();
+	const Real lift = 4.0f;	// float it clear of the ground so it is not swallowed by the terrain
+
+	const Real x0 = min(m_boxStart.x, m_boxEnd.x);
+	const Real x1 = max(m_boxStart.x, m_boxEnd.x);
+	const Real y0 = min(m_boxStart.y, m_boxEnd.y);
+	const Real y1 = max(m_boxStart.y, m_boxEnd.y);
+
+	// Follow the ground along each edge rather than cutting through hills.
+	const Real z00 = TheTerrainLogic->getGroundHeight(x0, y0) + lift;
+	const Real z10 = TheTerrainLogic->getGroundHeight(x1, y0) + lift;
+	const Real z11 = TheTerrainLogic->getGroundHeight(x1, y1) + lift;
+	const Real z01 = TheTerrainLogic->getGroundHeight(x0, y1) + lift;
+
+	const Vector3 corners[4] =
+	{
+		Vector3(x0, y0, z00), Vector3(x1, y0, z10),
+		Vector3(x1, y1, z11), Vector3(x0, y1, z01),
+	};
+
+	for (Int i = 0; i < 4; ++i)
+	{
+		if (m_boxLines[i] == nullptr)
+			continue;
+		m_boxLines[i]->Reset(corners[i], corners[(i + 1) % 4], width);
+		m_boxLines[i]->Set_Hidden(false);
+	}
+}
+
+//-------------------------------------------------------------------------------------------------
+/** Hold the trigger and sweep the laser across the ground to take everything inside the box. A
+	* short press is still a single click, so the two gestures do not fight. */
+//-------------------------------------------------------------------------------------------------
+void VRControls::updateBoxSelect(const Vector3 &origin, const Vector3 &dir)
+{
+	const VRControllerState &right = TheOpenXR->getController(VR_HAND_RIGHT);
+
+	Coord3D ground;
+	const Bool onGround = traceTerrain(origin, dir, ground);
+
+	if (right.triggerPressed && onGround)
+	{
+		m_boxArmed = TRUE;
+		m_boxing = FALSE;
+		m_boxStart = ground;
+		m_boxEnd = ground;
+	}
+	else if (right.trigger && m_boxArmed && onGround)
+	{
+		m_boxEnd = ground;
+
+		// Only a real sweep becomes a box; a twitch while clicking a tank must not.
+		const Real dx = m_boxEnd.x - m_boxStart.x;
+		const Real dy = m_boxEnd.y - m_boxStart.y;
+		const Real minSweep = 0.05f * TheOpenXR->getWorldUnitsPerMeter();
+		if (!m_boxing && (dx * dx + dy * dy) > (minSweep * minSweep))
+			m_boxing = TRUE;
+
+		if (m_boxing)
+			updateBoxVisual(TRUE);
+	}
+	else if (!right.trigger && m_boxArmed)
+	{
+		if (m_boxing)
+			selectInBox(m_boxStart, m_boxEnd);
+
+		m_boxArmed = FALSE;
+		m_boxing = FALSE;
+		updateBoxVisual(FALSE);
+	}
+}
+
+//-------------------------------------------------------------------------------------------------
+/** A short post over each selected unit, so a selection made from across the map is visible. */
+//-------------------------------------------------------------------------------------------------
+void VRControls::updateSelectionMarkers()
+{
+	Int used = 0;
+
+	if (TheInGameUI != nullptr && TheGameLogic != nullptr && TheGameLogic->isInGame())
+	{
+		const DrawableList *selected = TheInGameUI->getAllSelectedDrawables();
+		if (selected != nullptr)
+		{
+			const Real scale = TheOpenXR->getWorldUnitsPerMeter();
+			const Real height = 0.10f * scale;	// a hand's breadth, whatever size the player is
+			const Real width = 0.006f * scale;
+
+			for (DrawableList::const_iterator it = selected->begin();
+				it != selected->end() && used < MAX_SELECTION_MARKERS; ++it)
+			{
+				Drawable *draw = *it;
+				if (draw == nullptr)
+					continue;
+
+				const Coord3D *pos = draw->getPosition();
+				if (pos == nullptr)
+					continue;
+
+				const Vector3 base(pos->x, pos->y, pos->z + height * 0.35f);
+				const Vector3 top(pos->x, pos->y, pos->z + height * 1.35f);
+
+				m_selectionMarkers[used]->Reset(base, top, width);
+				m_selectionMarkers[used]->Set_Hidden(false);
+				++used;
+			}
+		}
+	}
+
+	for (Int i = used; i < MAX_SELECTION_MARKERS; ++i)
+	{
+		if (m_selectionMarkers[i] != nullptr)
+			m_selectionMarkers[i]->Set_Hidden(true);
+	}
+}
+
+//-------------------------------------------------------------------------------------------------
 /** Order the selection to whatever the laser is on: attack an object, or move to a patch of
 	* ground. Also world-space, for the same reason. */
 //-------------------------------------------------------------------------------------------------
@@ -500,14 +711,22 @@ void VRControls::updateLocomotion(W3DView *view)
 		view->lookAt(&pos);
 	}
 
+	// The right stick does ONE thing at a time - whichever way you pushed it hardest. Letting a
+	// diagonal both turn and resize meant every rotation quietly changed your size as well.
 	const Real turn = applyDeadzone(right.stickX);
-	if (turn != 0.0f)
-		view->setAngle(view->getAngle() + turn * STICK_TURN_SPEED * dt);
+	const Real grow = applyDeadzone(right.stickY);
 
-	const Real zoom = applyDeadzone(right.stickY);
-	if (zoom != 0.0f)
+	if (fabsf(turn) > fabsf(grow))
 	{
-		Real newScale = TheOpenXR->getWorldUnitsPerMeter() * (1.0f - zoom * STICK_ZOOM_SPEED * dt);
+		if (turn != 0.0f)
+			view->setAngle(view->getAngle() + turn * STICK_TURN_SPEED * dt);
+	}
+	else if (grow != 0.0f)
+	{
+		// Up makes YOU bigger: a metre of you covers more world, so the map shrinks away below
+		// and you take in the whole battle. Down shrinks you into it, until the tanks are the
+		// size of tanks. (The scale is world units per metre of player, hence up = larger.)
+		Real newScale = TheOpenXR->getWorldUnitsPerMeter() * (1.0f + grow * STICK_ZOOM_SPEED * dt);
 		if (newScale < MIN_SCALE) newScale = MIN_SCALE;
 		if (newScale > MAX_SCALE) newScale = MAX_SCALE;
 		TheWritableGlobalData->m_vrWorldUnitsPerMeter = newScale;
@@ -612,7 +831,18 @@ void VRControls::updatePointer(W3DView *view)
 		Vector3 origin, dir;
 		if (computeHandRay(VR_HAND_RIGHT, origin, dir))
 		{
-			if (rightState.triggerPressed)
+			// A held-and-swept trigger is a box; a tapped one is a click. The box runs first so
+			// it can tell us, on release, whether the gesture turned into a sweep.
+			const Bool wasBoxing = m_boxing;
+			updateBoxSelect(origin, dir);
+
+			// Release after a sweep already selected the box - do not also single-click, or the
+			// click would immediately replace the group we just gathered.
+			if (rightState.triggerReleased && wasBoxing)
+			{
+				// handled by the box
+			}
+			else if (rightState.triggerPressed)
 				selectUnderRay(origin, dir);
 
 			// Orders live on A as well as the left trigger. On a mouse the same button does both
@@ -721,7 +951,10 @@ void VRControls::updateRays(W3DView *view)
 			continue;
 
 		const VRControllerState &c = TheOpenXR->getController(hand);
-		if (!c.poseValid)
+
+		// The hand holding the menu does not also carry a laser: the beam starts inside the panel
+		// it is holding and lies across everything you are trying to read.
+		if (!c.poseValid || TheOpenXR->isWristPanelOpen(hand))
 		{
 			line->Set_Hidden(true);
 			m_rayVisible[hand] = FALSE;
@@ -898,4 +1131,5 @@ void VRControls::update()
 
 	// The beams are drawn everywhere, including the menus - that is the whole point of them.
 	updateRays(view);
+	updateSelectionMarkers();
 }

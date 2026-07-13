@@ -87,6 +87,24 @@ private:
 	/// mouse translators would have produced.
 	void selectUnderRay(const Vector3 &origin, const Vector3 &dir);
 	void commandUnderRay(const Vector3 &origin, const Vector3 &dir);
+
+	/// Sweep the laser across the ground with the trigger held to take everything inside the
+	/// box, the way a mouse drag does. A rectangle is drawn on the ground while you sweep, so
+	/// the gesture reads the same as the one it replaces.
+	void updateBoxSelect(const Vector3 &origin, const Vector3 &dir);
+	void selectInBox(const Coord3D &corner0, const Coord3D &corner1);
+	void updateBoxVisual(Bool visible);
+	/// A marker floating over everything currently selected - without one, a selection made from
+	/// across the map is invisible.
+	void updateSelectionMarkers();
+
+	enum { MAX_SELECTION_MARKERS = 40 };
+	class Line3DClass *m_boxLines[4];
+	class Line3DClass *m_selectionMarkers[MAX_SELECTION_MARKERS];
+	Bool m_boxing;                ///< the trigger is down and the sweep has grown past a nudge
+	Bool m_boxArmed;              ///< the trigger is down; we are watching to see if it becomes a sweep
+	Coord3D m_boxStart;
+	Coord3D m_boxEnd;
 	/// Where the ray lands: an object if it hits one, otherwise the ground.
 	Bool traceAim(const Vector3 &origin, const Vector3 &dir, Coord3D &outHit) const;
 	void updateLocomotion(W3DView *view);
