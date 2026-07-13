@@ -118,6 +118,7 @@ OpenXRManager::OpenXRManager()
 	, m_uiHeight(0)
 	, m_uiInGame(FALSE)
 	, m_uiReady(FALSE)
+	, m_showFlatFrame(FALSE)
 	, m_groupBarTexture(nullptr)
 	, m_groupBarSurface(nullptr)
 	, m_groupBarSwapchain(XR_NULL_HANDLE)
@@ -1378,6 +1379,8 @@ void OpenXRManager::layoutUiPanels()
 		// fills a comfortable chunk of the view without forcing the player to sweep their head.
 		UiPanel& p = m_uiPanels[UI_PANEL_SCREEN];
 		p.active = TRUE;
+		p.ownerHand = -1;	// belongs to no hand: both rays may use it
+		p.isGroupBar = FALSE;
 		p.pose.orientation.x = p.pose.orientation.y = p.pose.orientation.z = 0.0f;
 		p.pose.orientation.w = 1.0f;
 		p.pose.position.x = 0.0f;
@@ -1420,11 +1423,12 @@ void OpenXRManager::layoutUiPanels()
 		// appears in full instead of being sliced in half.
 		UiPanel& p = m_uiPanels[wristPanelIds[hand]];
 		p.isGroupBar = FALSE;
+		p.ownerHand = hand;
 		p.cropX = 0;
 		p.cropY = 0;
 		p.cropW = m_uiWidth;
 		p.cropH = m_uiHeight;
-		p.widthMeters = 1.10f;	// big enough to read a menu on, and to hit with a ray
+		p.widthMeters = 0.55f;
 		p.heightMeters = p.widthMeters * (Real)p.cropH / (Real)p.cropW;
 		p.pose.orientation = panelQuat;
 
@@ -1441,6 +1445,7 @@ void OpenXRManager::layoutUiPanels()
 		{
 			UiPanel& g = m_uiPanels[groupPanelIds[hand]];
 			g.isGroupBar = TRUE;
+			g.ownerHand = hand;
 			g.cropX = 0;
 			g.cropY = 0;
 			g.cropW = m_groupBarWidth;
@@ -1484,6 +1489,12 @@ OpenXRManager::VRPickKind OpenXRManager::pickUiPanel(Int hand, Int &outX, Int &o
 	{
 		const UiPanel& p = m_uiPanels[i];
 		if (!p.active)
+			continue;
+
+		// A hand cannot point at its own panel: the panel hangs out in front of that hand, so
+		// its ray would strike it immediately and never reach anything else. You aim at a panel
+		// with the OTHER hand, which is how you would hold a tablet and tap it anyway.
+		if (p.ownerHand == hand)
 			continue;
 
 		// Move the ray into the panel's own frame, where the panel is the z=0 plane.
@@ -1543,9 +1554,24 @@ Bool OpenXRManager::captureUiFrame(UnsignedInt uiImageIndex)
 	if (!m_uiReady || m_uiTexture == nullptr)
 		return FALSE;
 
-	// The engine's freshly drawn interface, not a crop of the flat frame.
+	// Normally the engine's freshly drawn interface. While a movie plays there is no interface -
+	// the film goes straight to the backbuffer - so we show the finished flat frame instead.
 	VkImageLayout srcLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-	VkImage src = getVulkanImage(m_uiTexture, &srcLayout);
+	VkImage src = VK_NULL_HANDLE;
+
+	if (m_showFlatFrame && m_d3d8Device != nullptr)
+	{
+		IDirect3DSurface8* backbuffer = nullptr;
+		if (SUCCEEDED(m_d3d8Device->GetBackBuffer(0, D3DBACKBUFFER_TYPE_MONO, &backbuffer))
+			&& backbuffer != nullptr)
+		{
+			src = getVulkanImage(backbuffer, &srcLayout);
+			backbuffer->Release();
+		}
+	}
+
+	if (src == VK_NULL_HANDLE)
+		src = getVulkanImage(m_uiTexture, &srcLayout);
 
 	if (src == VK_NULL_HANDLE)
 		return FALSE;

@@ -32,6 +32,7 @@
 #include "Common/MessageStream.h"
 #include "GameClient/Display.h"
 #include "GameClient/DrawableInfo.h"
+#include "GameClient/InGameUI.h"
 #include "GameClient/View.h"
 #include "GameClient/Mouse.h"
 #include "GameLogic/GameLogic.h"
@@ -284,9 +285,16 @@ Bool VRControls::traceScene(const Vector3 &origin, const Vector3 &dir, Coord3D &
 	if (info == nullptr || info->m_drawable == nullptr)
 		return FALSE;
 
-	outHit.x = result.ContactPoint.X;
-	outHit.y = result.ContactPoint.Y;
-	outHit.z = result.ContactPoint.Z;
+	// Where along the ray did it strike? ContactPoint is NOT dependable here - W3D's collision
+	// routines only fill it in for some geometry, and it comes back as the world origin for the
+	// rest, which then projects to nowhere and silently swallows the click. Fraction, on the
+	// other hand, is always set: it is the hit's distance along the segment we cast.
+	const Real distance = result.Fraction * AIM_MAX_DISTANCE;
+	const Vector3 point = origin + dir * distance;
+
+	outHit.x = point.X;
+	outHit.y = point.Y;
+	outHit.z = point.Z;
 	return TRUE;
 }
 
@@ -295,6 +303,14 @@ Bool VRControls::traceScene(const Vector3 &origin, const Vector3 &dir, Coord3D &
 //-------------------------------------------------------------------------------------------------
 Bool VRControls::traceAim(const Vector3 &origin, const Vector3 &dir, Coord3D &outHit) const
 {
+	// While a building is being placed, aim at the GROUND ONLY. The placement ghost is a real
+	// drawable that follows the cursor, so a scene cast would strike the ghost, place the cursor
+	// on it, move the ghost there, and strike it again - the building crawls around under your
+	// hand and can never be put down. This is also the only sane answer: you are choosing a
+	// patch of ground, not clicking an object.
+	if (TheInGameUI != nullptr && TheInGameUI->getPendingPlaceType() != nullptr)
+		return traceTerrain(origin, dir, outHit);
+
 	if (traceScene(origin, dir, outHit))
 		return TRUE;
 	return traceTerrain(origin, dir, outHit);
@@ -450,10 +466,12 @@ void VRControls::updatePointer(W3DView *view)
 		// object, so when the engine then does its own pick from that pixel it finds the same
 		// object. Tracing only the terrain sent the cursor to the dirt behind the tank you were
 		// aiming at, which is why units could not be clicked.
+		const Bool placing = (TheInGameUI != nullptr && TheInGameUI->getPendingPlaceType() != nullptr);
+
 		Vector3 origin, dir;
 		Coord3D hit;
 		const Bool haveRay = computeHandRay(VR_HAND_RIGHT, origin, dir);
-		const Bool haveObject = haveRay && traceScene(origin, dir, hit);
+		const Bool haveObject = haveRay && !placing && traceScene(origin, dir, hit);
 		const Bool haveGround = !haveObject && haveRay && traceTerrain(origin, dir, hit);
 		const Bool onScreen = (haveObject || haveGround) && view->worldToScreen(&hit, &screen);
 

@@ -1908,10 +1908,16 @@ void W3DDisplay::drawVRScene( W3DView *view )
 		DX8Wrapper::Set_Render_Target((IDirect3DSurface8 *)nullptr);
 	}
 
+	// A movie has no interface to draw - it is painted straight to the backbuffer - so during one
+	// the VR screen shows the finished flat frame, and the player watches the intro in the
+	// headset instead of staring at a frozen image.
+	const Bool moviePlaying = isMoviePlaying();
+	TheOpenXR->setShowFlatFrame(moviePlaying);
+
 	// Draw the game's REAL interface into its own transparent layer for VR. This is the whole
 	// GUI - the same windows, sprites and menus the flat game draws - on a clear background, so
 	// the VR panel shows an actual menu rather than a rectangle cut out of the flat frame.
-	if (TheOpenXR->hasUiSurface() && TheInGameUI != nullptr)
+	if (!moviePlaying && TheOpenXR->hasUiSurface() && TheInGameUI != nullptr)
 	{
 		DX8Wrapper::Set_Render_Target(TheOpenXR->getUiSurface(), true /* default depth buffer */);
 

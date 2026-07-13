@@ -164,6 +164,11 @@ public:
 	IDirect3DSurface8* getUiSurface() const { return m_uiSurface; }
 	Bool hasUiSurface() const { return m_uiSurface != nullptr; }
 
+	/// While a movie plays there IS no interface to draw - the film is painted straight to the
+	/// backbuffer - so the VR screen shows the finished flat frame instead. Without this the
+	/// headset just holds the last thing it saw while the intro plays on the monitor.
+	void setShowFlatFrame(Bool showFlatFrame) { m_showFlatFrame = showFlatFrame; }
+
 	/// Move the VR origin to where the player is now: forward becomes the way they are facing.
 	void recenter();
 
@@ -190,6 +195,7 @@ private:
 		Int cropX, cropY, cropW, cropH;     ///< pixels within the source image
 		Bool active;
 		Bool isGroupBar;                    ///< draws from the group-bar swapchain, not the frame
+		Int ownerHand;                      ///< the hand it hangs off, or -1 for the fixed screen
 	};
 	enum { UI_PANEL_SCREEN = 0, UI_PANEL_LEFT_WRIST = 1, UI_PANEL_RIGHT_WRIST = 2,
 	       UI_PANEL_LEFT_GROUPS = 3, UI_PANEL_RIGHT_GROUPS = 4, UI_PANEL_COUNT = 5 };
@@ -288,6 +294,7 @@ private:
 	Int m_uiWidth, m_uiHeight;
 	Bool m_uiInGame;
 	Bool m_uiReady;
+	Bool m_showFlatFrame;   ///< capture the backbuffer, not the UI layer (movies)
 	UiPanel m_uiPanels[UI_PANEL_COUNT];
 	Bool m_wristPanelOpen[VR_HAND_COUNT];
 
