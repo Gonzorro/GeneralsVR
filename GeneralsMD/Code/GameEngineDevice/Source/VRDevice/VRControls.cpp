@@ -466,9 +466,32 @@ void VRControls::updateLocomotion(W3DView *view)
 	const Real panY = applyDeadzone(left.stickY);
 	if (panX != 0.0f || panY != 0.0f)
 	{
-		// Pan along the way you are facing, in table-metres so it feels the same at any zoom.
-		const Vector3 forward = -anchor.Get_Z_Vector();
-		const Vector3 right2 = anchor.Get_X_Vector();
+		// Pan along the way the PLAYER is looking, not the way the tactical camera happens to
+		// face. In a headset you turn your head and expect forward to be wherever you are now
+		// looking; taking the direction from the anchor instead meant pushing the stick "forward"
+		// sent you off sideways the moment you looked around.
+		Vector3 forward = -anchor.Get_Z_Vector();
+		Vector3 right2 = anchor.Get_X_Vector();
+
+		const VREyeView &head = TheOpenXR->getEyeView(0);
+		Quaternion headQuat(head.quatX, head.quatY, head.quatZ, head.quatW);
+		Matrix3D headRot;
+		Build_Matrix3D(headQuat, headRot);
+
+		Matrix3D headWorld;
+		Matrix3D::Multiply(anchor, headRot, &headWorld);
+
+		Vector3 gaze = -headWorld.Get_Z_Vector();
+		gaze.Z = 0.0f;	// flatten: looking down must not drive you into the ground
+		if (gaze.Length2() > 0.0001f)
+		{
+			gaze.Normalize();
+			forward = gaze;
+			const Vector3 worldUp(0.0f, 0.0f, 1.0f);
+			Vector3::Cross_Product(forward, worldUp, &right2);
+			right2.Normalize();
+		}
+
 		const Real step = STICK_PAN_SPEED * scale * dt;
 
 		Coord3D pos = view->getPosition();

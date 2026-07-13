@@ -2009,17 +2009,21 @@ void OpenXRManager::submitFrame(Bool worldRendered)
 		}
 	}
 
-	// Panels are drawn as real geometry in the eye pass now (see W3DDisplay::drawVRPanels), not
-	// handed to the compositor as quad layers: a layer has no depth, so it buried the laser that
-	// was pointing at it and stamped a hard rectangle over the battlefield.
-	//
-	// A MOVIE is the one exception. It is painted straight to the backbuffer and draws no
-	// interface at all, so there is nothing for a geometry panel to show - and with no layer
-	// either, the headset simply held the last image it had while the intro played on the
-	// monitor. For a movie, and only a movie, we go back through a quad layer showing the
-	// finished flat frame.
-	const Bool anyFramePanel = m_showFlatFrame && m_uiPanels[UI_PANEL_SCREEN].active;
-	const Bool anyGroupPanel = FALSE;
+	// Panels are compositor quad layers. Drawing them as geometry in the eye pass instead was an
+	// attempt to let the laser sort in front of them - but it lost the panel entirely, and a
+	// menu you cannot see is worse than a menu the laser hides behind. Layers work; the beam is
+	// the thing to solve, not this.
+	Bool anyFramePanel = FALSE;
+	Bool anyGroupPanel = FALSE;
+	for (Int i = 0; i < UI_PANEL_COUNT; ++i)
+	{
+		if (!m_uiPanels[i].active)
+			continue;
+		if (m_uiPanels[i].isGroupBar)
+			anyGroupPanel = TRUE;
+		else
+			anyFramePanel = TRUE;
+	}
 
 	if (m_uiReady && anyFramePanel)
 	{
@@ -2111,8 +2115,9 @@ void OpenXRManager::submitFrame(Bool worldRendered)
 
 			XrCompositionLayerQuad& q = quadLayers[i];
 			q = XrCompositionLayerQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
-			// No source-alpha blending: the panels are solid objects, not ghosts.
-			q.layerFlags = 0;
+			// Blend on the interface's own alpha, so what floats in VR is the menu's sprites and
+			// not a rectangle of screen.
+			q.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
 			q.space = m_appSpace;
 			q.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
 			q.subImage.swapchain = p.isGroupBar ? m_groupBarSwapchain : m_uiSwapchain;

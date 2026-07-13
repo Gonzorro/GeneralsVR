@@ -415,6 +415,10 @@ Int parseVR(char *args[], int num)
 	TheWritableGlobalData->m_vrMode = TRUE;
 	// 30Hz stepping is nauseating in a headset, so VR always smooths motion.
 	TheWritableGlobalData->m_smoothMotion = TRUE;
+	// The terrain normally draws in a window around the camera, which is invisible on a monitor
+	// but glaring in a headset: the trees and buildings of the far half of the map stand on
+	// nothing. The engine already has a switch for drawing all of it.
+	TheWritableGlobalData->m_drawEntireTerrain = TRUE;
 
 	return 1;
 }
