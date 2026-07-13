@@ -89,6 +89,11 @@ public:
 	/// game's 2D interface, which VR shows on floating panels - is complete.
 	/// No-op unless the game runs with -vr and a session is live.
 	void drawVRScene( class W3DView *view );
+	/// The interface panels, drawn as real geometry in the eye pass. Handing them to the
+	/// compositor as quad layers instead put them flat on top of everything with no depth: the
+	/// laser aimed at a panel disappeared behind it, and the panel became a hard rectangle
+	/// stamped over the battlefield.
+	void drawVRPanels( const Matrix3D &anchor, Real scale );
 	Bool m_vrWorldRendered;  ///< did the eye pass run this frame?
 #endif
 

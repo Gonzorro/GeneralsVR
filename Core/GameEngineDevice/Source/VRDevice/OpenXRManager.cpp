@@ -1468,6 +1468,36 @@ void OpenXRManager::layoutUiPanels()
 }
 
 //-------------------------------------------------------------------------------------------------
+Bool OpenXRManager::getPanelInfo(Int index, VRPanelInfo &out) const
+{
+	if (index < 0 || index >= UI_PANEL_COUNT)
+		return FALSE;
+
+	const UiPanel& p = m_uiPanels[index];
+	if (!p.active)
+		return FALSE;
+
+	out.quatX = p.pose.orientation.x;
+	out.quatY = p.pose.orientation.y;
+	out.quatZ = p.pose.orientation.z;
+	out.quatW = p.pose.orientation.w;
+	out.posX = p.pose.position.x;
+	out.posY = p.pose.position.y;
+	out.posZ = p.pose.position.z;
+	out.widthMeters = p.widthMeters;
+	out.heightMeters = p.heightMeters;
+	out.isGroupBar = p.isGroupBar;
+
+	const Real texW = (Real)(p.isGroupBar ? m_groupBarWidth : m_uiWidth);
+	const Real texH = (Real)(p.isGroupBar ? m_groupBarHeight : m_uiHeight);
+	out.u0 = (texW > 0.0f) ? (Real)p.cropX / texW : 0.0f;
+	out.v0 = (texH > 0.0f) ? (Real)p.cropY / texH : 0.0f;
+	out.u1 = (texW > 0.0f) ? (Real)(p.cropX + p.cropW) / texW : 1.0f;
+	out.v1 = (texH > 0.0f) ? (Real)(p.cropY + p.cropH) / texH : 1.0f;
+	return TRUE;
+}
+
+//-------------------------------------------------------------------------------------------------
 OpenXRManager::VRPickKind OpenXRManager::pickUiPanel(Int hand, Int &outX, Int &outY,
 	Real *outDistanceMeters) const
 {
@@ -1974,17 +2004,11 @@ void OpenXRManager::submitFrame(Bool worldRendered)
 		}
 	}
 
-	Bool anyFramePanel = FALSE;
-	Bool anyGroupPanel = FALSE;
-	for (Int i = 0; i < UI_PANEL_COUNT; ++i)
-	{
-		if (!m_uiPanels[i].active)
-			continue;
-		if (m_uiPanels[i].isGroupBar)
-			anyGroupPanel = TRUE;
-		else
-			anyFramePanel = TRUE;
-	}
+	// The panels are drawn as real geometry in the eye pass now (see W3DDisplay::drawVRPanels),
+	// not handed to the compositor as quad layers: a layer has no depth, so it buried the laser
+	// that was pointing at it and stamped a hard rectangle over the battlefield.
+	const Bool anyFramePanel = FALSE;
+	const Bool anyGroupPanel = FALSE;
 
 	if (m_uiReady && anyFramePanel)
 	{

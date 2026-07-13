@@ -1798,6 +1798,119 @@ void W3DDisplay::step()
 }
 
 #ifdef RTS_HAS_OPENXR
+// W3DDisplay::drawVRPanels ===================================================
+/** GeneralsVR @feature Draw the interface panels as real quads in the world.
+	*
+	* They used to be OpenXR quad layers, which the compositor paints flat over the finished
+	* image with no depth at all. That had two consequences the player felt immediately: the
+	* laser aimed at a panel vanished *behind* it, and the panel read as a hard rectangle of
+	* screen pasted over the battlefield. As geometry they sort properly against the beam and
+	* the world, and an alpha test throws away everything the interface did not paint - so what
+	* floats in front of the player is the menu's own sprites, and nothing else.
+	*/
+//=============================================================================
+void W3DDisplay::drawVRPanels( const Matrix3D &anchor, Real scale )
+{
+	if (TheOpenXR == nullptr)
+		return;
+
+	IDirect3DDevice8 *device = DX8Wrapper::_Get_D3D_Device8();
+	if (device == nullptr)
+		return;
+
+	struct PanelVertex { Real x, y, z; Real u, v; };
+	const DWORD PANEL_FVF = D3DFVF_XYZ | D3DFVF_TEX1;
+
+	Bool stateSet = FALSE;
+
+	for (Int i = 0; i < TheOpenXR->getPanelCount(); ++i)
+	{
+		OpenXRManager::VRPanelInfo info;
+		if (!TheOpenXR->getPanelInfo(i, info))
+			continue;
+
+		IDirect3DTexture8 *texture = info.isGroupBar ? TheOpenXR->getGroupBarTexture()
+		                                             : TheOpenXR->getUiTexture();
+		if (texture == nullptr)
+			continue;
+
+		// The panel's pose is in VR space (metres); lift it into the world the same way the
+		// hands and eyes are, so it hangs exactly where the player sees their controller.
+		Quaternion q(info.quatX, info.quatY, info.quatZ, info.quatW);
+		Matrix3D panelPose;
+		Build_Matrix3D(q, panelPose);
+		panelPose.Set_Translation(Vector3(info.posX * scale, info.posY * scale, info.posZ * scale));
+
+		Matrix3D panelWorld;
+		Matrix3D::Multiply(anchor, panelPose, &panelWorld);
+
+		const Vector3 origin = panelWorld.Get_Translation();
+		const Vector3 right = panelWorld.Get_X_Vector() * (info.widthMeters * 0.5f * scale);
+		const Vector3 up = panelWorld.Get_Y_Vector() * (info.heightMeters * 0.5f * scale);
+
+		// Panel space is +X right and +Y up; the texture runs +V downwards.
+		const Vector3 topLeft = origin - right + up;
+		const Vector3 topRight = origin + right + up;
+		const Vector3 bottomRight = origin + right - up;
+		const Vector3 bottomLeft = origin - right - up;
+
+		PanelVertex verts[4] =
+		{
+			{ topLeft.X,     topLeft.Y,     topLeft.Z,     info.u0, info.v0 },
+			{ topRight.X,    topRight.Y,    topRight.Z,    info.u1, info.v0 },
+			{ bottomRight.X, bottomRight.Y, bottomRight.Z, info.u1, info.v1 },
+			{ bottomLeft.X,  bottomLeft.Y,  bottomLeft.Z,  info.u0, info.v1 },
+		};
+
+		if (!stateSet)
+		{
+			stateSet = TRUE;
+
+			D3DMATRIX identity;
+			for (Int r = 0; r < 4; ++r)
+				for (Int c = 0; c < 4; ++c)
+					identity.m[r][c] = (r == c) ? 1.0f : 0.0f;
+			device->SetTransform(D3DTS_WORLD, &identity);
+
+			device->SetVertexShader(PANEL_FVF);
+			device->SetPixelShader(0);
+			device->SetRenderState(D3DRS_LIGHTING, FALSE);
+			device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+			device->SetRenderState(D3DRS_ZENABLE, TRUE);
+			device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+			device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+
+			// Keep only what the interface actually painted. Blending alone would leave the
+			// unpainted background faintly there, and any alpha the sprites lost on the way in
+			// would show the world through the buttons.
+			device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+			device->SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
+			device->SetRenderState(D3DRS_ALPHAREF, 0x40);
+			device->SetRenderState(D3DRS_ALPHAFUNC, D3DCMP_GREATER);
+
+			device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+			device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+			device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+			device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+			device->SetTextureStageState(0, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
+			device->SetTextureStageState(0, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
+			device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+			device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+		}
+
+		device->SetTexture(0, texture);
+		device->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, verts, sizeof(PanelVertex));
+	}
+
+	if (stateSet)
+	{
+		// Hand the device back the way we found it, or the next thing drawn inherits our states.
+		device->SetTexture(0, nullptr);
+		device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+		DX8Wrapper::Invalidate_Cached_Render_States();
+	}
+}
+
 // W3DDisplay::drawVRScene ====================================================
 /** GeneralsVR @feature Stereo pass: render the 3D scene once per eye into the OpenXR render
 	* targets, then hand them to the runtime.
@@ -1905,6 +2018,10 @@ void W3DDisplay::drawVRScene( W3DView *view )
 			if (TheVRControls != nullptr && TheVRControls->getRayScene() != nullptr)
 				WW3D::Render(TheVRControls->getRayScene(), vrCamera);
 
+			// The interface panels are geometry too, so the beam aimed at one lands in front of
+			// it instead of vanishing behind a layer pasted over the frame.
+			drawVRPanels(anchor, scale);
+
 			WW3D::End_Render(false);  // no present: the image belongs to the headset
 		}
 
@@ -1926,9 +2043,10 @@ void W3DDisplay::drawVRScene( W3DView *view )
 
 		if (WW3D::Begin_Render(false, false, Vector3(0.0f, 0.0f, 0.0f)) == WW3D_ERROR_OK)
 		{
-			// Opaque. The interface is a physical panel you hold, not a ghost: leaving the alpha
-			// at zero let the battlefield bleed through the buttons and washed the whole thing out.
-			DX8Wrapper::Clear(true, false, Vector3(0.0f, 0.0f, 0.0f), 1.0f);
+			// Transparent background: only the interface's own sprites should exist in VR, never
+			// a rectangle of screen. The panel quad alpha-tests this, so what the UI did not
+			// paint is simply not drawn - no black square, and the sprites stay solid.
+			DX8Wrapper::Clear(true, false, Vector3(0.0f, 0.0f, 0.0f), 0.0f);
 
 			TheInGameUI->DRAW();	// this repaints the whole window system, menus included
 			if (TheMouse != nullptr)

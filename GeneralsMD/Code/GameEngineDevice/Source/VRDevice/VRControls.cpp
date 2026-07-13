@@ -519,9 +519,10 @@ void VRControls::updatePointer(W3DView *view)
 	if (pick == OpenXRManager::VR_PICK_GROUP_SLOT)
 	{
 		// The control-group bar is ours, not the game's: a trigger pull recalls that squad, and
-		// holding the primary button while pulling saves the current selection into it instead.
+		// holding the LEFT hand's button while pulling saves the current selection into it
+		// instead. (The right hand's A now issues orders, so it cannot double as a modifier.)
 		if (rightState.triggerPressed)
-			applyControlGroup(panelX, rightState.primaryButton);
+			applyControlGroup(panelX, TheOpenXR->getController(VR_HAND_LEFT).primaryButton);
 
 		// Do not let the click fall through to the battlefield underneath.
 		if (m_leftDown)
@@ -591,8 +592,11 @@ void VRControls::updatePointer(W3DView *view)
 			if (rightState.triggerPressed)
 				selectUnderRay(origin, dir);
 
+			// Orders live on A as well as the left trigger. On a mouse the same button does both
+			// jobs by context, but a trigger has no such context in the hand, and one button that
+			// sometimes selects and sometimes orders is a button you cannot trust mid-battle.
 			const VRControllerState &leftState = TheOpenXR->getController(VR_HAND_LEFT);
-			if (leftState.triggerPressed)
+			if (rightState.primaryPressed || leftState.triggerPressed)
 				commandUnderRay(origin, dir);
 		}
 	}
@@ -775,7 +779,7 @@ void VRControls::drawGroupBar()
 		if (TheOpenXR->pickUiPanel(hand, slot, unusedY) == OpenXRManager::VR_PICK_GROUP_SLOT)
 			hoverSlot = slot;
 	}
-	const Bool assigning = TheOpenXR->getController(VR_HAND_RIGHT).primaryButton;
+	const Bool assigning = TheOpenXR->getController(VR_HAND_LEFT).primaryButton;
 
 	DX8Wrapper::Set_Render_Target(surface, TheOpenXR->getDepthSurface());
 

@@ -172,6 +172,24 @@ public:
 	/// Move the VR origin to where the player is now: forward becomes the way they are facing.
 	void recenter();
 
+	/// A panel, as the renderer needs to see it: the engine draws these as real 3D quads in the
+	/// eye pass rather than letting the compositor slap them on top as flat layers. A layer has
+	/// no depth, so it buried the laser pointing at it and turned the interface into a hard
+	/// rectangle floating over the world.
+	struct VRPanelInfo
+	{
+		Real quatX, quatY, quatZ, quatW;    ///< pose in the VR reference space, metres
+		Real posX, posY, posZ;
+		Real widthMeters, heightMeters;
+		Real u0, v0, u1, v1;                ///< the region of the source texture to show
+		Bool isGroupBar;                    ///< which texture: the group bar, or the interface
+	};
+	Int getPanelCount() const { return UI_PANEL_COUNT; }
+	Bool getPanelInfo(Int index, VRPanelInfo &out) const;
+
+	IDirect3DTexture8* getUiTexture() const { return m_uiTexture; }
+	IDirect3DTexture8* getGroupBarTexture() const { return m_groupBarTexture; }
+
 	/// The control-group bar the engine draws for us (10 slots), shown on the wrist panel.
 	IDirect3DSurface8* getGroupBarSurface() const { return m_groupBarSurface; }
 	Int getGroupBarWidth() const { return m_groupBarWidth; }
