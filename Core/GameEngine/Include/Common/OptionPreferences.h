@@ -114,6 +114,7 @@ public:
 	Bool getUseHeatEffects();
 	Bool getDynamicLODEnabled();
 	Bool getFPSLimitEnabled();
+	Int getMaxRenderFps(); ///< GeneralsVR @feature Optional "MaxRenderFPS" override, 0 when not set
 	Bool getBuildingOcclusionEnabled();
 	Int getParticleCap();
 

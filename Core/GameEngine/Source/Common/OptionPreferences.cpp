@@ -32,6 +32,7 @@
 #include "PreRTS.h"	// This must go first in EVERY cpp file in the GameEngine
 
 #include "Common/AudioSettings.h"
+#include "Common/FrameRateLimit.h"
 #include "Common/GameAudio.h"
 #include "Common/GameLOD.h"
 #include "Common/GlobalData.h"
@@ -671,6 +672,25 @@ Bool OptionPreferences::getFPSLimitEnabled()
 		return TRUE;
 	}
 	return FALSE;
+}
+
+// GeneralsVR @feature Optional max render fps override, applied on engine init
+// and on new game, where the game speed otherwise dictates the render fps.
+// 0 or absent key keeps the original behavior. "uncapped" removes the limit.
+Int OptionPreferences::getMaxRenderFps()
+{
+	OptionPreferences::const_iterator it = find("MaxRenderFPS");
+	if (it == end())
+		return 0;
+
+	if (stricmp(it->second.str(), "uncapped") == 0)
+		return RenderFpsPreset::UncappedFpsValue;
+
+	Int fps = atoi(it->second.str());
+	if (fps < LOGICFRAMES_PER_SECOND || fps > 1000)
+		return 0;
+
+	return fps;
 }
 
 Bool OptionPreferences::get3DShadowsEnabled()

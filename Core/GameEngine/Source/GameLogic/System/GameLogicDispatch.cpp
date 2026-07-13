@@ -32,10 +32,12 @@
 
 #include "Common/CRCDebug.h"
 #include "Common/FramePacer.h"
+#include "Common/FrameRateLimit.h"
 #include "Common/GameAudio.h"
 #include "Common/GameEngine.h"
 #include "Common/GlobalData.h"
 #include "Common/NameKeyGenerator.h"
+#include "Common/OptionPreferences.h"
 #include "Common/ThingFactory.h"
 #include "Common/Player.h"
 #include "Common/PlayerList.h"
@@ -877,14 +879,38 @@ bool GameLogic::onNewGame(MAYBE_UNUSED GameMessage *msg)
 	if ( msg->getArgumentCount() >= 3 )
 		rankPoints = msg->getArgument( 2 )->integer;
 
+	Int gameSpeedFps = LOGICFRAMES_PER_SECOND;
+
 	if ( msg->getArgumentCount() >= 4 )
 	{
 		Int maxFPS = msg->getArgument( 3 )->integer;
+		// GeneralsVR @tweak The fallback is now the logic frame rate constant, because the
+		// global data value carries the "MaxRenderFPS" preference and is no longer a valid
+		// game speed.
 		if (maxFPS < 1 || maxFPS > 1000)
-			maxFPS = TheGlobalData->m_framesPerSecondLimit;
+			maxFPS = LOGICFRAMES_PER_SECOND;
 		DEBUG_LOG(("Setting max FPS limit to %d FPS", maxFPS));
 		TheFramePacer->setFramesPerSecondLimit(maxFPS);
 		TheWritableGlobalData->m_useFpsLimit = true;
+		gameSpeedFps = maxFPS;
+	}
+
+	// GeneralsVR @feature Decouple the render rate from the game speed. The logic rate is
+	// always pinned to the game speed fps, so that render fps changes (preference, hotkeys,
+	// uncapped) never change the game speed. Networked games pace their logic through
+	// TheNetwork, which takes precedence over the logic time scale in the frame pacer.
+	{
+		TheFramePacer->setLogicTimeScaleFps(gameSpeedFps);
+		TheFramePacer->enableLogicTimeScale(TRUE);
+
+		OptionPreferences optionPref;
+		const Int preferredRenderFps = optionPref.getMaxRenderFps();
+		if (preferredRenderFps > 0)
+		{
+			DEBUG_LOG(("Overriding max FPS limit with MaxRenderFPS preference %d, logic runs at %d FPS", preferredRenderFps, gameSpeedFps));
+			TheFramePacer->setFramesPerSecondLimit(preferredRenderFps);
+			TheWritableGlobalData->m_useFpsLimit = (preferredRenderFps != RenderFpsPreset::UncappedFpsValue);
+		}
 	}
 
 	// prepare for new game

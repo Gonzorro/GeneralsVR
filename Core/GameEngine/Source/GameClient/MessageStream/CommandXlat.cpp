@@ -183,6 +183,16 @@ Bool hasThingsInProduction(PlayerType playerType)
 bool changeMaxRenderFps(FpsValueChange change)
 {
 	UnsignedInt maxRenderFps = TheFramePacer->getFramesPerSecondLimit();
+
+	// GeneralsVR @feature Pin the logic rate to the current effective rate before changing
+	// the render rate, so that render fps changes never change the game speed. Networked
+	// games pace their logic through TheNetwork, which takes precedence anyway.
+	if (TheNetwork == nullptr && !TheFramePacer->isLogicTimeScaleEnabled())
+	{
+		TheFramePacer->setLogicTimeScaleFps(maxRenderFps);
+		TheFramePacer->enableLogicTimeScale(TRUE);
+	}
+
 	maxRenderFps = RenderFpsPreset::changeFpsValue(maxRenderFps, change);
 
 	TheFramePacer->setFramesPerSecondLimit(maxRenderFps);

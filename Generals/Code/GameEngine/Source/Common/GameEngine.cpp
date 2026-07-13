@@ -33,6 +33,7 @@
 #include "Common/BuildAssistant.h"
 #include "Common/CRCDebug.h"
 #include "Common/FramePacer.h"
+#include "Common/FrameRateLimit.h"
 #include "Common/Radar.h"
 #include "Common/PlayerTemplate.h"
 #include "Common/Team.h"
@@ -509,6 +510,20 @@ void GameEngine::init()
 		TheSubsystemList->postProcessLoadAll();
 
 		TheFramePacer->setFramesPerSecondLimit(TheGlobalData->m_framesPerSecondLimit);
+
+		// GeneralsVR @feature Apply the optional "MaxRenderFPS" preference from Options.ini.
+		// Written into the global data so that any later reset to the global value,
+		// such as ScriptEngine::reset() on map load, restores the preference and not 30.
+		{
+			OptionPreferences optionPref;
+			const Int preferredRenderFps = optionPref.getMaxRenderFps();
+			if (preferredRenderFps > 0)
+			{
+				TheWritableGlobalData->m_framesPerSecondLimit = preferredRenderFps;
+				TheWritableGlobalData->m_useFpsLimit = (preferredRenderFps != RenderFpsPreset::UncappedFpsValue);
+				TheFramePacer->setFramesPerSecondLimit(preferredRenderFps);
+			}
+		}
 
 		TheAudio->setOn(TheGlobalData->m_audioOn && TheGlobalData->m_musicOn, AudioAffect_Music);
 		TheAudio->setOn(TheGlobalData->m_audioOn && TheGlobalData->m_soundsOn, AudioAffect_Sound);
