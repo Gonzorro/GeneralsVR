@@ -156,6 +156,17 @@ public:
 	/// Also reports how far away the hit was, so the laser can be drawn stopping at the panel.
 	VRPickKind pickUiPanel(Int hand, Int &outX, Int &outY, Real *outDistanceMeters = nullptr) const;
 
+	/// The surface the engine draws the game's real 2D interface into, once per frame, with a
+	/// transparent background. Showing THAT beats copying the finished frame: a crop of the
+	/// backbuffer can only ever show a rectangle of whatever the flat game happened to draw,
+	/// which is useless the moment a full-screen menu (the Generals promotion screen, say)
+	/// appears. Here we get the real windows, sprites and all, on a clear background.
+	IDirect3DSurface8* getUiSurface() const { return m_uiSurface; }
+	Bool hasUiSurface() const { return m_uiSurface != nullptr; }
+
+	/// Move the VR origin to where the player is now: forward becomes the way they are facing.
+	void recenter();
+
 	/// The control-group bar the engine draws for us (10 slots), shown on the wrist panel.
 	IDirect3DSurface8* getGroupBarSurface() const { return m_groupBarSurface; }
 	Int getGroupBarWidth() const { return m_groupBarWidth; }
@@ -237,6 +248,8 @@ private:
 	XrAction m_stickAction;
 	XrAction m_primaryAction;
 	XrAction m_secondaryAction;
+	XrAction m_menuAction;      ///< the three-bar button: recenter
+	Bool m_menuButtonDown;
 	XrPath m_handPaths[VR_HAND_COUNT];
 	XrSpace m_aimSpaces[VR_HAND_COUNT];
 	VRControllerState m_controllers[VR_HAND_COUNT];
@@ -270,6 +283,8 @@ private:
 	// The game's 2D frame, captured from the backbuffer and shown on panels in VR
 	XrSwapchain m_uiSwapchain;
 	std::vector<VkImage> m_uiImages;
+	IDirect3DTexture8* m_uiTexture;   ///< the engine draws the real interface here
+	IDirect3DSurface8* m_uiSurface;
 	Int m_uiWidth, m_uiHeight;
 	Bool m_uiInGame;
 	Bool m_uiReady;

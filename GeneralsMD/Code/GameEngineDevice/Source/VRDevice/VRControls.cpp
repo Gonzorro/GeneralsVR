@@ -331,142 +331,47 @@ void VRControls::updateLocomotion(W3DView *view)
 		handWorld[hand] = world.Get_Translation();
 	}
 
+	// Grips are ONLY for resizing the world now: the left stick moves you, so a one-handed drag
+	// competing with it was both redundant and the source of the runaway slide. Two grips
+	// together pinch the battlefield bigger or smaller - pull your hands apart to shrink down
+	// into it and see the fighting up close, push them together to grow and take in the whole map.
 	const Bool leftGrab = left.grip && handValid[VR_HAND_LEFT];
 	const Bool rightGrab = right.grip && handValid[VR_HAND_RIGHT];
+	const Bool pinching = leftGrab && rightGrab;
 
-	// Starting or restarting a grab: snapshot where the hands and the camera are, so the drag
-	// is always measured from the moment of the grip rather than accumulating drift.
-	const Bool bothNow = leftGrab && rightGrab;
-	const Bool anyNow = leftGrab || rightGrab;
-	const Bool wasGrabbing = m_grabbing[0] || m_grabbing[1];
-
-	if (anyNow && (!wasGrabbing || bothNow != m_twoHandGrab))
+	if (pinching)
 	{
-		m_grabCameraPos = view->getPosition();
-		m_grabAngle = view->getAngle();
-		m_grabScale = scale;
-		m_twoHandGrab = bothNow;
-		for (Int hand = 0; hand < 2; ++hand)
-			m_grabHandWorld[hand] = handWorld[hand];
+		const Vector3 span = handWorld[1] - handWorld[0];
+		const Real spanNow = span.Length();
 
-		if (bothNow)
+		if (!m_twoHandGrab)
 		{
-			const Vector3 span = handWorld[1] - handWorld[0];
-			m_grabHandSpan = span.Length();
+			// A pinch begins: remember what the world looked like at this hand separation.
+			m_twoHandGrab = TRUE;
+			m_grabScale = scale;
+			m_grabHandSpan = spanNow;
 		}
-
-		// Start the throw measurement from HERE. Without this the first frame of a grab
-		// measures against wherever the camera was last time - possibly another map - and
-		// launches the world at an absurd speed.
-		m_lastCameraPos = m_grabCameraPos;
-		m_slideVelocity.x = m_slideVelocity.y = 0.0f;
-	}
-	m_grabbing[VR_HAND_LEFT] = leftGrab;
-	m_grabbing[VR_HAND_RIGHT] = rightGrab;
-
-	if (anyNow)
-	{
-		if (bothNow && m_grabHandSpan > 1.0f)
+		else if (spanNow > 1.0f && m_grabHandSpan > 1.0f)
 		{
-			// Two hands: pulling them apart magnifies the table (you dive in), pushing them
-			// together shrinks it (you rise above the whole battle).
-			const Vector3 span = handWorld[1] - handWorld[0];
-			const Real spanNow = span.Length();
-			if (spanNow > 1.0f)
-			{
-				Real newScale = m_grabScale * (m_grabHandSpan / spanNow);
-				if (newScale < MIN_SCALE) newScale = MIN_SCALE;
-				if (newScale > MAX_SCALE) newScale = MAX_SCALE;
-				TheWritableGlobalData->m_vrWorldUnitsPerMeter = newScale;
-			}
-		}
-
-		// One hand (or the midpoint of two): the world follows the hand. Moving your hand
-		// right pushes the world right, which means the camera goes left.
-		Vector3 dragNow(0.0f, 0.0f, 0.0f);
-		Vector3 dragStart(0.0f, 0.0f, 0.0f);
-		Int dragCount = 0;
-		for (Int hand = 0; hand < 2; ++hand)
-		{
-			if (!m_grabbing[hand] || !handValid[hand])
-				continue;
-			dragNow += handWorld[hand];
-			dragStart += m_grabHandWorld[hand];
-			++dragCount;
-		}
-		if (dragCount > 0)
-		{
-			dragNow /= (Real)dragCount;
-			dragStart /= (Real)dragCount;
-
-			Coord3D pos;
-			pos.x = m_grabCameraPos.x - (dragNow.X - dragStart.X) * GRAB_GAIN;
-			pos.y = m_grabCameraPos.y - (dragNow.Y - dragStart.Y) * GRAB_GAIN;
-			pos.z = m_grabCameraPos.z;
-			view->lookAt(&pos);
-		}
-
-		// While gripping, track how fast the map is travelling so that letting go mid-sweep lets
-		// it coast on. Measured in TABLE-METRES per second, not world units, so the feel is the
-		// same whether the map is a tabletop or a landscape - a raw world-unit velocity scales
-		// with the zoom and turns into a catapult when you are zoomed out.
-		const Coord3D nowPos = view->getPosition();
-		const Real dtVel = TheFramePacer != nullptr ? TheFramePacer->getUpdateTime() : (1.0f / 90.0f);
-		if (dtVel > 0.0001f && scale > 0.0f)
-		{
-			const Real instantX = ((nowPos.x - m_lastCameraPos.x) / scale) / dtVel;
-			const Real instantY = ((nowPos.y - m_lastCameraPos.y) / scale) / dtVel;
-
-			// Smoothed: one jittery frame must not become a launch.
-			m_slideVelocity.x += (instantX - m_slideVelocity.x) * SLIDE_SMOOTHING;
-			m_slideVelocity.y += (instantY - m_slideVelocity.y) * SLIDE_SMOOTHING;
-
-			const Real speed = sqrtf(m_slideVelocity.x * m_slideVelocity.x
-				+ m_slideVelocity.y * m_slideVelocity.y);
-			if (speed > SLIDE_MAX_SPEED)
-			{
-				const Real clamp = SLIDE_MAX_SPEED / speed;
-				m_slideVelocity.x *= clamp;
-				m_slideVelocity.y *= clamp;
-			}
+			Real newScale = m_grabScale * (m_grabHandSpan / spanNow);
+			if (newScale < MIN_SCALE) newScale = MIN_SCALE;
+			if (newScale > MAX_SCALE) newScale = MAX_SCALE;
+			TheWritableGlobalData->m_vrWorldUnitsPerMeter = newScale;
 		}
 	}
 	else
 	{
 		m_twoHandGrab = FALSE;
-
-		// Let go and the map coasts to a stop.
-		const Real dtSlide = TheFramePacer != nullptr ? TheFramePacer->getUpdateTime() : (1.0f / 90.0f);
-		const Real speed = sqrtf(m_slideVelocity.x * m_slideVelocity.x
-			+ m_slideVelocity.y * m_slideVelocity.y);
-		if (speed > SLIDE_MIN_SPEED)
-		{
-			Coord3D pos = view->getPosition();
-			pos.x += m_slideVelocity.x * scale * dtSlide;
-			pos.y += m_slideVelocity.y * scale * dtSlide;
-			view->lookAt(&pos);
-
-			const Real decay = 1.0f - SLIDE_FRICTION * dtSlide;
-			m_slideVelocity.x *= (decay > 0.0f) ? decay : 0.0f;
-			m_slideVelocity.y *= (decay > 0.0f) ? decay : 0.0f;
-		}
-		else
-		{
-			m_slideVelocity.x = m_slideVelocity.y = 0.0f;
-		}
 	}
 
-	m_lastCameraPos = view->getPosition();
-
-	// Thumbsticks: the same verbs without the arm movement. Left pans, right turns and zooms.
+	// Thumbsticks: left pans, right turns and zooms.
 	const Real dt = TheFramePacer != nullptr ? TheFramePacer->getUpdateTime() : (1.0f / 90.0f);
 
 	const Real panX = applyDeadzone(left.stickX);
 	const Real panY = applyDeadzone(left.stickY);
 	if (panX != 0.0f || panY != 0.0f)
 	{
-		// Pan along the direction you are facing, in table-metres so it feels the same at any
-		// zoom level.
+		// Pan along the way you are facing, in table-metres so it feels the same at any zoom.
 		const Vector3 forward = -anchor.Get_Z_Vector();
 		const Vector3 right2 = anchor.Get_X_Vector();
 		const Real step = STICK_PAN_SPEED * scale * dt;
@@ -484,13 +389,13 @@ void VRControls::updateLocomotion(W3DView *view)
 	const Real zoom = applyDeadzone(right.stickY);
 	if (zoom != 0.0f)
 	{
-		// Push forward to grow the table (dive in), pull back to shrink it (rise above).
 		Real newScale = TheOpenXR->getWorldUnitsPerMeter() * (1.0f - zoom * STICK_ZOOM_SPEED * dt);
 		if (newScale < MIN_SCALE) newScale = MIN_SCALE;
 		if (newScale > MAX_SCALE) newScale = MAX_SCALE;
 		TheWritableGlobalData->m_vrWorldUnitsPerMeter = newScale;
 	}
 }
+
 
 //-------------------------------------------------------------------------------------------------
 /** Point at the battlefield and click. The ray's ground hit is projected into the tactical
@@ -547,13 +452,30 @@ void VRControls::updatePointer(W3DView *view)
 		// aiming at, which is why units could not be clicked.
 		Vector3 origin, dir;
 		Coord3D hit;
-		if (computeHandRay(VR_HAND_RIGHT, origin, dir)
-			&& traceAim(origin, dir, hit)
-			&& view->worldToScreen(&hit, &screen))
+		const Bool haveRay = computeHandRay(VR_HAND_RIGHT, origin, dir);
+		const Bool haveObject = haveRay && traceScene(origin, dir, hit);
+		const Bool haveGround = !haveObject && haveRay && traceTerrain(origin, dir, hit);
+		const Bool onScreen = (haveObject || haveGround) && view->worldToScreen(&hit, &screen);
+
+		if (onScreen)
 		{
 			m_hasAimPoint = TRUE;
 			m_aimPoint = hit;
 			haveTarget = TRUE;
+		}
+
+		// Say exactly where the chain breaks. A click that goes nowhere is otherwise silent:
+		// the ray may miss, or it may hit something that the flat camera cannot see - and
+		// worldToScreen then refuses, because the cursor we drive lives in the flat view.
+		static Int diagCountdown = 0;
+		if (--diagCountdown <= 0 || rightState.triggerPressed)
+		{
+			diagCountdown = 90;
+			DEBUG_LOG(("OpenXR: aim: ray=%d object=%d ground=%d onScreen=%d screen=(%d,%d) hit=(%.0f %.0f %.0f)%s",
+				haveRay, haveObject, haveGround, onScreen,
+				onScreen ? screen.x : -1, onScreen ? screen.y : -1,
+				hit.x, hit.y, hit.z,
+				rightState.triggerPressed ? " [TRIGGER]" : ""));
 		}
 	}
 
@@ -789,6 +711,23 @@ void VRControls::update()
 
 	W3DView *view = (W3DView *)TheTacticalView;
 	const Bool inGame = (TheGameLogic != nullptr && TheGameLogic->isInGame());
+
+	// Skipping the intro. The movie does not run in a blocking loop at all - it plays across
+	// ordinary frames, and Escape reaches it through the window translator, which then calls
+	// stopMovie(). So we call the same thing: no keyboard needed in a headset.
+	if (TheDisplay != nullptr && TheDisplay->isMoviePlaying())
+	{
+		for (Int hand = 0; hand < 2; ++hand)
+		{
+			if (TheOpenXR->getController(hand).secondaryPressed)
+			{
+				TheDisplay->stopMovie();
+				DEBUG_LOG(("OpenXR: movie skipped by controller"));
+				break;
+			}
+		}
+		return;	// nothing else to do while a movie is on screen
+	}
 
 	updatePanelToggles();
 

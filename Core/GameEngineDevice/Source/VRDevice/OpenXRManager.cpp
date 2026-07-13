@@ -112,6 +112,8 @@ OpenXRManager::OpenXRManager()
 	, m_depthSurface(nullptr)
 	, m_eyeImageLayout(VK_IMAGE_LAYOUT_UNDEFINED)
 	, m_uiSwapchain(XR_NULL_HANDLE)
+	, m_uiTexture(nullptr)
+	, m_uiSurface(nullptr)
 	, m_uiWidth(0)
 	, m_uiHeight(0)
 	, m_uiInGame(FALSE)
@@ -129,6 +131,8 @@ OpenXRManager::OpenXRManager()
 	, m_stickAction(XR_NULL_HANDLE)
 	, m_primaryAction(XR_NULL_HANDLE)
 	, m_secondaryAction(XR_NULL_HANDLE)
+	, m_menuAction(XR_NULL_HANDLE)
+	, m_menuButtonDown(FALSE)
 	, m_actionsReady(FALSE)
 	, m_framesSubmitted(0)
 	, m_submitFailLogged(FALSE)
@@ -623,6 +627,7 @@ Bool OpenXRManager::createActions()
 		{ &m_stickAction,   "stick",    "Thumbstick",    XR_ACTION_TYPE_VECTOR2F_INPUT},
 		{ &m_primaryAction, "primary",  "Primary Button",XR_ACTION_TYPE_BOOLEAN_INPUT },
 		{ &m_secondaryAction, "secondary", "Secondary Button", XR_ACTION_TYPE_BOOLEAN_INPUT },
+		{ &m_menuAction,    "menu",     "Menu Button",   XR_ACTION_TYPE_BOOLEAN_INPUT },
 	};
 
 	for (size_t i = 0; i < sizeof(defs)/sizeof(defs[0]); ++i)
@@ -651,6 +656,9 @@ Bool OpenXRManager::createActions()
 		"/user/hand/left/input/thumbstick",          "/user/hand/right/input/thumbstick",
 		"/user/hand/left/input/x/click",             "/user/hand/right/input/a/click",
 		"/user/hand/left/input/y/click",             "/user/hand/right/input/b/click",
+		// The three-bar button lives on the LEFT controller only (the right one belongs to the
+		// system), so both hands' menu action is bound to it.
+		"/user/hand/left/input/menu/click",          "/user/hand/left/input/menu/click",
 	};
 	XrAction bindingActions[] =
 	{
@@ -660,6 +668,7 @@ Bool OpenXRManager::createActions()
 		m_stickAction,   m_stickAction,
 		m_primaryAction, m_primaryAction,
 		m_secondaryAction, m_secondaryAction,
+		m_menuAction,    m_menuAction,
 	};
 
 	std::vector<XrActionSuggestedBinding> bindings;
@@ -668,6 +677,21 @@ Bool OpenXRManager::createActions()
 		XrPath path = XR_NULL_PATH;
 		if (XR_FAILED(xrStringToPath(m_instance, bindingPaths[i], &path)))
 			continue;
+
+		// The menu button exists on one controller only, so its two entries collapse into one
+		// binding. Suggesting the same action/path pair twice is asking for trouble.
+		Bool duplicate = FALSE;
+		for (size_t j = 0; j < bindings.size(); ++j)
+		{
+			if (bindings[j].action == bindingActions[i] && bindings[j].binding == path)
+			{
+				duplicate = TRUE;
+				break;
+			}
+		}
+		if (duplicate)
+			continue;
+
 		XrActionSuggestedBinding b = {};
 		b.action = bindingActions[i];
 		b.binding = path;
@@ -731,6 +755,20 @@ void OpenXRManager::syncControllers()
 	sync.activeActionSets = &active;
 	if (XR_FAILED(xrSyncActions(m_session, &sync)))
 		return;
+
+	// The three-bar menu button: recenter. Edge-triggered.
+	{
+		XrActionStateGetInfo get = {XR_TYPE_ACTION_STATE_GET_INFO};
+		get.subactionPath = m_handPaths[VR_HAND_LEFT];
+		get.action = m_menuAction;
+
+		XrActionStateBoolean state = {XR_TYPE_ACTION_STATE_BOOLEAN};
+		xrGetActionStateBoolean(m_session, &get, &state);
+		const Bool down = state.isActive && state.currentState;
+		if (down && !m_menuButtonDown)
+			recenter();
+		m_menuButtonDown = down;
+	}
 
 	for (Int hand = 0; hand < VR_HAND_COUNT; ++hand)
 	{
@@ -1091,6 +1129,16 @@ Bool OpenXRManager::createUiSwapchain()
 	if (m_uiWidth <= 0 || m_uiHeight <= 0)
 		return FALSE;
 
+	// The engine paints its real interface into this, on a transparent background.
+	if (FAILED(m_d3d8Device->CreateTexture(m_uiWidth, m_uiHeight, 1, D3DUSAGE_RENDERTARGET,
+		D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &m_uiTexture)))
+	{
+		DEBUG_LOG(("OpenXR: ui: CreateTexture failed (%dx%d)", m_uiWidth, m_uiHeight));
+		return FALSE;
+	}
+	if (FAILED(m_uiTexture->GetSurfaceLevel(0, &m_uiSurface)))
+		return FALSE;
+
 	XrSwapchainCreateInfo swci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
 	swci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
 	swci.format = VK_FORMAT_B8G8R8A8_SRGB;
@@ -1261,6 +1309,49 @@ Bool OpenXRManager::copyGroupBar(UnsignedInt imageIndex)
 }
 
 //-------------------------------------------------------------------------------------------------
+/** Move the VR origin to wherever the player is now, facing wherever they are facing. Play drifts
+	* - people turn in their chair, or start the game facing the wrong way - and without this the
+	* only cure is to physically shuffle back to where the session began. Only yaw is taken: tipping
+	* the world to match a tilted head would be exactly the horizon-tilt we are careful to avoid. */
+//-------------------------------------------------------------------------------------------------
+void OpenXRManager::recenter()
+{
+	if (m_session == XR_NULL_HANDLE || m_appSpace == XR_NULL_HANDLE)
+		return;
+
+	// Where is the head right now, in the space we are about to replace?
+	const XrPosef& head = m_eyePoses[0];
+
+	// Keep yaw only. A quaternion's yaw about the up axis (+Y in OpenXR) comes straight out of
+	// the atan2 of its Y/W terms once pitch and roll are dropped.
+	const Real yaw = atan2f(2.0f * (head.orientation.w * head.orientation.y
+			+ head.orientation.x * head.orientation.z),
+		1.0f - 2.0f * (head.orientation.y * head.orientation.y
+			+ head.orientation.x * head.orientation.x));
+
+	XrReferenceSpaceCreateInfo spaceInfo = {XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+	spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+	spaceInfo.poseInReferenceSpace.orientation = quatFromAxisAngle(0.0f, 1.0f, 0.0f, yaw);
+	spaceInfo.poseInReferenceSpace.position = head.position;
+
+	XrSpace newSpace = XR_NULL_HANDLE;
+	if (XR_FAILED(xrCreateReferenceSpace(m_session, &spaceInfo, &newSpace)))
+	{
+		DEBUG_LOG(("OpenXR: recenter FAILED"));
+		return;
+	}
+
+	// The old space is still referenced by this frame's layers, so retire it only once the new
+	// one is safely in place.
+	XrSpace oldSpace = m_appSpace;
+	m_appSpace = newSpace;
+	if (oldSpace != XR_NULL_HANDLE)
+		xrDestroySpace(oldSpace);
+
+	DEBUG_LOG(("OpenXR: recentered (yaw %.0f degrees)", yaw * 57.2958f));
+}
+
+//-------------------------------------------------------------------------------------------------
 void OpenXRManager::toggleWristPanel(Int hand)
 {
 	if (hand >= 0 && hand < VR_HAND_COUNT)
@@ -1323,18 +1414,22 @@ void OpenXRManager::layoutUiPanels()
 		const XrQuaternionf tilt = quatFromAxisAngle(1.0f, 0.0f, 0.0f, -0.9f);	// ~50 degrees
 		const XrQuaternionf panelQuat = multiply(handQuat, tilt);
 
-		// The whole bottom strip of the game's own HUD, full width - not a narrow slice of it.
+		// The WHOLE interface, not a rectangle cut out of the bottom of the screen. Because the
+		// engine draws it for us on a transparent background, the battlefield shows through
+		// everywhere the UI is not - and a full-screen menu (the Generals promotion screen, say)
+		// appears in full instead of being sliced in half.
 		UiPanel& p = m_uiPanels[wristPanelIds[hand]];
 		p.isGroupBar = FALSE;
 		p.cropX = 0;
-		p.cropY = (Int)(0.70f * m_uiHeight);
+		p.cropY = 0;
 		p.cropW = m_uiWidth;
-		p.cropH = m_uiHeight - p.cropY;
-		p.widthMeters = 0.75f;	// big enough to read and to hit with a ray
+		p.cropH = m_uiHeight;
+		p.widthMeters = 1.10f;	// big enough to read a menu on, and to hit with a ray
 		p.heightMeters = p.widthMeters * (Real)p.cropH / (Real)p.cropW;
 		p.pose.orientation = panelQuat;
 
-		const XrVector3f offsetLocal = { 0.0f, 0.10f, -0.06f };	// above and just ahead of the hand
+		// Out in front of the hand, where a whole screen has room to sit.
+		const XrVector3f offsetLocal = { 0.0f, 0.22f, -0.30f };
 		const XrVector3f offsetWorld = rotate(handQuat, offsetLocal);
 		p.pose.position.x = c.posX + offsetWorld.x;
 		p.pose.position.y = c.posY + offsetWorld.y;
@@ -1445,16 +1540,12 @@ OpenXRManager::VRPickKind OpenXRManager::pickUiPanel(Int hand, Int &outX, Int &o
 //-------------------------------------------------------------------------------------------------
 Bool OpenXRManager::captureUiFrame(UnsignedInt uiImageIndex)
 {
-	if (!m_uiReady || m_d3d8Device == nullptr)
+	if (!m_uiReady || m_uiTexture == nullptr)
 		return FALSE;
 
-	IDirect3DSurface8* backbuffer = nullptr;
-	if (FAILED(m_d3d8Device->GetBackBuffer(0, D3DBACKBUFFER_TYPE_MONO, &backbuffer)) || backbuffer == nullptr)
-		return FALSE;
-
+	// The engine's freshly drawn interface, not a crop of the flat frame.
 	VkImageLayout srcLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-	VkImage src = getVulkanImage(backbuffer, &srcLayout);
-	backbuffer->Release();
+	VkImage src = getVulkanImage(m_uiTexture, &srcLayout);
 
 	if (src == VK_NULL_HANDLE)
 		return FALSE;
@@ -2021,6 +2112,8 @@ void OpenXRManager::shutdown()
 		m_uiSwapchain = XR_NULL_HANDLE;
 	}
 	m_uiImages.clear();
+	if (m_uiSurface != nullptr) { m_uiSurface->Release(); m_uiSurface = nullptr; }
+	if (m_uiTexture != nullptr) { m_uiTexture->Release(); m_uiTexture = nullptr; }
 	m_uiReady = FALSE;
 
 	if (m_groupBarSwapchain != XR_NULL_HANDLE)

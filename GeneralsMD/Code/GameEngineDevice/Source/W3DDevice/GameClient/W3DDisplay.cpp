@@ -1908,6 +1908,28 @@ void W3DDisplay::drawVRScene( W3DView *view )
 		DX8Wrapper::Set_Render_Target((IDirect3DSurface8 *)nullptr);
 	}
 
+	// Draw the game's REAL interface into its own transparent layer for VR. This is the whole
+	// GUI - the same windows, sprites and menus the flat game draws - on a clear background, so
+	// the VR panel shows an actual menu rather than a rectangle cut out of the flat frame.
+	if (TheOpenXR->hasUiSurface() && TheInGameUI != nullptr)
+	{
+		DX8Wrapper::Set_Render_Target(TheOpenXR->getUiSurface(), true /* default depth buffer */);
+
+		if (WW3D::Begin_Render(false, false, Vector3(0.0f, 0.0f, 0.0f)) == WW3D_ERROR_OK)
+		{
+			// Fully transparent: everything the UI does not cover must let the battlefield through.
+			DX8Wrapper::Clear(true, false, Vector3(0.0f, 0.0f, 0.0f), 0.0f);
+
+			TheInGameUI->DRAW();	// this repaints the whole window system, menus included
+			if (TheMouse != nullptr)
+				TheMouse->DRAW();
+
+			WW3D::End_Render(false);
+		}
+
+		DX8Wrapper::Set_Render_Target((IDirect3DSurface8 *)nullptr);
+	}
+
 	// The control-group bar is our own drawing, so it has to be refreshed while we still own the
 	// render targets - before the engine goes back to the monitor frame.
 	if (TheVRControls != nullptr)
