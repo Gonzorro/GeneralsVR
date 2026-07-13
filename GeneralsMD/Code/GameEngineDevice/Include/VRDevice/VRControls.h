@@ -42,14 +42,25 @@
 #include "WWMath/vector3.h"
 
 class W3DView;
+class Line3DClass;
+class SimpleSceneClass;
 
 class VRControls
 {
 public:
 	VRControls();
+	~VRControls();
 
 	/// Once per frame, before the game client consumes input.
 	void update();
+
+	/// The laser pointers, as a scene the stereo renderer draws with the world (and in the
+	/// menus, on its own). Without a visible beam the player is pointing blind.
+	SimpleSceneClass *getRayScene() const { return m_rayScene; }
+
+	/// Draw the ten control-group slots into the render target OpenXRManager hands us. Called
+	/// by the display, because only it may touch render targets.
+	void drawGroupBar();
 
 	/// The world-space transform the headset floats at: the tactical camera's position and
 	/// heading, held upright (its downward pitch must not tilt the player's horizon). Shared
@@ -65,6 +76,9 @@ private:
 	Bool traceTerrain(const Vector3 &origin, const Vector3 &dir, Coord3D &outHit) const;
 	void updateLocomotion(W3DView *view);
 	void updatePointer(W3DView *view);
+	void updateRays(W3DView *view);
+	void updatePanelToggles();
+	void applyControlGroup(Int slot, Bool assign);
 
 	// Grab-drag state: where the world was gripped, and the camera position at that moment.
 	Bool m_grabbing[2];
@@ -75,10 +89,20 @@ private:
 	Real m_grabHandSpan;          ///< distance between hands when the two-handed grab began
 	Bool m_twoHandGrab;
 
+	// Throwing the map: a flick leaves the world sliding, and it coasts to a stop. Without this
+	// every centimetre of travel costs a full arm movement.
+	Coord2D m_slideVelocity;      ///< world units per second
+	Coord3D m_lastCameraPos;
+
 	Bool m_hasAimPoint;
 	Coord3D m_aimPoint;
 	Bool m_leftDown;              ///< synthetic mouse button state we have injected
 	Bool m_rightDown;
+
+	// The laser pointers.
+	SimpleSceneClass *m_rayScene;
+	Line3DClass *m_rayLines[2];
+	Bool m_rayVisible[2];
 };
 
 extern VRControls *TheVRControls;  ///< nullptr unless the game runs with -vr

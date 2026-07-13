@@ -69,8 +69,10 @@ struct VRControllerState
 	Bool gripPressed;
 	Bool gripReleased;
 	Real stickX, stickY;  ///< -1..1
-	Bool primaryButton;   ///< A / X
+	Bool primaryButton;   ///< A / X  - hold while clicking a group slot to ASSIGN it
 	Bool primaryPressed;
+	Bool secondaryButton; ///< B / Y  - toggles this hand's panel
+	Bool secondaryPressed;
 };
 
 enum VRHand { VR_HAND_LEFT = 0, VR_HAND_RIGHT = 1, VR_HAND_COUNT = 2 };
@@ -134,9 +136,26 @@ public:
 	/// Menus get one big screen in front of the player; a battle gets the HUD on the wrists.
 	void setUiInGame(Bool inGame) { m_uiInGame = inGame; }
 
-	/// Cast a hand's aim ray at the UI panels. Returns the pixel in the captured frame that
-	/// the ray lands on, which the engine can feed to the mouse as if it were a real cursor.
-	Bool pickUiPanel(Int hand, Int &outScreenX, Int &outScreenY) const;
+	/// In a battle each hand's panel is hidden until the player summons it with that hand's
+	/// secondary button, so it never floats in the way while they are moving units.
+	void toggleWristPanel(Int hand);
+	Bool isWristPanelOpen(Int hand) const { return m_wristPanelOpen[hand]; }
+
+	/// What a hand's ray is currently pointing at.
+	enum VRPickKind { VR_PICK_NONE = 0, VR_PICK_SCREEN, VR_PICK_GROUP_SLOT };
+
+	/// Cast a hand's aim ray at the UI panels.
+	/// VR_PICK_SCREEN     -> outX/outY is the pixel of the game's own frame under the ray, which
+	///                       the engine can feed to the mouse as if it were a real cursor.
+	/// VR_PICK_GROUP_SLOT -> outX is the control group (0-9) under the ray.
+	/// Also reports how far away the hit was, so the laser can be drawn stopping at the panel.
+	VRPickKind pickUiPanel(Int hand, Int &outX, Int &outY, Real *outDistanceMeters = nullptr) const;
+
+	/// The control-group bar the engine draws for us (10 slots), shown on the wrist panel.
+	IDirect3DSurface8* getGroupBarSurface() const { return m_groupBarSurface; }
+	Int getGroupBarWidth() const { return m_groupBarWidth; }
+	Int getGroupBarHeight() const { return m_groupBarHeight; }
+	Bool hasGroupBar() const { return m_groupBarSurface != nullptr; }
 
 	/// World units per real-world metre - the tabletop scale. Head motion and eye separation
 	/// are multiplied by this when composing the VR camera.
@@ -152,14 +171,19 @@ private:
 	{
 		XrPosef pose;                       ///< in the app reference space
 		Real widthMeters, heightMeters;
-		Int cropX, cropY, cropW, cropH;     ///< pixels within the captured frame
+		Int cropX, cropY, cropW, cropH;     ///< pixels within the source image
 		Bool active;
+		Bool isGroupBar;                    ///< draws from the group-bar swapchain, not the frame
 	};
-	enum { UI_PANEL_SCREEN = 0, UI_PANEL_LEFT_WRIST = 1, UI_PANEL_RIGHT_WRIST = 2, UI_PANEL_COUNT = 3 };
+	enum { UI_PANEL_SCREEN = 0, UI_PANEL_LEFT_WRIST = 1, UI_PANEL_RIGHT_WRIST = 2,
+	       UI_PANEL_LEFT_GROUPS = 3, UI_PANEL_RIGHT_GROUPS = 4, UI_PANEL_COUNT = 5 };
+	enum { VR_GROUP_COUNT = 10 };
 
 	Bool createUiSwapchain();
+	Bool createGroupBar();
 	void layoutUiPanels();                  ///< place the panels for this frame
 	Bool captureUiFrame(UnsignedInt uiImageIndex);  ///< backbuffer -> UI swapchain image
+	Bool copyGroupBar(UnsignedInt imageIndex);      ///< our drawn bar -> its swapchain image
 
 	Bool hasExtension(const char* name) const;
 	void probeVulkanRequirements();
@@ -175,7 +199,8 @@ private:
 	VkImage getVulkanImage(IUnknown* d3d8Resource, VkImageLayout* outLayout);
 	/// Record the eye copies (when \a imageIndices is given) and the UI capture into one command
 	/// buffer and submit it on DXVK's queue.
-	Bool recordAndSubmitCopies(const UnsignedInt* imageIndices, Bool captureUi, UnsignedInt uiImageIndex);
+	Bool recordAndSubmitCopies(const UnsignedInt* imageIndices, Bool captureUi, UnsignedInt uiImageIndex,
+		Bool captureGroupBar, UnsignedInt groupBarImageIndex);
 
 	XrInstance m_instance;
 	XrSystemId m_systemId;
@@ -206,6 +231,7 @@ private:
 	XrAction m_gripAction;
 	XrAction m_stickAction;
 	XrAction m_primaryAction;
+	XrAction m_secondaryAction;
 	XrPath m_handPaths[VR_HAND_COUNT];
 	XrSpace m_aimSpaces[VR_HAND_COUNT];
 	VRControllerState m_controllers[VR_HAND_COUNT];
@@ -243,6 +269,16 @@ private:
 	Bool m_uiInGame;
 	Bool m_uiReady;
 	UiPanel m_uiPanels[UI_PANEL_COUNT];
+	Bool m_wristPanelOpen[VR_HAND_COUNT];
+
+	// The control-group bar: a render target the engine draws ten numbered slots into, shown
+	// under the wrist panel so squads can be saved and recalled without a keyboard.
+	IDirect3DTexture8* m_groupBarTexture;
+	IDirect3DSurface8* m_groupBarSurface;
+	XrSwapchain m_groupBarSwapchain;
+	std::vector<VkImage> m_groupBarImages;
+	Int m_groupBarWidth, m_groupBarHeight;
+	Bool m_groupBarReady;
 
 	UnsignedInt m_framesSubmitted;
 	Bool m_submitFailLogged;

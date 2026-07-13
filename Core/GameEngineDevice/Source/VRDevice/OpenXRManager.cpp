@@ -116,12 +116,19 @@ OpenXRManager::OpenXRManager()
 	, m_uiHeight(0)
 	, m_uiInGame(FALSE)
 	, m_uiReady(FALSE)
+	, m_groupBarTexture(nullptr)
+	, m_groupBarSurface(nullptr)
+	, m_groupBarSwapchain(XR_NULL_HANDLE)
+	, m_groupBarWidth(1024)
+	, m_groupBarHeight(128)
+	, m_groupBarReady(FALSE)
 	, m_actionSet(XR_NULL_HANDLE)
 	, m_aimPoseAction(XR_NULL_HANDLE)
 	, m_triggerAction(XR_NULL_HANDLE)
 	, m_gripAction(XR_NULL_HANDLE)
 	, m_stickAction(XR_NULL_HANDLE)
 	, m_primaryAction(XR_NULL_HANDLE)
+	, m_secondaryAction(XR_NULL_HANDLE)
 	, m_actionsReady(FALSE)
 	, m_framesSubmitted(0)
 	, m_submitFailLogged(FALSE)
@@ -137,6 +144,8 @@ OpenXRManager::OpenXRManager()
 		m_uiPanels[i] = UiPanel();
 		m_uiPanels[i].pose.orientation.w = 1.0f;
 	}
+	m_wristPanelOpen[VR_HAND_LEFT] = FALSE;
+	m_wristPanelOpen[VR_HAND_RIGHT] = FALSE;
 	for (int i = 0; i < MAX_EYES; ++i)
 	{
 		m_swapchains[i] = XR_NULL_HANDLE;
@@ -613,6 +622,7 @@ Bool OpenXRManager::createActions()
 		{ &m_gripAction,    "grip",     "Grip",          XR_ACTION_TYPE_BOOLEAN_INPUT },
 		{ &m_stickAction,   "stick",    "Thumbstick",    XR_ACTION_TYPE_VECTOR2F_INPUT},
 		{ &m_primaryAction, "primary",  "Primary Button",XR_ACTION_TYPE_BOOLEAN_INPUT },
+		{ &m_secondaryAction, "secondary", "Secondary Button", XR_ACTION_TYPE_BOOLEAN_INPUT },
 	};
 
 	for (size_t i = 0; i < sizeof(defs)/sizeof(defs[0]); ++i)
@@ -640,6 +650,7 @@ Bool OpenXRManager::createActions()
 		"/user/hand/left/input/squeeze/value",       "/user/hand/right/input/squeeze/value",
 		"/user/hand/left/input/thumbstick",          "/user/hand/right/input/thumbstick",
 		"/user/hand/left/input/x/click",             "/user/hand/right/input/a/click",
+		"/user/hand/left/input/y/click",             "/user/hand/right/input/b/click",
 	};
 	XrAction bindingActions[] =
 	{
@@ -648,6 +659,7 @@ Bool OpenXRManager::createActions()
 		m_gripAction,    m_gripAction,
 		m_stickAction,   m_stickAction,
 		m_primaryAction, m_primaryAction,
+		m_secondaryAction, m_secondaryAction,
 	};
 
 	std::vector<XrActionSuggestedBinding> bindings;
@@ -744,6 +756,13 @@ void OpenXRManager::syncControllers()
 		XrActionStateBoolean primaryState = {XR_TYPE_ACTION_STATE_BOOLEAN};
 		xrGetActionStateBoolean(m_session, &get, &primaryState);
 		c.primaryButton = primaryState.isActive && primaryState.currentState;
+
+		get.action = m_secondaryAction;
+		XrActionStateBoolean secondaryState = {XR_TYPE_ACTION_STATE_BOOLEAN};
+		xrGetActionStateBoolean(m_session, &get, &secondaryState);
+		const Bool wasSecondary = c.secondaryButton;
+		c.secondaryButton = secondaryState.isActive && secondaryState.currentState;
+		c.secondaryPressed = c.secondaryButton && !wasSecondary;
 
 		get.action = m_stickAction;
 		XrActionStateVector2f stickState = {XR_TYPE_ACTION_STATE_VECTOR2F};
@@ -1071,6 +1090,146 @@ Bool OpenXRManager::createUiSwapchain()
 }
 
 //-------------------------------------------------------------------------------------------------
+/** The control-group bar: a render target the engine draws ten numbered slots into. It hangs
+	* under the wrist panel, giving squads a home without a keyboard. */
+//-------------------------------------------------------------------------------------------------
+Bool OpenXRManager::createGroupBar()
+{
+	if (m_d3d8Device == nullptr)
+		return FALSE;
+
+	if (FAILED(m_d3d8Device->CreateTexture(m_groupBarWidth, m_groupBarHeight, 1,
+		D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &m_groupBarTexture)))
+	{
+		DEBUG_LOG(("OpenXR: groupbar: CreateTexture failed"));
+		return FALSE;
+	}
+	if (FAILED(m_groupBarTexture->GetSurfaceLevel(0, &m_groupBarSurface)))
+		return FALSE;
+
+	XrSwapchainCreateInfo swci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+	swci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+	swci.format = VK_FORMAT_B8G8R8A8_SRGB;
+	swci.sampleCount = 1;
+	swci.width = m_groupBarWidth;
+	swci.height = m_groupBarHeight;
+	swci.faceCount = 1;
+	swci.arraySize = 1;
+	swci.mipCount = 1;
+	if (XR_FAILED(xrCreateSwapchain(m_session, &swci, &m_groupBarSwapchain)))
+	{
+		DEBUG_LOG(("OpenXR: groupbar: xrCreateSwapchain failed"));
+		m_groupBarSwapchain = XR_NULL_HANDLE;
+		return FALSE;
+	}
+
+	uint32_t imageCount = 0;
+	xrEnumerateSwapchainImages(m_groupBarSwapchain, 0, &imageCount, nullptr);
+	std::vector<XrSwapchainImageVulkanKHR> images(imageCount);
+	for (uint32_t i = 0; i < imageCount; ++i)
+	{
+		images[i] = XrSwapchainImageVulkanKHR{};
+		images[i].type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR;
+	}
+	if (XR_FAILED(xrEnumerateSwapchainImages(m_groupBarSwapchain, imageCount, &imageCount,
+		(XrSwapchainImageBaseHeader*)images.data())))
+		return FALSE;
+
+	m_groupBarImages.clear();
+	for (uint32_t i = 0; i < imageCount; ++i)
+		m_groupBarImages.push_back(images[i].image);
+
+	m_groupBarReady = TRUE;
+	DEBUG_LOG(("OpenXR: groupbar: %dx%d ready", m_groupBarWidth, m_groupBarHeight));
+	return TRUE;
+}
+
+Bool OpenXRManager::copyGroupBar(UnsignedInt imageIndex)
+{
+	if (!m_groupBarReady)
+		return FALSE;
+
+	VkImageLayout srcLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	VkImage src = getVulkanImage(m_groupBarTexture, &srcLayout);
+	if (src == VK_NULL_HANDLE)
+		return FALSE;
+
+	VkImage dst = m_groupBarImages[imageIndex];
+
+	VkImageSubresourceRange range = {};
+	range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	range.levelCount = 1;
+	range.layerCount = 1;
+
+	VkImageMemoryBarrier pre[2] = {};
+	pre[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	pre[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	pre[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	pre[0].oldLayout = srcLayout;
+	pre[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	pre[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	pre[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	pre[0].image = src;
+	pre[0].subresourceRange = range;
+
+	pre[1] = pre[0];
+	pre[1].srcAccessMask = 0;
+	pre[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	pre[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	pre[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	pre[1].image = dst;
+
+	g_vk.cmdPipelineBarrier(m_vkCommandBuffer,
+		VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		0, 0, nullptr, 0, nullptr, 2, pre);
+
+	VkImageCopy copy = {};
+	copy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	copy.srcSubresource.layerCount = 1;
+	copy.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	copy.dstSubresource.layerCount = 1;
+	copy.extent.width = (uint32_t)m_groupBarWidth;
+	copy.extent.height = (uint32_t)m_groupBarHeight;
+	copy.extent.depth = 1;
+
+	g_vk.cmdCopyImage(m_vkCommandBuffer,
+		src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		1, &copy);
+
+	VkImageMemoryBarrier post[2] = {};
+	post[0] = pre[0];
+	post[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	post[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	post[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	post[0].newLayout = srcLayout;
+
+	post[1] = pre[1];
+	post[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	post[1].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+	post[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	post[1].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+	g_vk.cmdPipelineBarrier(m_vkCommandBuffer,
+		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+		0, 0, nullptr, 0, nullptr, 2, post);
+
+	return TRUE;
+}
+
+//-------------------------------------------------------------------------------------------------
+void OpenXRManager::toggleWristPanel(Int hand)
+{
+	if (hand >= 0 && hand < VR_HAND_COUNT)
+	{
+		m_wristPanelOpen[hand] = !m_wristPanelOpen[hand];
+		DEBUG_LOG(("OpenXR: ui: %s panel %s",
+			hand == VR_HAND_LEFT ? "left" : "right",
+			m_wristPanelOpen[hand] ? "opened" : "closed"));
+	}
+}
+
+//-------------------------------------------------------------------------------------------------
 void OpenXRManager::layoutUiPanels()
 {
 	for (Int i = 0; i < UI_PANEL_COUNT; ++i)
@@ -1099,61 +1258,81 @@ void OpenXRManager::layoutUiPanels()
 		return;
 	}
 
-	// In a battle: pull the two things you constantly need out of the HUD and hang them off the
-	// wrists, so the battlefield itself stays unobstructed. These crops are fractions of the
-	// game's own layout - the minimap sits bottom-left, the command bar bottom-right.
-	struct WristSpec { Int hand; Real cx0, cy0, cx1, cy1; Real widthMeters; };
-	const WristSpec specs[] =
-	{
-		{ VR_HAND_LEFT,  0.00f, 0.70f, 0.26f, 1.00f, 0.26f },	// minimap
-		{ VR_HAND_RIGHT, 0.62f, 0.66f, 1.00f, 1.00f, 0.30f },	// command bar
-	};
-	const Int panelIds[] = { UI_PANEL_LEFT_WRIST, UI_PANEL_RIGHT_WRIST };
+	// In a battle the panels stay OUT OF THE WAY until summoned: a panel floating permanently
+	// over your hand is in the way exactly when you are moving units. Each hand's secondary
+	// button (B / Y) calls up that hand's panel, which carries the game's whole bottom HUD -
+	// minimap, command bar, everything - big enough to actually read and click.
+	const Int wristPanelIds[VR_HAND_COUNT] = { UI_PANEL_LEFT_WRIST, UI_PANEL_RIGHT_WRIST };
+	const Int groupPanelIds[VR_HAND_COUNT] = { UI_PANEL_LEFT_GROUPS, UI_PANEL_RIGHT_GROUPS };
 
-	for (Int i = 0; i < 2; ++i)
+	for (Int hand = 0; hand < VR_HAND_COUNT; ++hand)
 	{
-		const VRControllerState& c = m_controllers[specs[i].hand];
+		if (!m_wristPanelOpen[hand])
+			continue;
+
+		const VRControllerState& c = m_controllers[hand];
 		if (!c.poseValid)
 			continue;
 
-		UiPanel& p = m_uiPanels[panelIds[i]];
-		p.cropX = (Int)(specs[i].cx0 * m_uiWidth);
-		p.cropY = (Int)(specs[i].cy0 * m_uiHeight);
-		p.cropW = (Int)((specs[i].cx1 - specs[i].cx0) * m_uiWidth);
-		p.cropH = (Int)((specs[i].cy1 - specs[i].cy0) * m_uiHeight);
-		if (p.cropW <= 0 || p.cropH <= 0)
-			continue;
-
-		p.widthMeters = specs[i].widthMeters;
-		p.heightMeters = p.widthMeters * (Real)p.cropH / (Real)p.cropW;
-
-		// Sit the panel just above the controller and tilt it back towards the player, the way
-		// you would tip a wristwatch to read it. The quad faces along its own +Z, and the aim
-		// pose's +Z already points back at the player, so a pitch-up is all it needs.
-		const XrQuaternionf tilt = quatFromAxisAngle(1.0f, 0.0f, 0.0f, -0.9f);	// ~50 degrees
-		p.pose.orientation = multiply(c.quatW == 0.0f && c.quatX == 0.0f ? XrQuaternionf{0,0,0,1}
-			: XrQuaternionf{c.quatX, c.quatY, c.quatZ, c.quatW}, tilt);
-
-		const XrVector3f offsetLocal = { 0.0f, 0.06f, -0.04f };	// up a little, just ahead of the hand
 		const XrQuaternionf handQuat = { c.quatX, c.quatY, c.quatZ, c.quatW };
+
+		// Tip the panel back toward the player, the way you tilt a wristwatch to read it.
+		const XrQuaternionf tilt = quatFromAxisAngle(1.0f, 0.0f, 0.0f, -0.9f);	// ~50 degrees
+		const XrQuaternionf panelQuat = multiply(handQuat, tilt);
+
+		// The whole bottom strip of the game's own HUD, full width - not a narrow slice of it.
+		UiPanel& p = m_uiPanels[wristPanelIds[hand]];
+		p.isGroupBar = FALSE;
+		p.cropX = 0;
+		p.cropY = (Int)(0.70f * m_uiHeight);
+		p.cropW = m_uiWidth;
+		p.cropH = m_uiHeight - p.cropY;
+		p.widthMeters = 0.75f;	// big enough to read and to hit with a ray
+		p.heightMeters = p.widthMeters * (Real)p.cropH / (Real)p.cropW;
+		p.pose.orientation = panelQuat;
+
+		const XrVector3f offsetLocal = { 0.0f, 0.10f, -0.06f };	// above and just ahead of the hand
 		const XrVector3f offsetWorld = rotate(handQuat, offsetLocal);
 		p.pose.position.x = c.posX + offsetWorld.x;
 		p.pose.position.y = c.posY + offsetWorld.y;
 		p.pose.position.z = c.posZ + offsetWorld.z;
-
 		p.active = TRUE;
+
+		// The control-group bar sits directly under it.
+		if (m_groupBarReady)
+		{
+			UiPanel& g = m_uiPanels[groupPanelIds[hand]];
+			g.isGroupBar = TRUE;
+			g.cropX = 0;
+			g.cropY = 0;
+			g.cropW = m_groupBarWidth;
+			g.cropH = m_groupBarHeight;
+			g.widthMeters = p.widthMeters;
+			g.heightMeters = g.widthMeters * (Real)m_groupBarHeight / (Real)m_groupBarWidth;
+			g.pose.orientation = panelQuat;
+
+			// Just below the HUD panel, in the panel's own frame (its -Y is "down").
+			const XrVector3f belowLocal = { 0.0f,
+				-(p.heightMeters * 0.5f + g.heightMeters * 0.5f + 0.01f), 0.0f };
+			const XrVector3f belowWorld = rotate(panelQuat, belowLocal);
+			g.pose.position.x = p.pose.position.x + belowWorld.x;
+			g.pose.position.y = p.pose.position.y + belowWorld.y;
+			g.pose.position.z = p.pose.position.z + belowWorld.z;
+			g.active = TRUE;
+		}
 	}
 }
 
 //-------------------------------------------------------------------------------------------------
-Bool OpenXRManager::pickUiPanel(Int hand, Int &outScreenX, Int &outScreenY) const
+OpenXRManager::VRPickKind OpenXRManager::pickUiPanel(Int hand, Int &outX, Int &outY,
+	Real *outDistanceMeters) const
 {
 	if (!m_uiReady || hand < 0 || hand >= VR_HAND_COUNT)
-		return FALSE;
+		return VR_PICK_NONE;
 
 	const VRControllerState& c = m_controllers[hand];
 	if (!c.poseValid)
-		return FALSE;
+		return VR_PICK_NONE;
 
 	const XrQuaternionf handQuat = { c.quatX, c.quatY, c.quatZ, c.quatW };
 	const XrVector3f origin = { c.posX, c.posY, c.posZ };
@@ -1161,7 +1340,7 @@ Bool OpenXRManager::pickUiPanel(Int hand, Int &outScreenX, Int &outScreenY) cons
 	const XrVector3f dir = rotate(handQuat, forwardLocal);
 
 	Real bestDistance = 1.0e9f;
-	Bool hit = FALSE;
+	VRPickKind hit = VR_PICK_NONE;
 
 	for (Int i = 0; i < UI_PANEL_COUNT; ++i)
 	{
@@ -1195,10 +1374,26 @@ Bool OpenXRManager::pickUiPanel(Int hand, Int &outScreenX, Int &outScreenY) cons
 		const Real u = (hx + halfW) / p.widthMeters;
 		const Real v = 1.0f - (hy + halfH) / p.heightMeters;
 
-		outScreenX = p.cropX + (Int)(u * p.cropW);
-		outScreenY = p.cropY + (Int)(v * p.cropH);
+		if (p.isGroupBar)
+		{
+			// Ten slots side by side: which one is under the ray?
+			Int slot = (Int)(u * VR_GROUP_COUNT);
+			if (slot < 0) slot = 0;
+			if (slot >= VR_GROUP_COUNT) slot = VR_GROUP_COUNT - 1;
+			outX = slot;
+			outY = 0;
+			hit = VR_PICK_GROUP_SLOT;
+		}
+		else
+		{
+			outX = p.cropX + (Int)(u * p.cropW);
+			outY = p.cropY + (Int)(v * p.cropH);
+			hit = VR_PICK_SCREEN;
+		}
+
 		bestDistance = t;
-		hit = TRUE;
+		if (outDistanceMeters != nullptr)
+			*outDistanceMeters = t;
 	}
 
 	return hit;
@@ -1316,7 +1511,8 @@ void OpenXRManager::initGraphics(IDirect3DDevice8* d3d8Device)
 
 	// The UI panels are a bonus on top of stereo; failing to set them up must not cost us the
 	// battlefield, so this is deliberately not fatal.
-	createUiSwapchain();
+	if (createUiSwapchain())
+		createGroupBar();
 
 	m_stereoReady = TRUE;
 	DEBUG_LOG(("OpenXR: graphics ready - stereo path armed"));
@@ -1434,7 +1630,7 @@ void OpenXRManager::beginFrame()
 
 //-------------------------------------------------------------------------------------------------
 Bool OpenXRManager::recordAndSubmitCopies(const UnsignedInt* imageIndices, Bool captureUi,
-	UnsignedInt uiImageIndex)
+	UnsignedInt uiImageIndex, Bool captureGroupBar, UnsignedInt groupBarImageIndex)
 {
 	// Wait for OUR PREVIOUS copy to finish before touching the command buffer again. This has
 	// to happen here, not after submitting: resetting or re-recording a command buffer that the
@@ -1540,9 +1736,12 @@ Bool OpenXRManager::recordAndSubmitCopies(const UnsignedInt* imageIndices, Bool 
 			0, 0, nullptr, 0, nullptr, 2, post);
 	}
 
-	// The game's finished 2D frame rides along in the same command buffer.
+	// The game's finished 2D frame - and our own control-group bar - ride along in the same
+	// command buffer.
 	if (captureUi)
 		captureUiFrame(uiImageIndex);
+	if (captureGroupBar)
+		copyGroupBar(groupBarImageIndex);
 
 	if (g_vk.endCommandBuffer(m_vkCommandBuffer) != VK_SUCCESS)
 		return FALSE;
@@ -1614,11 +1813,19 @@ void OpenXRManager::submitFrame(Bool worldRendered)
 		}
 	}
 
-	Bool anyPanel = FALSE;
+	Bool anyFramePanel = FALSE;
+	Bool anyGroupPanel = FALSE;
 	for (Int i = 0; i < UI_PANEL_COUNT; ++i)
-		anyPanel = anyPanel || m_uiPanels[i].active;
+	{
+		if (!m_uiPanels[i].active)
+			continue;
+		if (m_uiPanels[i].isGroupBar)
+			anyGroupPanel = TRUE;
+		else
+			anyFramePanel = TRUE;
+	}
 
-	if (m_uiReady && anyPanel)
+	if (m_uiReady && anyFramePanel)
 	{
 		XrSwapchainImageAcquireInfo acquireInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
 		uint32_t index = 0;
@@ -1632,8 +1839,28 @@ void OpenXRManager::submitFrame(Bool worldRendered)
 		}
 	}
 
-	const Bool recorded = (haveEyes || haveUi)
-		&& recordAndSubmitCopies(haveEyes ? eyeIndices : nullptr, haveUi, uiIndex);
+	Bool haveGroupBar = FALSE;
+	UnsignedInt groupIndex = 0;
+	if (m_groupBarReady && anyGroupPanel)
+	{
+		XrSwapchainImageAcquireInfo acquireInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+		uint32_t index = 0;
+		XrSwapchainImageWaitInfo waitInfo = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+		waitInfo.timeout = XR_INFINITE_DURATION;
+		if (XR_SUCCEEDED(xrAcquireSwapchainImage(m_groupBarSwapchain, &acquireInfo, &index))
+			&& XR_SUCCEEDED(xrWaitSwapchainImage(m_groupBarSwapchain, &waitInfo)))
+		{
+			haveGroupBar = TRUE;
+			groupIndex = index;
+		}
+	}
+
+	Bool recorded = FALSE;
+	if (haveEyes || haveUi || haveGroupBar)
+	{
+		recorded = recordAndSubmitCopies(haveEyes ? eyeIndices : nullptr, haveUi, uiIndex,
+			haveGroupBar, groupIndex);
+	}
 
 	if (haveEyes)
 	{
@@ -1647,6 +1874,11 @@ void OpenXRManager::submitFrame(Bool worldRendered)
 	{
 		XrSwapchainImageReleaseInfo releaseInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
 		xrReleaseSwapchainImage(m_uiSwapchain, &releaseInfo);
+	}
+	if (haveGroupBar)
+	{
+		XrSwapchainImageReleaseInfo releaseInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+		xrReleaseSwapchainImage(m_groupBarSwapchain, &releaseInfo);
 	}
 
 	if (recorded && haveEyes)
@@ -1668,7 +1900,7 @@ void OpenXRManager::submitFrame(Bool worldRendered)
 		layers[layerCount++] = (const XrCompositionLayerBaseHeader*)&worldLayer;
 	}
 
-	if (recorded && haveUi)
+	if (recorded)
 	{
 		// Panels go on top of the world, in the order they were laid out.
 		for (Int i = 0; i < UI_PANEL_COUNT; ++i)
@@ -1676,13 +1908,17 @@ void OpenXRManager::submitFrame(Bool worldRendered)
 			const UiPanel& p = m_uiPanels[i];
 			if (!p.active)
 				continue;
+			if (p.isGroupBar && !haveGroupBar)
+				continue;
+			if (!p.isGroupBar && !haveUi)
+				continue;
 
 			XrCompositionLayerQuad& q = quadLayers[i];
 			q = XrCompositionLayerQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
 			q.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
 			q.space = m_appSpace;
 			q.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-			q.subImage.swapchain = m_uiSwapchain;
+			q.subImage.swapchain = p.isGroupBar ? m_groupBarSwapchain : m_uiSwapchain;
 			q.subImage.imageArrayIndex = 0;
 			q.subImage.imageRect.offset = {p.cropX, p.cropY};
 			q.subImage.imageRect.extent = {p.cropW, p.cropH};
@@ -1743,6 +1979,17 @@ void OpenXRManager::shutdown()
 	}
 	m_uiImages.clear();
 	m_uiReady = FALSE;
+
+	if (m_groupBarSwapchain != XR_NULL_HANDLE)
+	{
+		xrDestroySwapchain(m_groupBarSwapchain);
+		m_groupBarSwapchain = XR_NULL_HANDLE;
+	}
+	m_groupBarImages.clear();
+	if (m_groupBarSurface != nullptr) { m_groupBarSurface->Release(); m_groupBarSurface = nullptr; }
+	if (m_groupBarTexture != nullptr) { m_groupBarTexture->Release(); m_groupBarTexture = nullptr; }
+	m_groupBarReady = FALSE;
+
 	m_d3d8Device = nullptr;
 
 	for (Int eye = 0; eye < MAX_EYES; ++eye)

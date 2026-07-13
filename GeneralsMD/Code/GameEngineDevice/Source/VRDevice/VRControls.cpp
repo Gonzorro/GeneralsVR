@@ -29,12 +29,18 @@
 #include "Common/Debug.h"
 #include "Common/FramePacer.h"
 #include "Common/GlobalData.h"
+#include "Common/MessageStream.h"
+#include "GameClient/Display.h"
 #include "GameClient/View.h"
 #include "GameClient/Mouse.h"
 #include "GameLogic/GameLogic.h"
 #include "GameLogic/TerrainLogic.h"
 #include "W3DDevice/GameClient/W3DView.h"
 #include "Win32Device/GameClient/Win32Mouse.h"
+#include "WW3D2/dx8wrapper.h"
+#include "WW3D2/line3d.h"
+#include "WW3D2/scene.h"
+#include "WW3D2/ww3d.h"
 #include "WWMath/quat.h"
 
 VRControls *TheVRControls = nullptr;
@@ -57,6 +63,15 @@ namespace
 	const Real MIN_SCALE           = 80.0f;
 	const Real MAX_SCALE           = 4000.0f;
 
+	// Dragging the world. A 1:1 drag makes crossing a big map a chore, so a flick throws the
+	// map and it coasts: the harder you flick, the further it slides.
+	const Real GRAB_GAIN           = 2.2f;   ///< world moves this much further than the hand
+	const Real SLIDE_FRICTION      = 3.2f;   ///< per second; how quickly a throw dies away
+	const Real SLIDE_MIN_SPEED     = 15.0f;  ///< world units per second below which we stop
+
+	const Real RAY_WIDTH_METERS    = 0.004f;
+	const Real RAY_MAX_METERS      = 6.0f;   ///< how far a laser reaches when it hits nothing
+
 	Real applyDeadzone(Real v)
 	{
 		if (v > STICK_DEADZONE)  return (v - STICK_DEADZONE) / (1.0f - STICK_DEADZONE);
@@ -74,11 +89,49 @@ VRControls::VRControls()
 	, m_hasAimPoint(FALSE)
 	, m_leftDown(FALSE)
 	, m_rightDown(FALSE)
+	, m_rayScene(nullptr)
 {
 	m_grabbing[0] = m_grabbing[1] = FALSE;
 	m_grabHandWorld[0] = m_grabHandWorld[1] = Vector3(0.0f, 0.0f, 0.0f);
 	m_grabCameraPos.zero();
+	m_lastCameraPos.zero();
 	m_aimPoint.zero();
+	m_slideVelocity.x = m_slideVelocity.y = 0.0f;
+
+	// The laser pointers live in their own scene so the stereo renderer can draw them over the
+	// battlefield - and, in the menus, on their own with nothing else in the world.
+	m_rayScene = NEW_REF(SimpleSceneClass, ());
+	for (Int hand = 0; hand < 2; ++hand)
+	{
+		// Cyan for the pointing hand, amber for the other, so they are told apart at a glance.
+		const Real r = (hand == VR_HAND_RIGHT) ? 0.35f : 1.0f;
+		const Real g = (hand == VR_HAND_RIGHT) ? 0.85f : 0.72f;
+		const Real b = (hand == VR_HAND_RIGHT) ? 1.00f : 0.25f;
+		m_rayLines[hand] = NEW_REF(Line3DClass, (Vector3(0.0f, 0.0f, 0.0f), Vector3(0.0f, 0.0f, 1.0f),
+			1.0f, r, g, b, 0.85f));
+		m_rayScene->Add_Render_Object(m_rayLines[hand]);
+		m_rayLines[hand]->Set_Hidden(true);
+		m_rayVisible[hand] = FALSE;
+	}
+}
+
+VRControls::~VRControls()
+{
+	for (Int hand = 0; hand < 2; ++hand)
+	{
+		if (m_rayLines[hand] != nullptr)
+		{
+			if (m_rayScene != nullptr)
+				m_rayScene->Remove_Render_Object(m_rayLines[hand]);
+			m_rayLines[hand]->Release_Ref();
+			m_rayLines[hand] = nullptr;
+		}
+	}
+	if (m_rayScene != nullptr)
+	{
+		m_rayScene->Release_Ref();
+		m_rayScene = nullptr;
+	}
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -287,16 +340,48 @@ void VRControls::updateLocomotion(W3DView *view)
 			dragStart /= (Real)dragCount;
 
 			Coord3D pos;
-			pos.x = m_grabCameraPos.x - (dragNow.X - dragStart.X);
-			pos.y = m_grabCameraPos.y - (dragNow.Y - dragStart.Y);
+			pos.x = m_grabCameraPos.x - (dragNow.X - dragStart.X) * GRAB_GAIN;
+			pos.y = m_grabCameraPos.y - (dragNow.Y - dragStart.Y) * GRAB_GAIN;
 			pos.z = m_grabCameraPos.z;
 			view->lookAt(&pos);
+		}
+
+		// While gripping, remember how fast the map is actually travelling, so that letting go
+		// mid-sweep throws it rather than stopping it dead.
+		const Coord3D nowPos = view->getPosition();
+		const Real dtVel = TheFramePacer != nullptr ? TheFramePacer->getUpdateTime() : (1.0f / 90.0f);
+		if (dtVel > 0.0001f)
+		{
+			m_slideVelocity.x = (nowPos.x - m_lastCameraPos.x) / dtVel;
+			m_slideVelocity.y = (nowPos.y - m_lastCameraPos.y) / dtVel;
 		}
 	}
 	else
 	{
 		m_twoHandGrab = FALSE;
+
+		// Let go and the map keeps going, coasting to a stop - a flick can cross the battlefield.
+		const Real dtSlide = TheFramePacer != nullptr ? TheFramePacer->getUpdateTime() : (1.0f / 90.0f);
+		const Real speed = sqrtf(m_slideVelocity.x * m_slideVelocity.x
+			+ m_slideVelocity.y * m_slideVelocity.y);
+		if (speed > SLIDE_MIN_SPEED)
+		{
+			Coord3D pos = view->getPosition();
+			pos.x += m_slideVelocity.x * dtSlide;
+			pos.y += m_slideVelocity.y * dtSlide;
+			view->lookAt(&pos);
+
+			const Real decay = 1.0f - SLIDE_FRICTION * dtSlide;
+			m_slideVelocity.x *= (decay > 0.0f) ? decay : 0.0f;
+			m_slideVelocity.y *= (decay > 0.0f) ? decay : 0.0f;
+		}
+		else
+		{
+			m_slideVelocity.x = m_slideVelocity.y = 0.0f;
+		}
 	}
+
+	m_lastCameraPos = view->getPosition();
 
 	// Thumbsticks: the same verbs without the arm movement. Left pans, right turns and zooms.
 	const Real dt = TheFramePacer != nullptr ? TheFramePacer->getUpdateTime() : (1.0f / 90.0f);
@@ -348,11 +433,31 @@ void VRControls::updatePointer(W3DView *view)
 	ICoord2D screen;
 	Bool haveTarget = FALSE;
 
+	const VRControllerState &rightState = TheOpenXR->getController(VR_HAND_RIGHT);
+
 	// A UI panel always wins over the world behind it: if the ray lands on the menu screen or on
 	// a wrist panel, the cursor goes there. The panel already knows which pixel of the game's own
 	// frame the ray hit, so the engine's GUI sees an ordinary cursor over an ordinary button.
 	Int panelX = 0, panelY = 0;
-	if (TheOpenXR->pickUiPanel(VR_HAND_RIGHT, panelX, panelY))
+	const OpenXRManager::VRPickKind pick = TheOpenXR->pickUiPanel(VR_HAND_RIGHT, panelX, panelY);
+
+	if (pick == OpenXRManager::VR_PICK_GROUP_SLOT)
+	{
+		// The control-group bar is ours, not the game's: a trigger pull recalls that squad, and
+		// holding the primary button while pulling saves the current selection into it instead.
+		if (rightState.triggerPressed)
+			applyControlGroup(panelX, rightState.primaryButton);
+
+		// Do not let the click fall through to the battlefield underneath.
+		if (m_leftDown)
+		{
+			m_leftDown = FALSE;
+			mouse->addWin32Event(WM_LBUTTONUP, 0, MAKELPARAM(0, 0), GetTickCount());
+		}
+		return;
+	}
+
+	if (pick == OpenXRManager::VR_PICK_SCREEN)
 	{
 		screen.x = panelX;
 		screen.y = panelY;
@@ -410,6 +515,176 @@ void VRControls::updatePointer(W3DView *view)
 }
 
 //-------------------------------------------------------------------------------------------------
+/** Each hand's secondary button (B / Y) summons that hand's panel and dismisses it again, so
+	* the HUD is there when you want it and gone when you are commanding units. */
+void VRControls::updatePanelToggles()
+{
+	for (Int hand = 0; hand < 2; ++hand)
+	{
+		if (TheOpenXR->getController(hand).secondaryPressed)
+			TheOpenXR->toggleWristPanel(hand);
+	}
+}
+
+//-------------------------------------------------------------------------------------------------
+/** Control groups, the RTS player's muscle memory, without a keyboard. Pointing at a slot and
+	* pulling the trigger recalls that squad; holding the primary button (A / X) while doing it
+	* saves the current selection there instead. These go through the same meta-messages the
+	* keyboard hotkeys produce, so the engine cannot tell the difference. */
+void VRControls::applyControlGroup(Int slot, Bool assign)
+{
+	if (TheMessageStream == nullptr || slot < 0 || slot > 9)
+		return;
+
+	const GameMessage::Type type = assign
+		? (GameMessage::Type)(GameMessage::MSG_META_CREATE_TEAM0 + slot)
+		: (GameMessage::Type)(GameMessage::MSG_META_SELECT_TEAM0 + slot);
+
+	TheMessageStream->appendMessage(type);
+	DEBUG_LOG(("OpenXR: control group %d %s", slot, assign ? "SAVED" : "recalled"));
+}
+
+//-------------------------------------------------------------------------------------------------
+/** The visible laser. A pointer you cannot see is a pointer you cannot aim, so each hand casts a
+	* beam that stops exactly where it lands - on a panel, or on the ground. */
+void VRControls::updateRays(W3DView *view)
+{
+	const Real scale = TheOpenXR->getWorldUnitsPerMeter();
+	const Bool inGame = (TheGameLogic != nullptr && TheGameLogic->isInGame());
+
+	for (Int hand = 0; hand < 2; ++hand)
+	{
+		Line3DClass *line = m_rayLines[hand];
+		if (line == nullptr)
+			continue;
+
+		const VRControllerState &c = TheOpenXR->getController(hand);
+		if (!c.poseValid || !inGame)
+		{
+			// Outside a battle the world is not rendered, so there is nothing to draw the beam
+			// into; the menu screen shows the game's own cursor instead.
+			line->Set_Hidden(true);
+			m_rayVisible[hand] = FALSE;
+			continue;
+		}
+
+		Vector3 origin, dir;
+		if (!computeHandRay(hand, origin, dir))
+		{
+			line->Set_Hidden(true);
+			m_rayVisible[hand] = FALSE;
+			continue;
+		}
+
+		// Stop the beam where it actually lands: on a panel if one is in the way, otherwise on
+		// the ground, otherwise just fade out at arm's reach.
+		Real length = RAY_MAX_METERS * scale;
+
+		Int px = 0, py = 0;
+		Real panelDistance = 0.0f;
+		if (TheOpenXR->pickUiPanel(hand, px, py, &panelDistance) != OpenXRManager::VR_PICK_NONE)
+		{
+			length = panelDistance * scale;
+		}
+		else
+		{
+			Coord3D hit;
+			if (traceTerrain(origin, dir, hit))
+			{
+				const Vector3 hitVec(hit.x, hit.y, hit.z);
+				length = (hitVec - origin).Length();
+			}
+		}
+
+		const Vector3 end = origin + dir * length;
+		line->Reset(origin, end, RAY_WIDTH_METERS * scale);
+		line->Set_Hidden(false);
+		m_rayVisible[hand] = TRUE;
+	}
+}
+
+//-------------------------------------------------------------------------------------------------
+/** Draw the ten control-group slots. Deliberately plain: numbered plates, lit up where the ray
+	* is resting, so the player can see which squad they are about to recall. */
+//-------------------------------------------------------------------------------------------------
+void VRControls::drawGroupBar()
+{
+	if (TheOpenXR == nullptr || !TheOpenXR->hasGroupBar() || TheDisplay == nullptr)
+		return;
+
+	IDirect3DSurface8 *surface = TheOpenXR->getGroupBarSurface();
+	if (surface == nullptr)
+		return;
+
+	const Int barW = TheOpenXR->getGroupBarWidth();
+	const Int barH = TheOpenXR->getGroupBarHeight();
+
+	// Which slot is the ray resting on? That one gets highlighted.
+	Int hoverSlot = -1;
+	for (Int hand = 0; hand < 2 && hoverSlot < 0; ++hand)
+	{
+		Int slot = 0, unusedY = 0;
+		if (TheOpenXR->pickUiPanel(hand, slot, unusedY) == OpenXRManager::VR_PICK_GROUP_SLOT)
+			hoverSlot = slot;
+	}
+	const Bool assigning = TheOpenXR->getController(VR_HAND_RIGHT).primaryButton;
+
+	DX8Wrapper::Set_Render_Target(surface, TheOpenXR->getDepthSurface());
+
+	if (WW3D::Begin_Render(true, false, Vector3(0.0f, 0.0f, 0.0f)) == WW3D_ERROR_OK)
+	{
+		const Int slotW = barW / 10;
+		const Int pad = 6;
+
+		for (Int slot = 0; slot < 10; ++slot)
+		{
+			const Int x0 = slot * slotW + pad;
+			const Int y0 = pad;
+			const Int w = slotW - pad * 2;
+			const Int h = barH - pad * 2;
+
+			// Amber while the primary button is held (you are about to SAVE into this slot),
+			// otherwise a cool highlight for the slot under the ray.
+			UnsignedInt fill;
+			if (slot == hoverSlot)
+				fill = assigning ? GameMakeColor(230, 150, 40, 235) : GameMakeColor(60, 150, 210, 225);
+			else
+				fill = GameMakeColor(20, 28, 38, 190);
+
+			TheDisplay->drawFillRect(x0, y0, w, h, fill);
+			TheDisplay->drawOpenRect(x0, y0, w, h, 2.0f, GameMakeColor(200, 220, 240, 220));
+
+			// The slot's number, drawn as a bar of pips: the font system is not available on an
+			// arbitrary render target, but a count is unmistakable at a glance.
+			const Int label = (slot + 1) % 10;	// 1..9 then 0
+			const Int pipW = 6;
+			const Int pipH = 6;
+			const Int pips = (label == 0) ? 10 : label;
+			const Int pipsPerRow = 5;
+			const Int rows = (pips + pipsPerRow - 1) / pipsPerRow;
+			const Int blockH = rows * (pipH + 3);
+			const Int startY = y0 + (h - blockH) / 2;
+
+			for (Int p = 0; p < pips; ++p)
+			{
+				const Int row = p / pipsPerRow;
+				const Int col = p % pipsPerRow;
+				const Int inRow = (row == rows - 1) ? (pips - row * pipsPerRow)
+					: pipsPerRow;
+				const Int rowW = inRow * (pipW + 3) - 3;
+				const Int px = x0 + (w - rowW) / 2 + col * (pipW + 3);
+				const Int py = startY + row * (pipH + 3);
+				TheDisplay->drawFillRect(px, py, pipW, pipH, GameMakeColor(255, 255, 255, 240));
+			}
+		}
+
+		WW3D::End_Render(false);
+	}
+
+	DX8Wrapper::Set_Render_Target((IDirect3DSurface8 *)nullptr);
+}
+
+//-------------------------------------------------------------------------------------------------
 void VRControls::update()
 {
 	if (TheOpenXR == nullptr || !TheOpenXR->isFrameActive())
@@ -417,6 +692,8 @@ void VRControls::update()
 
 	W3DView *view = (W3DView *)TheTacticalView;
 	const Bool inGame = (TheGameLogic != nullptr && TheGameLogic->isInGame());
+
+	updatePanelToggles();
 
 	// Locomotion only means something when there is a battlefield to move over. In the menus the
 	// controllers must not fling the tactical camera around behind the player's back.
@@ -426,4 +703,7 @@ void VRControls::update()
 	// Pointing works everywhere: at the menu screen floating in front of the player, at the
 	// wrist panels, and at the battlefield.
 	updatePointer(inGame ? view : nullptr);
+
+	if (view != nullptr)
+		updateRays(view);
 }

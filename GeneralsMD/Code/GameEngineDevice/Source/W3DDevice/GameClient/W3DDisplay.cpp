@@ -1881,11 +1881,22 @@ void W3DDisplay::drawVRScene( W3DView *view )
 		{
 			vrCamera->Apply();
 			WW3D::Render(m_3DScene, vrCamera);
+
+			// The laser pointers go on top of the battlefield, in the same eye pass, so they
+			// land in the headset (and in the monitor mirror) with correct depth.
+			if (TheVRControls != nullptr && TheVRControls->getRayScene() != nullptr)
+				WW3D::Render(TheVRControls->getRayScene(), vrCamera);
+
 			WW3D::End_Render(false);  // no present: the image belongs to the headset
 		}
 
 		DX8Wrapper::Set_Render_Target((IDirect3DSurface8 *)nullptr);
 	}
+
+	// The control-group bar is our own drawing, so it has to be refreshed while we still own the
+	// render targets - before the engine goes back to the monitor frame.
+	if (TheVRControls != nullptr)
+		TheVRControls->drawGroupBar();
 
 	// Once a second, report what the eye pass actually drew, so an empty headset can be told
 	// apart from a broken one without another round trip.
