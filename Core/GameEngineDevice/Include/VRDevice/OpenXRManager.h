@@ -160,6 +160,7 @@ private:
 	VkCommandPool m_vkCommandPool;
 	VkCommandBuffer m_vkCommandBuffer;
 	VkFence m_vkFence;
+	Bool m_copyInFlight; ///< our copy command buffer is still executing; must not be re-recorded
 
 	// Eye render targets (D3D8 side) and their Vulkan images
 	IDirect3DTexture8* m_eyeTextures[MAX_EYES];

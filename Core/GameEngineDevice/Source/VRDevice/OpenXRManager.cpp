@@ -107,6 +107,7 @@ OpenXRManager::OpenXRManager()
 	, m_vkCommandPool(VK_NULL_HANDLE)
 	, m_vkCommandBuffer(VK_NULL_HANDLE)
 	, m_vkFence(VK_NULL_HANDLE)
+	, m_copyInFlight(FALSE)
 	, m_depthSurface(nullptr)
 	, m_eyeImageLayout(VK_IMAGE_LAYOUT_UNDEFINED)
 	, m_framesSubmitted(0)
@@ -717,9 +718,16 @@ VkImage OpenXRManager::getVulkanImage(IUnknown* d3d8Resource, VkImageLayout* out
 		return VK_NULL_HANDLE;
 	}
 
-	DEBUG_LOG(("OpenXR: interop: VkImage 0x%llX (%ux%u, format %d, layout %d)",
-		(unsigned long long)image, info.extent.width, info.extent.height,
-		(int)info.format, (int)layout));
+	// Only log on the first lookup of an image: this runs every frame now.
+	static VkImage lastLogged = VK_NULL_HANDLE;
+	if (image != lastLogged)
+	{
+		lastLogged = image;
+		DEBUG_LOG(("OpenXR: interop: VkImage 0x%llX (%ux%u, format %d, layout %d, usage 0x%X, transferSrc=%d)",
+			(unsigned long long)image, info.extent.width, info.extent.height,
+			(int)info.format, (int)layout, (unsigned)info.usage,
+			(info.usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ? 1 : 0));
+	}
 
 	if (outLayout != nullptr)
 		*outLayout = layout;
@@ -863,6 +871,24 @@ void OpenXRManager::beginFrame()
 //-------------------------------------------------------------------------------------------------
 Bool OpenXRManager::copyEyesToSwapchains(const UnsignedInt* imageIndices)
 {
+	// Wait for OUR PREVIOUS copy to finish before touching the command buffer again. This has
+	// to happen here, not after submitting: resetting or re-recording a command buffer that the
+	// GPU is still executing corrupts it and takes the whole device down. The wait is unbounded
+	// on purpose - a frame can legitimately take seconds while the game streams in a map or
+	// plays a video, and a timeout here would put us right back into reusing a live buffer.
+	if (m_copyInFlight)
+	{
+		VkResult waitResult = g_vk.waitForFences(m_vkDevice, 1, &m_vkFence, VK_TRUE, UINT64_MAX);
+		if (waitResult != VK_SUCCESS)
+		{
+			DEBUG_LOG(("OpenXR: eye copy: fence wait failed (%d) - disabling stereo", (int)waitResult));
+			m_stereoReady = FALSE;
+			return FALSE;
+		}
+		m_copyInFlight = FALSE;
+	}
+	g_vk.resetFences(m_vkDevice, 1, &m_vkFence);
+
 	VkCommandBufferBeginInfo cbBegin = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
 	cbBegin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
@@ -872,7 +898,18 @@ Bool OpenXRManager::copyEyesToSwapchains(const UnsignedInt* imageIndices)
 
 	for (Int eye = 0; eye < m_eyeCount; ++eye)
 	{
-		VkImage src = m_eyeImages[eye];
+		// Re-query the eye image each frame: DXVK may recreate the backing image (a device
+		// reset, a resource move), which would leave a cached handle dangling.
+		VkImage src = getVulkanImage(m_eyeTextures[eye], &m_eyeImageLayout);
+		if (src == VK_NULL_HANDLE)
+		{
+			DEBUG_LOG(("OpenXR: eye copy: eye %d lost its VkImage - disabling stereo", eye));
+			m_stereoReady = FALSE;
+			g_vk.endCommandBuffer(m_vkCommandBuffer);
+			return FALSE;
+		}
+		m_eyeImages[eye] = src;
+
 		VkImage dst = m_swapchainImages[eye][imageIndices[eye]];
 
 		VkImageSubresourceRange range = {};
@@ -945,21 +982,27 @@ Bool OpenXRManager::copyEyesToSwapchains(const UnsignedInt* imageIndices)
 	submit.commandBufferCount = 1;
 	submit.pCommandBuffers = &m_vkCommandBuffer;
 
-	// DXVK owns the queue: flush its pending work (our source images were just rendered by it),
-	// take the queue, submit, give it back.
+	// DXVK owns the queue: flush its pending work (our source images were just rendered by it,
+	// and FlushRenderingCommands also synchronizes its CS thread, so the eye renders are
+	// guaranteed to be submitted ahead of us), take the queue, submit, give it back.
 	m_dxvkInterop->FlushRenderingCommands();
 	m_dxvkInterop->LockSubmissionQueue();
-	g_vk.resetFences(m_vkDevice, 1, &m_vkFence);
 	VkResult submitResult = g_vk.queueSubmit(m_vkQueue, 1, &submit, m_vkFence);
 	m_dxvkInterop->ReleaseSubmissionQueue();
 
 	if (submitResult != VK_SUCCESS)
 	{
-		DEBUG_LOG(("OpenXR: eye copy: vkQueueSubmit failed (%d)", (int)submitResult));
+		// VK_ERROR_DEVICE_LOST (-4) and friends are terminal for the GPU. Turning stereo off
+		// keeps the game itself alive and playable on the monitor rather than wedging it.
+		DEBUG_LOG(("OpenXR: eye copy: vkQueueSubmit failed (%d) - disabling stereo", (int)submitResult));
+		m_stereoReady = FALSE;
 		return FALSE;
 	}
 
-	g_vk.waitForFences(m_vkDevice, 1, &m_vkFence, VK_TRUE, 1000000000ull);
+	// Deliberately NOT waiting here. The runtime consumes the image on the same queue, so
+	// submission order already guarantees the copy lands before the compositor reads it, and
+	// blocking the render thread on the GPU every frame would cost us the frame budget.
+	m_copyInFlight = TRUE;
 	return TRUE;
 }
 
@@ -1067,8 +1110,11 @@ void OpenXRManager::submitEyes()
 //-------------------------------------------------------------------------------------------------
 void OpenXRManager::shutdown()
 {
+	// Nothing may be destroyed while our copy is still executing on the GPU.
 	if (m_vkDevice != VK_NULL_HANDLE && g_vk.deviceWaitIdle != nullptr)
 		g_vk.deviceWaitIdle(m_vkDevice);
+	m_copyInFlight = FALSE;
+	m_stereoReady = FALSE;
 
 	for (Int eye = 0; eye < MAX_EYES; ++eye)
 	{
