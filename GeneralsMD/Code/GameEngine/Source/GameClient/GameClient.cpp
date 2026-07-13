@@ -787,11 +787,20 @@ void GameClient::step()
 	TheDisplay->step();
 }
 
+GameClient::MovieAbortHook GameClient::s_movieAbortHook = nullptr;
+
 Bool GameClient::isMovieAbortRequested()
 {
 	if (TheGameEngine)
 	{
 		TheGameEngine->serviceWindowsOS();
+	}
+
+	// GeneralsVR @feature In a headset there is no keyboard to reach for: the secondary button
+	// on either controller skips the movie, exactly as Escape does below.
+	if (s_movieAbortHook != nullptr && s_movieAbortHook())
+	{
+		return TRUE;
 	}
 
 	// TheSuperHackers @feature User can skip video by pressing ESC

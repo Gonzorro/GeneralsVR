@@ -803,6 +803,49 @@ void OpenXRManager::syncControllers()
 }
 
 //-------------------------------------------------------------------------------------------------
+/** The intro movie plays inside a loop that blocks the whole engine, so none of our per-frame
+	* machinery runs while it does. The engine itself handles Escape there by reaching straight
+	* into the keyboard; this is the same move, reaching straight into the runtime. Edge-triggered,
+	* so holding the button cannot skip several movies in a row. */
+//-------------------------------------------------------------------------------------------------
+Bool OpenXRManager::pollSkipRequest()
+{
+	if (!m_actionsReady || !m_sessionRunning)
+		return FALSE;
+
+	XrActiveActionSet active = {};
+	active.actionSet = m_actionSet;
+	active.subactionPath = XR_NULL_PATH;
+
+	XrActionsSyncInfo sync = {XR_TYPE_ACTIONS_SYNC_INFO};
+	sync.countActiveActionSets = 1;
+	sync.activeActionSets = &active;
+	if (XR_FAILED(xrSyncActions(m_session, &sync)))
+		return FALSE;
+
+	Bool skip = FALSE;
+
+	for (Int hand = 0; hand < VR_HAND_COUNT; ++hand)
+	{
+		XrActionStateGetInfo get = {XR_TYPE_ACTION_STATE_GET_INFO};
+		get.subactionPath = m_handPaths[hand];
+		get.action = m_secondaryAction;
+
+		XrActionStateBoolean state = {XR_TYPE_ACTION_STATE_BOOLEAN};
+		if (XR_FAILED(xrGetActionStateBoolean(m_session, &get, &state)))
+			continue;
+
+		const Bool down = state.isActive && state.currentState;
+		VRControllerState& c = m_controllers[hand];
+		if (down && !c.secondaryButton)
+			skip = TRUE;
+		c.secondaryButton = down;
+	}
+
+	return skip;
+}
+
+//-------------------------------------------------------------------------------------------------
 Bool OpenXRManager::createSwapchains()
 {
 	uint32_t formatCount = 0;

@@ -121,6 +121,11 @@ public:
 	/// controller is off, lost, or the runtime has no bindings for it.
 	const VRControllerState& getController(Int hand) const { return m_controllers[hand]; }
 
+	/// Is the player asking to skip the intro movie? Movies play inside a blocking loop that
+	/// never reaches our per-frame update, so this polls the runtime directly - it is the VR
+	/// equivalent of the engine reaching straight into the keyboard for Escape.
+	Bool pollSkipRequest();
+
 	/// The D3D8 surface the engine should render this eye into (eye-sized, colour only;
 	/// pair it with getDepthSurface()).
 	IDirect3DSurface8* getEyeSurface(Int eye) const { return m_eyeSurfaces[eye]; }

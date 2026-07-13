@@ -155,7 +155,16 @@ public:
 
 	static Bool isMovieAbortRequested();
 
+	// GeneralsVR @feature A movie plays inside a loop that blocks the whole engine, so the VR
+	// layer's per-frame update never runs and a controller press cannot reach it the usual way.
+	// The device layer installs this hook to let a headset skip a movie the way Escape does.
+	// The engine core must not depend on the VR module, hence a plain function pointer.
+	typedef Bool (*MovieAbortHook)();
+	static void setMovieAbortHook( MovieAbortHook hook ) { s_movieAbortHook = hook; }
+
 protected:
+
+	static MovieAbortHook s_movieAbortHook;
 
 	// snapshot methods
 	virtual void crc( Xfer *xfer ) override;

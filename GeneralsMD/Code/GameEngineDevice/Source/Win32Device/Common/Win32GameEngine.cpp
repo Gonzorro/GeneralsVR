@@ -41,7 +41,15 @@
 #ifdef RTS_HAS_OPENXR
 #include "VRDevice/OpenXRManager.h"
 #include "VRDevice/VRControls.h"
+#include "GameClient/GameClient.h"
 #include "dx8wrapper.h"
+
+// GeneralsVR @feature Let a controller skip the intro movie. The movie loop blocks the engine,
+// so this is polled straight from the runtime - see OpenXRManager::pollSkipRequest.
+static Bool vrMovieAbortHook()
+{
+	return TheOpenXR != nullptr && TheOpenXR->pollSkipRequest();
+}
 #endif
 
 extern DWORD TheMessageTime;
@@ -61,7 +69,9 @@ Win32GameEngine::Win32GameEngine()
 Win32GameEngine::~Win32GameEngine()
 {
 #ifdef RTS_HAS_OPENXR
-	// GeneralsVR @feature Tear down VR after the engine has shut down.
+	// GeneralsVR @feature Tear down VR after the engine has shut down. The hook must go first:
+	// it points at a manager that is about to stop existing.
+	GameClient::setMovieAbortHook(nullptr);
 	delete TheVRControls;
 	TheVRControls = nullptr;
 	delete TheOpenXR;
@@ -104,6 +114,9 @@ void Win32GameEngine::init()
 
 			if (TheOpenXR->hasSession() && TheVRControls == nullptr)
 				TheVRControls = NEW VRControls;
+
+			if (TheOpenXR->hasSession())
+				GameClient::setMovieAbortHook(vrMovieAbortHook);
 		}
 	}
 #endif
