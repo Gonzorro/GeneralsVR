@@ -276,7 +276,7 @@ Bool VRControls::traceScene(const Vector3 &origin, const Vector3 &dir, Coord3D &
 
 	RayCollisionTestClass rayTest(lineSeg, &result, COLL_TYPE_ALL, false, false);
 
-	if (!W3DDisplay::m_3DScene->castRay(rayTest, false, (Int)PICK_TYPE_ALL_DRAWABLES))
+	if (!W3DDisplay::m_3DScene->castRay(rayTest, true, (Int)PICK_TYPE_ALL_DRAWABLES))
 		return FALSE;
 	if (rayTest.CollidedRenderObj == nullptr)
 		return FALSE;
@@ -314,7 +314,7 @@ Drawable *VRControls::pickDrawable(const Vector3 &origin, const Vector3 &dir) co
 	CastResultStruct result;
 	RayCollisionTestClass rayTest(lineSeg, &result, COLL_TYPE_ALL, false, false);
 
-	if (!W3DDisplay::m_3DScene->castRay(rayTest, false, (Int)PICK_TYPE_ALL_DRAWABLES))
+	if (!W3DDisplay::m_3DScene->castRay(rayTest, true, (Int)PICK_TYPE_ALL_DRAWABLES))
 		return nullptr;
 	if (rayTest.CollidedRenderObj == nullptr)
 		return nullptr;

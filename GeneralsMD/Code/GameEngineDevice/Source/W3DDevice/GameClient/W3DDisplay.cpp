@@ -1880,13 +1880,20 @@ void W3DDisplay::drawVRPanels( const Matrix3D &anchor, Real scale )
 			device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
 			device->SetRenderState(D3DRS_FOGENABLE, FALSE);
 
-			// Keep only what the interface actually painted. Blending alone would leave the
-			// unpainted background faintly there, and any alpha the sprites lost on the way in
-			// would show the world through the buttons.
-			device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+			// Blend, and reject only the pixels the interface never touched at all.
+			//
+			// A hard alpha test was the obvious way to get crisp sprites on nothing, but the
+			// alpha the UI leaves behind in the render target is weak - which is exactly why the
+			// panel looked washed out in the first place - so a 25% threshold threw the ENTIRE
+			// menu away. A near-zero threshold keeps everything that was painted and discards
+			// only the untouched background, and blending shows it for what it is.
+			device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+			device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+			device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
 			device->SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
-			device->SetRenderState(D3DRS_ALPHAREF, 0x40);
+			device->SetRenderState(D3DRS_ALPHAREF, 0x04);
 			device->SetRenderState(D3DRS_ALPHAFUNC, D3DCMP_GREATER);
+			device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
 
 			device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
 			device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
@@ -1907,6 +1914,8 @@ void W3DDisplay::drawVRPanels( const Matrix3D &anchor, Real scale )
 		// Hand the device back the way we found it, or the next thing drawn inherits our states.
 		device->SetTexture(0, nullptr);
 		device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+		device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+		device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
 		DX8Wrapper::Invalidate_Cached_Render_States();
 	}
 }
