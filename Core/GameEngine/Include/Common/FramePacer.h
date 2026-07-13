@@ -47,6 +47,13 @@ public:
 	Bool isActualFramesPerSecondLimitEnabled() const; ///< Returns whether the fps limit is actually enabled when considering all game settings and setups.
 	Int  getActualFramesPerSecondLimit() const; // Get the actual update fps limit.
 
+	/// GeneralsVR @feature Hand pacing to an external presenter (the VR compositor blocks in
+	/// xrWaitFrame at the headset's refresh rate). Overrides every in-game fps limit, which
+	/// would otherwise fight it and cause judder. Survives the LOD/options code paths that
+	/// rewrite the fps settings.
+	void setBypassFramesPerSecondLimit( Bool bypass ) { m_bypassFpsLimit = bypass; }
+	Bool isFramesPerSecondLimitBypassed() const { return m_bypassFpsLimit; }
+
 	Real getUpdateTime() const; ///< Get the last update delta time in seconds.
 	Real getUpdateFps() const; ///< Get the last update fps.
 	Real getBaseOverUpdateFpsRatio(Real minUpdateFps = 5.0f); ///< Get the last engine base over update fps ratio. Used to scale user inputs to a frame rate independent speed.
@@ -76,6 +83,7 @@ protected:
 	Real m_updateTime; ///< Last update delta time in seconds
 
 	Bool m_enableFpsLimit;
+	Bool m_bypassFpsLimit; ///< GeneralsVR: an external presenter (the VR compositor) paces us
 	Bool m_enableLogicTimeScale;
 	Bool m_isTimeFrozen;
 	Bool m_isGameHalted;

@@ -439,6 +439,18 @@ Int parseVRScale(char *args[], int num)
 	return 2;
 }
 
+// GeneralsVR @feature Per-eye render resolution scale (1.0 = the runtime's recommendation).
+Int parseVRRes(char *args[], int num)
+{
+	if (num > 1)
+	{
+		const Real scale = (Real)atof(args[1]);
+		if (scale >= 0.25f && scale <= 2.0f)
+			TheWritableGlobalData->m_vrResolutionScale = scale;
+	}
+	return 2;
+}
+
 Int parseHeadless(char *args[], int num)
 {
 	TheWritableGlobalData->m_headless = TRUE;
@@ -1172,6 +1184,9 @@ static CommandLineParam paramsForStartup[] =
 
 	// GeneralsVR @feature Tabletop scale in VR: world units per metre (default 500).
 	{ "-vrscale", parseVRScale },
+
+	// GeneralsVR @feature Per-eye render resolution scale (default 1.0).
+	{ "-vrres", parseVRRes },
 
 	// TheSuperHackers @feature helmutbuhler 13/04/2025
 	// Play back a replay. Pass the filename including .rep afterwards.

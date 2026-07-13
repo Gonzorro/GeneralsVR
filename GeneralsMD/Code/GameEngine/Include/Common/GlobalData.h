@@ -132,6 +132,11 @@ public:
 	// (-vrscale). Larger means the map appears smaller / further away.
 	Real m_vrWorldUnitsPerMeter;
 
+	// GeneralsVR @feature Scale applied to the runtime's recommended per-eye render size
+	// (-vrres). Below 1.0 trades sharpness for frame rate; the scene is drawn twice, and this
+	// engine is CPU-heavy per draw call.
+	Real m_vrResolutionScale;
+
 	Bool m_windowed;
 	Int m_xResolution;
 	Int m_yResolution;

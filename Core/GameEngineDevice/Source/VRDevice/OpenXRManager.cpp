@@ -237,6 +237,20 @@ Bool OpenXRManager::init()
 	m_eyeHeight = views[0].recommendedImageRectHeight;
 	DEBUG_LOG(("OpenXR: %d views, recommended eye target %dx%d", m_eyeCount, m_eyeWidth, m_eyeHeight));
 
+	// The scene is drawn once per eye through a CPU-heavy fixed-function path, so trading a
+	// little sharpness for frame rate is often the right call.
+	if (TheGlobalData != nullptr && TheGlobalData->m_vrResolutionScale > 0.0f
+		&& TheGlobalData->m_vrResolutionScale != 1.0f)
+	{
+		m_eyeWidth = (Int)(m_eyeWidth * TheGlobalData->m_vrResolutionScale);
+		m_eyeHeight = (Int)(m_eyeHeight * TheGlobalData->m_vrResolutionScale);
+		// Keep the dimensions even; some runtimes dislike odd swapchain extents.
+		m_eyeWidth &= ~1;
+		m_eyeHeight &= ~1;
+		DEBUG_LOG(("OpenXR: eye target scaled by %.2f -> %dx%d",
+			TheGlobalData->m_vrResolutionScale, m_eyeWidth, m_eyeHeight));
+	}
+
 	if (TheGlobalData != nullptr && TheGlobalData->m_vrWorldUnitsPerMeter > 0.0f)
 		m_worldUnitsPerMeter = TheGlobalData->m_vrWorldUnitsPerMeter;
 	DEBUG_LOG(("OpenXR: tabletop scale: %.1f world units per metre", m_worldUnitsPerMeter));
@@ -577,9 +591,9 @@ Bool OpenXRManager::createSwapchains()
 		DEBUG_LOG(("OpenXR: swapchain: no preferred format offered, falling back to %lld", chosen));
 	}
 	// A raw copy is only correct when the swapchain is BGRA (the layout D3DFMT_A8R8G8B8 gives us).
-	const Bool rawCopyOk = (chosen == VK_FORMAT_B8G8R8A8_SRGB || chosen == VK_FORMAT_B8G8R8A8_UNORM);
 	DEBUG_LOG(("OpenXR: swapchain: format %lld (%s)", chosen,
-		rawCopyOk ? "BGRA - raw copy" : "non-BGRA - blit (colour may shift)"));
+		(chosen == VK_FORMAT_B8G8R8A8_SRGB || chosen == VK_FORMAT_B8G8R8A8_UNORM)
+			? "BGRA - raw copy" : "non-BGRA - channels may swap"));
 
 	for (Int eye = 0; eye < m_eyeCount; ++eye)
 	{

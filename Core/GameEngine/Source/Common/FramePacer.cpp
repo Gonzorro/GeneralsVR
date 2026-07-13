@@ -39,6 +39,7 @@ FramePacer::FramePacer()
 	m_logicTimeScaleFPS = LOGICFRAMES_PER_SECOND;
 	m_updateTime = 1.0f / (Real)BaseFps; // initialized to something to avoid division by zero on first use
 	m_enableFpsLimit = FALSE;
+	m_bypassFpsLimit = FALSE;
 	m_enableLogicTimeScale = FALSE;
 	m_isTimeFrozen = FALSE;
 	m_isGameHalted = FALSE;
@@ -81,6 +82,10 @@ Bool FramePacer::isFramesPerSecondLimitEnabled() const
 
 Bool FramePacer::isActualFramesPerSecondLimitEnabled() const
 {
+	// GeneralsVR: the VR compositor paces the loop; any in-game limit would fight it.
+	if (m_bypassFpsLimit)
+		return false;
+
 	Bool allowFpsLimit = true;
 
 	if (TheTacticalView != nullptr)

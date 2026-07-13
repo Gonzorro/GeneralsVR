@@ -33,6 +33,7 @@
 
 #include "Win32Device/Common/Win32GameEngine.h"
 #include "Common/GlobalData.h"
+#include "Common/FramePacer.h"
 #include "Common/PerfTimer.h"
 
 #include "GameNetwork/LANAPICallbacks.h"
@@ -89,6 +90,14 @@ void Win32GameEngine::init()
 			// The D3D device exists by now (created during GameEngine::init), so the session
 			// can be built on the Vulkan device DXVK created behind it.
 			TheOpenXR->initGraphics(DX8Wrapper::_Get_D3D_Device8());
+
+			// The compositor now paces us (xrWaitFrame blocks at the headset's refresh rate).
+			// Leaving an in-game fps limit on top of that just causes judder.
+			if (TheOpenXR->hasSession() && TheFramePacer != nullptr)
+			{
+				TheFramePacer->setBypassFramesPerSecondLimit(TRUE);
+				DEBUG_LOG(("OpenXR: in-game fps limit bypassed - the compositor paces the loop"));
+			}
 		}
 	}
 #endif
