@@ -196,6 +196,14 @@ add_library(z_gameenginedevice STATIC)
 
 target_sources(z_gameenginedevice PRIVATE ${GAMEENGINEDEVICE_SRC})
 
+# GeneralsVR @feature Motion controller locomotion and pointing.
+if(RTS_BUILD_OPTION_VR AND (WIN32 OR "${CMAKE_SYSTEM}" MATCHES "Windows"))
+    target_sources(z_gameenginedevice PRIVATE
+        Include/VRDevice/VRControls.h
+        Source/VRDevice/VRControls.cpp
+    )
+endif()
+
 target_include_directories(z_gameenginedevice PUBLIC
     Include
 )

@@ -53,6 +53,28 @@ struct VREyeView
 	Real angleUp, angleDown;        ///< radians; down is negative
 };
 
+/// A controller's state for the current frame. Pose is in the same VR reference space as
+/// VREyeView (right-handed, -Z forward, +Y up, metres): the aim pose, which points out of the
+/// controller's nose the way a laser pointer would.
+struct VRControllerState
+{
+	Bool poseValid;
+	Real quatX, quatY, quatZ, quatW;
+	Real posX, posY, posZ;
+
+	Bool trigger;         ///< held
+	Bool triggerPressed;  ///< became held this frame
+	Bool triggerReleased; ///< became free this frame
+	Bool grip;            ///< held
+	Bool gripPressed;
+	Bool gripReleased;
+	Real stickX, stickY;  ///< -1..1
+	Bool primaryButton;   ///< A / X
+	Bool primaryPressed;
+};
+
+enum VRHand { VR_HAND_LEFT = 0, VR_HAND_RIGHT = 1, VR_HAND_COUNT = 2 };
+
 class OpenXRManager
 {
 public:
@@ -93,6 +115,10 @@ public:
 	/// Valid only while isFrameActive().
 	const VREyeView& getEyeView(Int eye) const { return m_eyeViews[eye]; }
 
+	/// Controller state for this frame. Always safe to read; poseValid is false when the
+	/// controller is off, lost, or the runtime has no bindings for it.
+	const VRControllerState& getController(Int hand) const { return m_controllers[hand]; }
+
 	/// The D3D8 surface the engine should render this eye into (eye-sized, colour only;
 	/// pair it with getDepthSurface()).
 	IDirect3DSurface8* getEyeSurface(Int eye) const { return m_eyeSurfaces[eye]; }
@@ -114,6 +140,8 @@ private:
 	void probeVulkanRequirements();
 	Bool findDxvkInterop(IDirect3DDevice8* d3d8Device);
 	Bool createSession();
+	Bool createActions();      ///< action set + bindings; controllers are optional, never fatal
+	void syncControllers();    ///< per frame, after the frame's display time is known
 	Bool createSwapchains();
 	Bool createEyeTargets(IDirect3DDevice8* d3d8Device);
 	Bool loadVulkanFunctions();
@@ -144,6 +172,18 @@ private:
 	Int m_eyeWidth;
 	Int m_eyeHeight;
 	Real m_worldUnitsPerMeter;
+
+	// Controller input (all optional: the game stays playable with mouse and keyboard)
+	XrActionSet m_actionSet;
+	XrAction m_aimPoseAction;
+	XrAction m_triggerAction;
+	XrAction m_gripAction;
+	XrAction m_stickAction;
+	XrAction m_primaryAction;
+	XrPath m_handPaths[VR_HAND_COUNT];
+	XrSpace m_aimSpaces[VR_HAND_COUNT];
+	VRControllerState m_controllers[VR_HAND_COUNT];
+	Bool m_actionsReady;
 
 	Bool m_supportsVulkan;   ///< XR_KHR_vulkan_enable2
 	Bool m_supportsVulkan1;  ///< XR_KHR_vulkan_enable (accepts DXVK's existing VkDevice)

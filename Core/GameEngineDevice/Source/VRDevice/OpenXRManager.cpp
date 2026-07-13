@@ -110,9 +110,22 @@ OpenXRManager::OpenXRManager()
 	, m_copyInFlight(FALSE)
 	, m_depthSurface(nullptr)
 	, m_eyeImageLayout(VK_IMAGE_LAYOUT_UNDEFINED)
+	, m_actionSet(XR_NULL_HANDLE)
+	, m_aimPoseAction(XR_NULL_HANDLE)
+	, m_triggerAction(XR_NULL_HANDLE)
+	, m_gripAction(XR_NULL_HANDLE)
+	, m_stickAction(XR_NULL_HANDLE)
+	, m_primaryAction(XR_NULL_HANDLE)
+	, m_actionsReady(FALSE)
 	, m_framesSubmitted(0)
 	, m_submitFailLogged(FALSE)
 {
+	for (int i = 0; i < VR_HAND_COUNT; ++i)
+	{
+		m_handPaths[i] = XR_NULL_PATH;
+		m_aimSpaces[i] = XR_NULL_HANDLE;
+		m_controllers[i] = VRControllerState();
+	}
 	for (int i = 0; i < MAX_EYES; ++i)
 	{
 		m_swapchains[i] = XR_NULL_HANDLE;
@@ -563,6 +576,203 @@ Bool OpenXRManager::createSession()
 }
 
 //-------------------------------------------------------------------------------------------------
+// GeneralsVR: controller input. Everything here is best-effort - if the runtime has no
+// controllers, or bindings fail, the game simply keeps playing with mouse and keyboard.
+//-------------------------------------------------------------------------------------------------
+Bool OpenXRManager::createActions()
+{
+	XrActionSetCreateInfo asci = {XR_TYPE_ACTION_SET_CREATE_INFO};
+	strcpy(asci.actionSetName, "gameplay");
+	strcpy(asci.localizedActionSetName, "Gameplay");
+	asci.priority = 0;
+	if (XR_FAILED(xrCreateActionSet(m_instance, &asci, &m_actionSet)))
+	{
+		DEBUG_LOG(("OpenXR: input: xrCreateActionSet failed"));
+		return FALSE;
+	}
+
+	xrStringToPath(m_instance, "/user/hand/left", &m_handPaths[VR_HAND_LEFT]);
+	xrStringToPath(m_instance, "/user/hand/right", &m_handPaths[VR_HAND_RIGHT]);
+
+	struct ActionDef { XrAction* action; const char* name; const char* localized; XrActionType type; };
+	const ActionDef defs[] =
+	{
+		{ &m_aimPoseAction, "aim_pose", "Aim Pose",      XR_ACTION_TYPE_POSE_INPUT    },
+		{ &m_triggerAction, "trigger",  "Trigger",       XR_ACTION_TYPE_BOOLEAN_INPUT },
+		{ &m_gripAction,    "grip",     "Grip",          XR_ACTION_TYPE_BOOLEAN_INPUT },
+		{ &m_stickAction,   "stick",    "Thumbstick",    XR_ACTION_TYPE_VECTOR2F_INPUT},
+		{ &m_primaryAction, "primary",  "Primary Button",XR_ACTION_TYPE_BOOLEAN_INPUT },
+	};
+
+	for (size_t i = 0; i < sizeof(defs)/sizeof(defs[0]); ++i)
+	{
+		XrActionCreateInfo aci = {XR_TYPE_ACTION_CREATE_INFO};
+		strcpy(aci.actionName, defs[i].name);
+		strcpy(aci.localizedActionName, defs[i].localized);
+		aci.actionType = defs[i].type;
+		aci.countSubactionPaths = VR_HAND_COUNT;
+		aci.subactionPaths = m_handPaths;
+		if (XR_FAILED(xrCreateAction(m_actionSet, &aci, defs[i].action)))
+		{
+			DEBUG_LOG(("OpenXR: input: xrCreateAction '%s' failed", defs[i].name));
+			return FALSE;
+		}
+	}
+
+	// Bindings for the Touch controllers. The runtime remaps these for any other hardware it
+	// supports, so this one profile is enough to get every mainstream controller working.
+	struct BindingDef { XrAction action; const char* path; };
+	const char* bindingPaths[] =
+	{
+		"/user/hand/left/input/aim/pose",            "/user/hand/right/input/aim/pose",
+		"/user/hand/left/input/trigger",             "/user/hand/right/input/trigger",
+		"/user/hand/left/input/squeeze/value",       "/user/hand/right/input/squeeze/value",
+		"/user/hand/left/input/thumbstick",          "/user/hand/right/input/thumbstick",
+		"/user/hand/left/input/x/click",             "/user/hand/right/input/a/click",
+	};
+	XrAction bindingActions[] =
+	{
+		m_aimPoseAction, m_aimPoseAction,
+		m_triggerAction, m_triggerAction,
+		m_gripAction,    m_gripAction,
+		m_stickAction,   m_stickAction,
+		m_primaryAction, m_primaryAction,
+	};
+
+	std::vector<XrActionSuggestedBinding> bindings;
+	for (size_t i = 0; i < sizeof(bindingPaths)/sizeof(bindingPaths[0]); ++i)
+	{
+		XrPath path = XR_NULL_PATH;
+		if (XR_FAILED(xrStringToPath(m_instance, bindingPaths[i], &path)))
+			continue;
+		XrActionSuggestedBinding b = {};
+		b.action = bindingActions[i];
+		b.binding = path;
+		bindings.push_back(b);
+	}
+
+	XrPath profilePath = XR_NULL_PATH;
+	xrStringToPath(m_instance, "/interaction_profiles/oculus/touch_controller", &profilePath);
+
+	XrInteractionProfileSuggestedBinding suggested = {XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+	suggested.interactionProfile = profilePath;
+	suggested.countSuggestedBindings = (uint32_t)bindings.size();
+	suggested.suggestedBindings = bindings.data();
+	XrResult bindResult = xrSuggestInteractionProfileBindings(m_instance, &suggested);
+	if (XR_FAILED(bindResult))
+	{
+		DEBUG_LOG(("OpenXR: input: suggested bindings rejected (%d)", (int)bindResult));
+		return FALSE;
+	}
+
+	// One space per hand, tracking that hand's aim pose.
+	for (Int hand = 0; hand < VR_HAND_COUNT; ++hand)
+	{
+		XrActionSpaceCreateInfo asci2 = {XR_TYPE_ACTION_SPACE_CREATE_INFO};
+		asci2.action = m_aimPoseAction;
+		asci2.subactionPath = m_handPaths[hand];
+		asci2.poseInActionSpace.orientation.w = 1.0f;
+		if (XR_FAILED(xrCreateActionSpace(m_session, &asci2, &m_aimSpaces[hand])))
+		{
+			DEBUG_LOG(("OpenXR: input: xrCreateActionSpace failed for hand %d", hand));
+			return FALSE;
+		}
+	}
+
+	XrSessionActionSetsAttachInfo attach = {XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
+	attach.countActionSets = 1;
+	attach.actionSets = &m_actionSet;
+	if (XR_FAILED(xrAttachSessionActionSets(m_session, &attach)))
+	{
+		DEBUG_LOG(("OpenXR: input: xrAttachSessionActionSets failed"));
+		return FALSE;
+	}
+
+	m_actionsReady = TRUE;
+	DEBUG_LOG(("OpenXR: input: controllers armed (aim, trigger, grip, stick, button)"));
+	return TRUE;
+}
+
+//-------------------------------------------------------------------------------------------------
+void OpenXRManager::syncControllers()
+{
+	if (!m_actionsReady || !m_sessionRunning)
+		return;
+
+	XrActiveActionSet active = {};
+	active.actionSet = m_actionSet;
+	active.subactionPath = XR_NULL_PATH;
+
+	XrActionsSyncInfo sync = {XR_TYPE_ACTIONS_SYNC_INFO};
+	sync.countActiveActionSets = 1;
+	sync.activeActionSets = &active;
+	if (XR_FAILED(xrSyncActions(m_session, &sync)))
+		return;
+
+	for (Int hand = 0; hand < VR_HAND_COUNT; ++hand)
+	{
+		VRControllerState& c = m_controllers[hand];
+		const Bool wasTrigger = c.trigger;
+		const Bool wasGrip = c.grip;
+		const Bool wasPrimary = c.primaryButton;
+
+		XrActionStateGetInfo get = {XR_TYPE_ACTION_STATE_GET_INFO};
+		get.subactionPath = m_handPaths[hand];
+
+		get.action = m_triggerAction;
+		XrActionStateBoolean triggerState = {XR_TYPE_ACTION_STATE_BOOLEAN};
+		xrGetActionStateBoolean(m_session, &get, &triggerState);
+		c.trigger = triggerState.isActive && triggerState.currentState;
+
+		get.action = m_gripAction;
+		XrActionStateBoolean gripState = {XR_TYPE_ACTION_STATE_BOOLEAN};
+		xrGetActionStateBoolean(m_session, &get, &gripState);
+		c.grip = gripState.isActive && gripState.currentState;
+
+		get.action = m_primaryAction;
+		XrActionStateBoolean primaryState = {XR_TYPE_ACTION_STATE_BOOLEAN};
+		xrGetActionStateBoolean(m_session, &get, &primaryState);
+		c.primaryButton = primaryState.isActive && primaryState.currentState;
+
+		get.action = m_stickAction;
+		XrActionStateVector2f stickState = {XR_TYPE_ACTION_STATE_VECTOR2F};
+		xrGetActionStateVector2f(m_session, &get, &stickState);
+		c.stickX = stickState.isActive ? stickState.currentState.x : 0.0f;
+		c.stickY = stickState.isActive ? stickState.currentState.y : 0.0f;
+
+		c.triggerPressed = c.trigger && !wasTrigger;
+		c.triggerReleased = !c.trigger && wasTrigger;
+		c.gripPressed = c.grip && !wasGrip;
+		c.gripReleased = !c.grip && wasGrip;
+		c.primaryPressed = c.primaryButton && !wasPrimary;
+
+		// The aim pose: where the controller is pointing, in our reference space.
+		get.action = m_aimPoseAction;
+		XrActionStatePose poseState = {XR_TYPE_ACTION_STATE_POSE};
+		xrGetActionStatePose(m_session, &get, &poseState);
+
+		c.poseValid = FALSE;
+		if (poseState.isActive && m_aimSpaces[hand] != XR_NULL_HANDLE)
+		{
+			XrSpaceLocation loc = {XR_TYPE_SPACE_LOCATION};
+			if (XR_SUCCEEDED(xrLocateSpace(m_aimSpaces[hand], m_appSpace, m_predictedDisplayTime, &loc))
+				&& (loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)
+				&& (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT))
+			{
+				c.poseValid = TRUE;
+				c.quatX = loc.pose.orientation.x;
+				c.quatY = loc.pose.orientation.y;
+				c.quatZ = loc.pose.orientation.z;
+				c.quatW = loc.pose.orientation.w;
+				c.posX = loc.pose.position.x;
+				c.posY = loc.pose.position.y;
+				c.posZ = loc.pose.position.z;
+			}
+		}
+	}
+}
+
+//-------------------------------------------------------------------------------------------------
 Bool OpenXRManager::createSwapchains()
 {
 	uint32_t formatCount = 0;
@@ -748,6 +958,11 @@ void OpenXRManager::initGraphics(IDirect3DDevice8* d3d8Device)
 		return;
 	if (!createVulkanCopyResources())
 		return;
+
+	// Controllers are a bonus, not a requirement: if this fails the headset still renders and
+	// the game is still playable with mouse and keyboard.
+	createActions();
+
 	if (!createSwapchains())
 		return;
 	if (!createEyeTargets(d3d8Device))
@@ -847,6 +1062,10 @@ void OpenXRManager::beginFrame()
 	if ((viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) == 0
 		|| (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) == 0)
 		return;
+
+	// Controllers are sampled here so that everything the frame uses - eyes and hands - is
+	// located against the same predicted display time.
+	syncControllers();
 
 	for (Int eye = 0; eye < m_eyeCount && (uint32_t)eye < viewCount; ++eye)
 	{
@@ -1145,6 +1364,21 @@ void OpenXRManager::shutdown()
 		xrEndSession(m_session);
 		m_sessionRunning = FALSE;
 	}
+	for (Int hand = 0; hand < VR_HAND_COUNT; ++hand)
+	{
+		if (m_aimSpaces[hand] != XR_NULL_HANDLE)
+		{
+			xrDestroySpace(m_aimSpaces[hand]);
+			m_aimSpaces[hand] = XR_NULL_HANDLE;
+		}
+	}
+	if (m_actionSet != XR_NULL_HANDLE)
+	{
+		xrDestroyActionSet(m_actionSet);	// destroys its actions too
+		m_actionSet = XR_NULL_HANDLE;
+	}
+	m_actionsReady = FALSE;
+
 	if (m_appSpace != XR_NULL_HANDLE)
 	{
 		xrDestroySpace(m_appSpace);

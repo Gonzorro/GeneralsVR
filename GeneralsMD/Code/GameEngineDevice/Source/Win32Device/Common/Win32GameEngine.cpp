@@ -40,6 +40,7 @@
 
 #ifdef RTS_HAS_OPENXR
 #include "VRDevice/OpenXRManager.h"
+#include "VRDevice/VRControls.h"
 #include "dx8wrapper.h"
 #endif
 
@@ -60,7 +61,9 @@ Win32GameEngine::Win32GameEngine()
 Win32GameEngine::~Win32GameEngine()
 {
 #ifdef RTS_HAS_OPENXR
-	// GeneralsVR @feature Tear down the OpenXR instance after the engine has shut down.
+	// GeneralsVR @feature Tear down VR after the engine has shut down.
+	delete TheVRControls;
+	TheVRControls = nullptr;
 	delete TheOpenXR;
 	TheOpenXR = nullptr;
 #endif
@@ -98,6 +101,9 @@ void Win32GameEngine::init()
 				TheFramePacer->setBypassFramesPerSecondLimit(TRUE);
 				DEBUG_LOG(("OpenXR: in-game fps limit bypassed - the compositor paces the loop"));
 			}
+
+			if (TheOpenXR->hasSession() && TheVRControls == nullptr)
+				TheVRControls = NEW VRControls;
 		}
 	}
 #endif
@@ -128,6 +134,11 @@ void Win32GameEngine::update()
 	// and the matching xrEndFrame happen inside W3DDisplay::drawVRScene.
 	if (TheOpenXR != nullptr)
 		TheOpenXR->beginFrame();
+
+	// Controllers drive the tactical camera and inject the cursor, so they must run before the
+	// game client consumes input this frame.
+	if (TheVRControls != nullptr)
+		TheVRControls->update();
 #endif
 
 	// call the engine normal update
