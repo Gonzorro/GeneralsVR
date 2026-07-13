@@ -56,6 +56,12 @@ public:
 	Bool hasDxvkVulkanDevice() const { return m_vkDevice != nullptr; }
 	Bool hasSession() const { return m_session != XR_NULL_HANDLE; }
 
+	/// Per-frame service from the engine's main loop: drains session events (begins/ends
+	/// the session as the runtime dictates) and, while running, does one
+	/// xrWaitFrame/xrBeginFrame/xrEndFrame cycle. First-light scope: submits zero layers,
+	/// which visibly switches the headset into the app (black void, head tracking live).
+	void pumpFrame();
+
 private:
 	Bool hasExtension(const char* name) const;
 
@@ -71,6 +77,11 @@ private:
 	XrSystemId m_systemId;
 	XrSession m_session;
 	XrSwapchain m_trialSwapchain;
+	XrSessionState m_sessionState;
+	XrEnvironmentBlendMode m_blendMode;
+	Bool m_sessionRunning;
+	Bool m_endFrameFailLogged;
+	UnsignedInt m_framesSubmitted;
 	Int m_eyeWidth;
 	Int m_eyeHeight;
 	Bool m_supportsVulkan;   ///< XR_KHR_vulkan_enable2

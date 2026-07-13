@@ -38,6 +38,11 @@ OpenXRManager::OpenXRManager()
 	, m_systemId(XR_NULL_SYSTEM_ID)
 	, m_session(XR_NULL_HANDLE)
 	, m_trialSwapchain(XR_NULL_HANDLE)
+	, m_sessionState(XR_SESSION_STATE_UNKNOWN)
+	, m_blendMode(XR_ENVIRONMENT_BLEND_MODE_OPAQUE)
+	, m_sessionRunning(FALSE)
+	, m_endFrameFailLogged(FALSE)
+	, m_framesSubmitted(0)
 	, m_eyeWidth(0)
 	, m_eyeHeight(0)
 	, m_supportsVulkan(FALSE)
@@ -402,6 +407,20 @@ void OpenXRManager::tryCreateSession()
 	}
 	DEBUG_LOG(("OpenXR: session: created over DXVK's Vulkan device"));
 
+	uint32_t blendCount = 0;
+	xrEnumerateEnvironmentBlendModes(m_instance, m_systemId,
+		XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &blendCount, nullptr);
+	if (blendCount > 0)
+	{
+		std::vector<XrEnvironmentBlendMode> modes(blendCount);
+		if (XR_SUCCEEDED(xrEnumerateEnvironmentBlendModes(m_instance, m_systemId,
+			XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, blendCount, &blendCount, modes.data())))
+		{
+			m_blendMode = modes[0];
+			DEBUG_LOG(("OpenXR: session: environment blend mode %d", (int)m_blendMode));
+		}
+	}
+
 	// Trial swapchain: proves the runtime will hand us renderable images on this device.
 	uint32_t formatCount = 0;
 	xrEnumerateSwapchainFormats(m_session, 0, &formatCount, nullptr);
@@ -453,8 +472,105 @@ void OpenXRManager::tryCreateSession()
 	DEBUG_LOG(("OpenXR: session spike complete - Vulkan route through DXVK is VIABLE"));
 }
 
+void OpenXRManager::pumpFrame()
+{
+	if (m_session == XR_NULL_HANDLE)
+		return;
+
+	// Drain the event queue; the runtime drives the session lifecycle through it.
+	for (;;)
+	{
+		XrEventDataBuffer ev = {XR_TYPE_EVENT_DATA_BUFFER};
+		if (xrPollEvent(m_instance, &ev) != XR_SUCCESS)
+			break;
+
+		if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED)
+		{
+			const XrEventDataSessionStateChanged* sc = (const XrEventDataSessionStateChanged*)&ev;
+			m_sessionState = sc->state;
+			DEBUG_LOG(("OpenXR: session state -> %d", (int)m_sessionState));
+
+			if (m_sessionState == XR_SESSION_STATE_READY)
+			{
+				XrSessionBeginInfo bi = {XR_TYPE_SESSION_BEGIN_INFO};
+				bi.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+				XrResult br = xrBeginSession(m_session, &bi);
+				m_sessionRunning = XR_SUCCEEDED(br);
+				DEBUG_LOG(("OpenXR: xrBeginSession %s (%d)",
+					m_sessionRunning ? "OK - session running" : "FAILED", (int)br));
+			}
+			else if (m_sessionState == XR_SESSION_STATE_STOPPING)
+			{
+				xrEndSession(m_session);
+				m_sessionRunning = FALSE;
+				DEBUG_LOG(("OpenXR: session stopped by runtime"));
+			}
+			else if (m_sessionState == XR_SESSION_STATE_EXITING
+				|| m_sessionState == XR_SESSION_STATE_LOSS_PENDING)
+			{
+				m_sessionRunning = FALSE;
+			}
+		}
+		else if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING)
+		{
+			m_sessionRunning = FALSE;
+		}
+	}
+
+	if (!m_sessionRunning)
+		return;
+
+	XrFrameWaitInfo waitInfo = {XR_TYPE_FRAME_WAIT_INFO};
+	XrFrameState frameState = {XR_TYPE_FRAME_STATE};
+	if (XR_FAILED(xrWaitFrame(m_session, &waitInfo, &frameState)))
+		return;
+
+	XrFrameBeginInfo beginInfo = {XR_TYPE_FRAME_BEGIN_INFO};
+	if (XR_FAILED(xrBeginFrame(m_session, &beginInfo)))
+		return;
+
+	XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
+	endInfo.displayTime = frameState.predictedDisplayTime;
+	endInfo.environmentBlendMode = m_blendMode;
+	endInfo.layerCount = 0;
+	endInfo.layers = nullptr;
+
+	// The compositor may use the shared Vulkan queue at frame submission.
+	if (m_dxvkInterop != nullptr)
+	{
+		m_dxvkInterop->FlushRenderingCommands();
+		m_dxvkInterop->LockSubmissionQueue();
+	}
+	XrResult endResult = xrEndFrame(m_session, &endInfo);
+	if (m_dxvkInterop != nullptr)
+		m_dxvkInterop->ReleaseSubmissionQueue();
+
+	if (XR_SUCCEEDED(endResult))
+	{
+		if (m_framesSubmitted == 0)
+		{
+			DEBUG_LOG(("OpenXR: FIRST FRAME submitted - headset switched to the app"));
+		}
+		++m_framesSubmitted;
+		if ((m_framesSubmitted % 1000) == 0)
+		{
+			DEBUG_LOG(("OpenXR: %u frames submitted", m_framesSubmitted));
+		}
+	}
+	else if (!m_endFrameFailLogged)
+	{
+		m_endFrameFailLogged = TRUE;
+		DEBUG_LOG(("OpenXR: xrEndFrame FAILED (%d)", (int)endResult));
+	}
+}
+
 void OpenXRManager::shutdown()
 {
+	if (m_sessionRunning)
+	{
+		xrEndSession(m_session);
+		m_sessionRunning = FALSE;
+	}
 	if (m_trialSwapchain != XR_NULL_HANDLE)
 	{
 		xrDestroySwapchain(m_trialSwapchain);

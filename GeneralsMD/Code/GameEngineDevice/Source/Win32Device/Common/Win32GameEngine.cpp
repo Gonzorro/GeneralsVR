@@ -113,6 +113,13 @@ void Win32GameEngine::reset()
 void Win32GameEngine::update()
 {
 
+#ifdef RTS_HAS_OPENXR
+	// GeneralsVR @feature Service the OpenXR session once per engine frame. With no layers
+	// submitted yet this only keeps the session alive (headset shows the app, black void);
+	// the stereo renderer will move the frame begin/end around the actual scene render.
+	if (TheOpenXR != nullptr)
+		TheOpenXR->pumpFrame();
+#endif
 
 	// call the engine normal update
 	GameEngine::update();
