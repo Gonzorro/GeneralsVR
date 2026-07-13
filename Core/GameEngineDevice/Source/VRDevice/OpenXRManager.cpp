@@ -718,11 +718,11 @@ VkImage OpenXRManager::getVulkanImage(IUnknown* d3d8Resource, VkImageLayout* out
 		return VK_NULL_HANDLE;
 	}
 
-	// Only log on the first lookup of an image: this runs every frame now.
-	static VkImage lastLogged = VK_NULL_HANDLE;
-	if (image != lastLogged)
+	// This is re-queried every frame per eye; only report the first few so the log stays useful.
+	static Int logBudget = 4;
+	if (logBudget > 0)
 	{
-		lastLogged = image;
+		--logBudget;
 		DEBUG_LOG(("OpenXR: interop: VkImage 0x%llX (%ux%u, format %d, layout %d, usage 0x%X, transferSrc=%d)",
 			(unsigned long long)image, info.extent.width, info.extent.height,
 			(int)info.format, (int)layout, (unsigned)info.usage,
