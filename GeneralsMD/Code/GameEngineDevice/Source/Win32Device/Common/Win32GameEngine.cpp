@@ -32,9 +32,14 @@
 #include <windows.h>
 
 #include "Win32Device/Common/Win32GameEngine.h"
+#include "Common/GlobalData.h"
 #include "Common/PerfTimer.h"
 
 #include "GameNetwork/LANAPICallbacks.h"
+
+#ifdef RTS_HAS_OPENXR
+#include "VRDevice/OpenXRManager.h"
+#endif
 
 extern DWORD TheMessageTime;
 
@@ -52,6 +57,12 @@ Win32GameEngine::Win32GameEngine()
 //-------------------------------------------------------------------------------------------------
 Win32GameEngine::~Win32GameEngine()
 {
+#ifdef RTS_HAS_OPENXR
+	// GeneralsVR @feature Tear down the OpenXR instance after the engine has shut down.
+	delete TheOpenXR;
+	TheOpenXR = nullptr;
+#endif
+
 	// restore it (this isn't really necessary, but feels good.)
 	SetErrorMode( m_previousErrorMode );
 }
@@ -65,6 +76,16 @@ void Win32GameEngine::init()
 
 	// extending functionality
 	GameEngine::init();
+
+#ifdef RTS_HAS_OPENXR
+	// GeneralsVR @feature Bootstrap OpenXR when requested with -vr. Failure is not fatal:
+	// the game keeps rendering flat and TheOpenXR->isAvailable() stays false.
+	if (TheGlobalData != nullptr && TheGlobalData->m_vrMode && TheOpenXR == nullptr)
+	{
+		TheOpenXR = NEW OpenXRManager;
+		TheOpenXR->init();
+	}
+#endif
 
 }
 

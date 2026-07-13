@@ -408,6 +408,15 @@ Int parseMapName(char *args[], int num)
 	return 1;
 }
 
+// GeneralsVR @feature Request OpenXR VR output. Falls back to flat rendering when no
+// runtime or headset is available.
+Int parseVR(char *args[], int num)
+{
+	TheWritableGlobalData->m_vrMode = TRUE;
+
+	return 1;
+}
+
 Int parseHeadless(char *args[], int num)
 {
 	TheWritableGlobalData->m_headless = TRUE;
@@ -1132,6 +1141,9 @@ static CommandLineParam paramsForStartup[] =
 	// TheSuperHackers @feature helmutbuhler 11/04/2025
 	// This runs the game without a window, graphics, input and audio. You can combine this with -replay
 	{ "-headless", parseHeadless },
+
+	// GeneralsVR @feature Request OpenXR VR output.
+	{ "-vr", parseVR },
 
 	// TheSuperHackers @feature helmutbuhler 13/04/2025
 	// Play back a replay. Pass the filename including .rep afterwards.

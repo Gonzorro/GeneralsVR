@@ -121,6 +121,9 @@ public:
 	// Run game without graphics, input or audio.
 	Bool m_headless;
 
+	// GeneralsVR @feature Run with OpenXR VR output when available (-vr).
+	Bool m_vrMode;
+
 	Bool m_windowed;
 	Int m_xResolution;
 	Int m_yResolution;

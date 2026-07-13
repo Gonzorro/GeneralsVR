@@ -229,6 +229,16 @@ target_link_libraries(corei_gameenginedevice_public INTERFACE
     milesstub
 )
 
+# GeneralsVR @feature OpenXR VR support
+if(RTS_BUILD_OPTION_VR AND (WIN32 OR "${CMAKE_SYSTEM}" MATCHES "Windows"))
+    target_sources(corei_gameenginedevice_private INTERFACE
+        Include/VRDevice/OpenXRManager.h
+        Source/VRDevice/OpenXRManager.cpp
+    )
+    target_link_libraries(corei_gameenginedevice_public INTERFACE openxr_loader)
+    target_compile_definitions(corei_gameenginedevice_public INTERFACE RTS_HAS_OPENXR)
+endif()
+
 if(RTS_BUILD_OPTION_FFMPEG)
     find_package(FFMPEG REQUIRED)
 
