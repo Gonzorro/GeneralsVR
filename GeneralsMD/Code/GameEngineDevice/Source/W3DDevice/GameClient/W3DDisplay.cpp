@@ -1877,7 +1877,10 @@ void W3DDisplay::drawVRScene( W3DView *view )
 
 		DX8Wrapper::Set_Render_Target(eyeSurface, TheOpenXR->getDepthSurface());
 
-		if (WW3D::Begin_Render(true, true, Vector3(0.0f, 0.0f, 0.0f)) == WW3D_ERROR_OK)
+		// Deliberately not black: the headset showing this blue means the swapchain path is
+		// healthy and the *scene* is what's empty (in the menus nothing 3D exists to draw -
+		// only the battlefield goes to the headset). Black would mean the copy never landed.
+		if (WW3D::Begin_Render(true, true, Vector3(0.05f, 0.10f, 0.30f)) == WW3D_ERROR_OK)
 		{
 			vrCamera->Apply();
 			WW3D::Render(m_3DScene, vrCamera);
@@ -1885,6 +1888,19 @@ void W3DDisplay::drawVRScene( W3DView *view )
 		}
 
 		DX8Wrapper::Set_Render_Target((IDirect3DSurface8 *)nullptr);
+	}
+
+	// Once a second, report what the eye pass actually drew, so an empty headset can be told
+	// apart from a broken one without another round trip.
+	static Int vrDiagCountdown = 0;
+	if (--vrDiagCountdown <= 0)
+	{
+		vrDiagCountdown = 90;
+		const Vector3 eyePos = anchor.Get_Translation();
+		DEBUG_LOG(("OpenXR: eye pass: %d polys, camera (%.0f %.0f %.0f) facing (%.2f %.2f %.2f), inGame=%d",
+			Debug_Statistics::Get_DX8_Polygons(), eyePos.X, eyePos.Y, eyePos.Z,
+			forward.X, forward.Y, forward.Z,
+			(TheGameLogic != nullptr && TheGameLogic->isInGame()) ? 1 : 0));
 	}
 
 	TheOpenXR->submitEyes();
