@@ -1807,7 +1807,11 @@ void W3DDisplay::step()
 //=============================================================================
 void W3DDisplay::drawVRScene( W3DView *view )
 {
-	if (TheOpenXR == nullptr || !TheOpenXR->isFrameActive() || view == nullptr)
+	// isStereoReady() is the hard gate: if any VR resource failed to come up, the session may
+	// still be ticking, but the eye render targets and their depth surface do not exist and
+	// binding them would fault.
+	if (TheOpenXR == nullptr || !TheOpenXR->isStereoReady() || !TheOpenXR->isFrameActive()
+		|| view == nullptr)
 		return;
 
 	CameraClass *tacticalCamera = view->get3DCamera();

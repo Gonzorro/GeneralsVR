@@ -67,8 +67,13 @@ public:
 	Bool isAvailable() const { return m_systemId != XR_NULL_SYSTEM_ID; }
 	Bool hasSession() const { return m_session != XR_NULL_HANDLE; }
 
+	/// True only when every VR resource exists (session, swapchains, eye targets with their
+	/// Vulkan images, depth). If any part of the graphics setup failed, this stays false and
+	/// the engine must not attempt an eye pass - the session still ticks so the game runs on.
+	Bool isStereoReady() const { return m_stereoReady; }
+
 	/// True between beginFrame() and submitEyes() while the runtime wants frames. The engine
-	/// only renders eyes when this is true.
+	/// only renders eyes when this AND isStereoReady() are true.
 	Bool isFrameActive() const { return m_frameActive; }
 
 	/// Locate DXVK's Vulkan device behind the game's D3D8 device, create the session,
@@ -126,6 +131,7 @@ private:
 	XrEnvironmentBlendMode m_blendMode;
 	Bool m_sessionRunning;
 	Bool m_frameActive;
+	Bool m_stereoReady; ///< every graphics resource exists; false = session ticks, no eye pass
 	XrTime m_predictedDisplayTime;
 
 	XrSwapchain m_swapchains[MAX_EYES];

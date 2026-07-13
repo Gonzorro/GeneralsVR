@@ -88,6 +88,7 @@ OpenXRManager::OpenXRManager()
 	, m_blendMode(XR_ENVIRONMENT_BLEND_MODE_OPAQUE)
 	, m_sessionRunning(FALSE)
 	, m_frameActive(FALSE)
+	, m_stereoReady(FALSE)
 	, m_predictedDisplayTime(0)
 	, m_eyeCount(0)
 	, m_eyeWidth(0)
@@ -641,6 +642,16 @@ Bool OpenXRManager::createSwapchains()
 //-------------------------------------------------------------------------------------------------
 Bool OpenXRManager::createEyeTargets(IDirect3DDevice8* device)
 {
+	// The engine's own depth buffer is backbuffer-sized, which is smaller than an eye target,
+	// so the eye passes need their own.
+	if (FAILED(device->CreateDepthStencilSurface(m_eyeWidth, m_eyeHeight, D3DFMT_D24S8,
+		D3DMULTISAMPLE_NONE, &m_depthSurface)))
+	{
+		DEBUG_LOG(("OpenXR: eye targets: CreateDepthStencilSurface FAILED (%dx%d)",
+			m_eyeWidth, m_eyeHeight));
+		return FALSE;
+	}
+
 	for (Int eye = 0; eye < m_eyeCount; ++eye)
 	{
 		if (FAILED(device->CreateTexture(m_eyeWidth, m_eyeHeight, 1, D3DUSAGE_RENDERTARGET,
@@ -656,21 +667,20 @@ Bool OpenXRManager::createEyeTargets(IDirect3DDevice8* device)
 			return FALSE;
 		}
 
+		// DXVK exposes the Vulkan image on both the texture and its surface. Which one carries
+		// it depends on how the D3D8 wrapper backs the resource, so try the texture and fall
+		// back to the surface.
 		m_eyeImages[eye] = getVulkanImage(m_eyeTextures[eye], &m_eyeImageLayout);
 		if (m_eyeImages[eye] == VK_NULL_HANDLE)
 		{
-			DEBUG_LOG(("OpenXR: eye targets: no VkImage behind eye texture %d", eye));
+			DEBUG_LOG(("OpenXR: eye targets: texture %d has no VkImage, trying its surface", eye));
+			m_eyeImages[eye] = getVulkanImage(m_eyeSurfaces[eye], &m_eyeImageLayout);
+		}
+		if (m_eyeImages[eye] == VK_NULL_HANDLE)
+		{
+			DEBUG_LOG(("OpenXR: eye targets: no VkImage behind eye %d - stereo unavailable", eye));
 			return FALSE;
 		}
-	}
-
-	// The engine's own depth buffer is backbuffer-sized, which is smaller than an eye target,
-	// so the eye passes need their own.
-	if (FAILED(device->CreateDepthStencilSurface(m_eyeWidth, m_eyeHeight, D3DFMT_D24S8,
-		D3DMULTISAMPLE_NONE, &m_depthSurface)))
-	{
-		DEBUG_LOG(("OpenXR: eye targets: CreateDepthStencilSurface FAILED"));
-		return FALSE;
 	}
 
 	DEBUG_LOG(("OpenXR: eye targets: %d D3D8 render targets %dx%d, VkImages bound (layout %d)",
@@ -683,16 +693,34 @@ VkImage OpenXRManager::getVulkanImage(IUnknown* d3d8Resource, VkImageLayout* out
 	ID3D9VkInteropTexture* interopTex =
 		(ID3D9VkInteropTexture*)queryWrappedD3D9Interface(d3d8Resource, IID_ID3D9VkInteropTexture);
 	if (interopTex == nullptr)
+	{
+		DEBUG_LOG(("OpenXR: interop: no ID3D9VkInteropTexture behind D3D8 resource %p", d3d8Resource));
 		return VK_NULL_HANDLE;
+	}
 
 	VkImage image = VK_NULL_HANDLE;
 	VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+	// DXVK requires the caller to pre-set sType (and a null pNext) or it rejects the whole
+	// call with D3DERR_INVALIDCALL - a zeroed struct is not enough.
 	VkImageCreateInfo info = {};
+	info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	info.pNext = nullptr;
+
 	HRESULT hr = interopTex->GetVulkanImageInfo(&image, &layout, &info);
 	interopTex->Release();
 
-	if (FAILED(hr))
+	if (FAILED(hr) || image == VK_NULL_HANDLE)
+	{
+		DEBUG_LOG(("OpenXR: interop: GetVulkanImageInfo failed (hr=0x%08X, image=0x%llX)",
+			(unsigned)hr, (unsigned long long)image));
 		return VK_NULL_HANDLE;
+	}
+
+	DEBUG_LOG(("OpenXR: interop: VkImage 0x%llX (%ux%u, format %d, layout %d)",
+		(unsigned long long)image, info.extent.width, info.extent.height,
+		(int)info.format, (int)layout));
+
 	if (outLayout != nullptr)
 		*outLayout = layout;
 	return image;
@@ -715,8 +743,14 @@ void OpenXRManager::initGraphics(IDirect3DDevice8* d3d8Device)
 	if (!createSwapchains())
 		return;
 	if (!createEyeTargets(d3d8Device))
+	{
+		// The session still runs (the headset holds the app and the game plays on the
+		// monitor), but no eye pass may be attempted: half the resources do not exist.
+		DEBUG_LOG(("OpenXR: eye targets unavailable - VR session runs but stereo is OFF"));
 		return;
+	}
 
+	m_stereoReady = TRUE;
 	DEBUG_LOG(("OpenXR: graphics ready - stereo path armed"));
 }
 
@@ -943,7 +977,7 @@ void OpenXRManager::submitEyes()
 	Bool copied = FALSE;
 	UnsignedInt imageIndices[MAX_EYES] = {0, 0};
 
-	if (m_swapchains[0] != XR_NULL_HANDLE && m_eyeImages[0] != VK_NULL_HANDLE)
+	if (m_stereoReady)
 	{
 		Bool acquiredAll = TRUE;
 		for (Int eye = 0; eye < m_eyeCount; ++eye)
