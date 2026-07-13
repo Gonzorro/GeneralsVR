@@ -84,9 +84,12 @@ public:
 	virtual void draw() override;  ///< redraw the entire display
 
 #ifdef RTS_HAS_OPENXR
-	/// GeneralsVR @feature Render the 3D scene once per eye into the OpenXR render targets and
-	/// submit them to the headset. No-op unless the game runs with -vr and a session is live.
+	/// GeneralsVR @feature Render the 3D scene once per eye into the OpenXR render targets.
+	/// The frame is submitted at the end of draw(), once the flat frame - and therefore the
+	/// game's 2D interface, which VR shows on floating panels - is complete.
+	/// No-op unless the game runs with -vr and a session is live.
 	void drawVRScene( class W3DView *view );
+	Bool m_vrWorldRendered;  ///< did the eye pass run this frame?
 #endif
 
 	/// @todo Replace these light management routines with a LightManager singleton

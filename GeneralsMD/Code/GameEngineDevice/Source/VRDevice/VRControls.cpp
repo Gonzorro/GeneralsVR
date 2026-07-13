@@ -342,25 +342,39 @@ void VRControls::updatePointer(W3DView *view)
 	m_hasAimPoint = FALSE;
 
 	Win32Mouse *mouse = (Win32Mouse *)TheMouse;
-	if (mouse == nullptr)
-		return;
-
-	// The right hand points; the left hand's trigger is the right mouse button (move / attack),
-	// which keeps both of the RTS verbs on triggers where they belong.
-	Vector3 origin, dir;
-	if (!computeHandRay(VR_HAND_RIGHT, origin, dir))
-		return;
-
-	Coord3D hit;
-	if (!traceTerrain(origin, dir, hit))
+	if (mouse == nullptr || TheOpenXR == nullptr)
 		return;
 
 	ICoord2D screen;
-	if (!view->worldToScreen(&hit, &screen))
-		return;	// pointing somewhere the flat camera cannot see; leave the cursor alone
+	Bool haveTarget = FALSE;
 
-	m_hasAimPoint = TRUE;
-	m_aimPoint = hit;
+	// A UI panel always wins over the world behind it: if the ray lands on the menu screen or on
+	// a wrist panel, the cursor goes there. The panel already knows which pixel of the game's own
+	// frame the ray hit, so the engine's GUI sees an ordinary cursor over an ordinary button.
+	Int panelX = 0, panelY = 0;
+	if (TheOpenXR->pickUiPanel(VR_HAND_RIGHT, panelX, panelY))
+	{
+		screen.x = panelX;
+		screen.y = panelY;
+		haveTarget = TRUE;
+	}
+	else if (view != nullptr && TheGameLogic != nullptr && TheGameLogic->isInGame())
+	{
+		// Otherwise point at the battlefield itself.
+		Vector3 origin, dir;
+		Coord3D hit;
+		if (computeHandRay(VR_HAND_RIGHT, origin, dir)
+			&& traceTerrain(origin, dir, hit)
+			&& view->worldToScreen(&hit, &screen))
+		{
+			m_hasAimPoint = TRUE;
+			m_aimPoint = hit;
+			haveTarget = TRUE;
+		}
+	}
+
+	if (!haveTarget)
+		return;	// pointing at nothing; leave the cursor where it is
 
 	const DWORD now = GetTickCount();
 	const LPARAM packed = MAKELPARAM(screen.x, screen.y);
@@ -402,14 +416,14 @@ void VRControls::update()
 		return;
 
 	W3DView *view = (W3DView *)TheTacticalView;
-	if (view == nullptr)
-		return;
+	const Bool inGame = (TheGameLogic != nullptr && TheGameLogic->isInGame());
 
-	// Only drive the battlefield while there is a battlefield: in menus the tactical view is
-	// not meaningful and the controllers must not fling the camera around.
-	if (TheGameLogic == nullptr || !TheGameLogic->isInGame())
-		return;
+	// Locomotion only means something when there is a battlefield to move over. In the menus the
+	// controllers must not fling the tactical camera around behind the player's back.
+	if (inGame && view != nullptr)
+		updateLocomotion(view);
 
-	updateLocomotion(view);
-	updatePointer(view);
+	// Pointing works everywhere: at the menu screen floating in front of the player, at the
+	// wrist panels, and at the battlefield.
+	updatePointer(inGame ? view : nullptr);
 }

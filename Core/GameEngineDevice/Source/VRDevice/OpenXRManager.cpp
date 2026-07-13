@@ -108,8 +108,14 @@ OpenXRManager::OpenXRManager()
 	, m_vkCommandBuffer(VK_NULL_HANDLE)
 	, m_vkFence(VK_NULL_HANDLE)
 	, m_copyInFlight(FALSE)
+	, m_d3d8Device(nullptr)
 	, m_depthSurface(nullptr)
 	, m_eyeImageLayout(VK_IMAGE_LAYOUT_UNDEFINED)
+	, m_uiSwapchain(XR_NULL_HANDLE)
+	, m_uiWidth(0)
+	, m_uiHeight(0)
+	, m_uiInGame(FALSE)
+	, m_uiReady(FALSE)
 	, m_actionSet(XR_NULL_HANDLE)
 	, m_aimPoseAction(XR_NULL_HANDLE)
 	, m_triggerAction(XR_NULL_HANDLE)
@@ -125,6 +131,11 @@ OpenXRManager::OpenXRManager()
 		m_handPaths[i] = XR_NULL_PATH;
 		m_aimSpaces[i] = XR_NULL_HANDLE;
 		m_controllers[i] = VRControllerState();
+	}
+	for (int i = 0; i < UI_PANEL_COUNT; ++i)
+	{
+		m_uiPanels[i] = UiPanel();
+		m_uiPanels[i].pose.orientation.w = 1.0f;
 	}
 	for (int i = 0; i < MAX_EYES; ++i)
 	{
@@ -945,8 +956,338 @@ VkImage OpenXRManager::getVulkanImage(IUnknown* d3d8Resource, VkImageLayout* out
 }
 
 //-------------------------------------------------------------------------------------------------
+// GeneralsVR: the game's own 2D UI in VR.
+//
+// The engine draws its entire interface - menus, command bar, minimap, cursor - as screen-space
+// 2D on top of the flat frame. Rather than re-implementing any of that, we capture the finished
+// backbuffer and hang it in VR: as a cinema screen while in the menus, and as cropped wrist
+// panels during a battle (an OpenXR quad layer can show a sub-rectangle of an image, so the
+// minimap and the command bar are simply two different crops of the same captured frame).
+//-------------------------------------------------------------------------------------------------
+namespace
+{
+	// Rotate a vector by a quaternion.
+	XrVector3f rotate(const XrQuaternionf& q, const XrVector3f& v)
+	{
+		const Real x = q.x, y = q.y, z = q.z, w = q.w;
+		// t = 2 * cross(q.xyz, v); v' = v + w*t + cross(q.xyz, t)
+		const Real tx = 2.0f * (y * v.z - z * v.y);
+		const Real ty = 2.0f * (z * v.x - x * v.z);
+		const Real tz = 2.0f * (x * v.y - y * v.x);
+		XrVector3f out;
+		out.x = v.x + w * tx + (y * tz - z * ty);
+		out.y = v.y + w * ty + (z * tx - x * tz);
+		out.z = v.z + w * tz + (x * ty - y * tx);
+		return out;
+	}
+
+	XrQuaternionf conjugate(const XrQuaternionf& q)
+	{
+		XrQuaternionf out;
+		out.x = -q.x; out.y = -q.y; out.z = -q.z; out.w = q.w;
+		return out;
+	}
+
+	XrQuaternionf multiply(const XrQuaternionf& a, const XrQuaternionf& b)
+	{
+		XrQuaternionf out;
+		out.w = a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z;
+		out.x = a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y;
+		out.y = a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x;
+		out.z = a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w;
+		return out;
+	}
+
+	XrQuaternionf quatFromAxisAngle(Real ax, Real ay, Real az, Real radians)
+	{
+		const Real h = radians * 0.5f;
+		const Real s = sinf(h);
+		XrQuaternionf out;
+		out.x = ax * s; out.y = ay * s; out.z = az * s; out.w = cosf(h);
+		return out;
+	}
+}
+
+Bool OpenXRManager::createUiSwapchain()
+{
+	if (m_d3d8Device == nullptr)
+		return FALSE;
+
+	// Capture at the backbuffer's own size: this is the frame the game already drew.
+	IDirect3DSurface8* backbuffer = nullptr;
+	if (FAILED(m_d3d8Device->GetBackBuffer(0, D3DBACKBUFFER_TYPE_MONO, &backbuffer)) || backbuffer == nullptr)
+	{
+		DEBUG_LOG(("OpenXR: ui: could not get the backbuffer"));
+		return FALSE;
+	}
+	D3DSURFACE_DESC desc = {};
+	backbuffer->GetDesc(&desc);
+	backbuffer->Release();
+
+	m_uiWidth = (Int)desc.Width;
+	m_uiHeight = (Int)desc.Height;
+	if (m_uiWidth <= 0 || m_uiHeight <= 0)
+		return FALSE;
+
+	XrSwapchainCreateInfo swci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+	swci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+	swci.format = VK_FORMAT_B8G8R8A8_SRGB;
+	swci.sampleCount = 1;
+	swci.width = m_uiWidth;
+	swci.height = m_uiHeight;
+	swci.faceCount = 1;
+	swci.arraySize = 1;
+	swci.mipCount = 1;
+
+	if (XR_FAILED(xrCreateSwapchain(m_session, &swci, &m_uiSwapchain)))
+	{
+		DEBUG_LOG(("OpenXR: ui: xrCreateSwapchain failed (%dx%d)", m_uiWidth, m_uiHeight));
+		m_uiSwapchain = XR_NULL_HANDLE;
+		return FALSE;
+	}
+
+	uint32_t imageCount = 0;
+	xrEnumerateSwapchainImages(m_uiSwapchain, 0, &imageCount, nullptr);
+	std::vector<XrSwapchainImageVulkanKHR> images(imageCount);
+	for (uint32_t i = 0; i < imageCount; ++i)
+	{
+		images[i] = XrSwapchainImageVulkanKHR{};
+		images[i].type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR;
+	}
+	if (XR_FAILED(xrEnumerateSwapchainImages(m_uiSwapchain, imageCount, &imageCount,
+		(XrSwapchainImageBaseHeader*)images.data())))
+	{
+		DEBUG_LOG(("OpenXR: ui: swapchain image enumeration failed"));
+		return FALSE;
+	}
+
+	m_uiImages.clear();
+	for (uint32_t i = 0; i < imageCount; ++i)
+		m_uiImages.push_back(images[i].image);
+
+	m_uiReady = TRUE;
+	DEBUG_LOG(("OpenXR: ui: capture swapchain %dx%d, %u images", m_uiWidth, m_uiHeight, imageCount));
+	return TRUE;
+}
+
+//-------------------------------------------------------------------------------------------------
+void OpenXRManager::layoutUiPanels()
+{
+	for (Int i = 0; i < UI_PANEL_COUNT; ++i)
+		m_uiPanels[i].active = FALSE;
+
+	if (!m_uiReady)
+		return;
+
+	if (!m_uiInGame)
+	{
+		// Menus: the whole frame as a cinema screen, straight ahead at eye height. Sized so it
+		// fills a comfortable chunk of the view without forcing the player to sweep their head.
+		UiPanel& p = m_uiPanels[UI_PANEL_SCREEN];
+		p.active = TRUE;
+		p.pose.orientation.x = p.pose.orientation.y = p.pose.orientation.z = 0.0f;
+		p.pose.orientation.w = 1.0f;
+		p.pose.position.x = 0.0f;
+		p.pose.position.y = 0.0f;
+		p.pose.position.z = -2.4f;	// the app space looks down -Z
+		p.widthMeters = 3.0f;
+		p.heightMeters = p.widthMeters * (Real)m_uiHeight / (Real)m_uiWidth;
+		p.cropX = 0;
+		p.cropY = 0;
+		p.cropW = m_uiWidth;
+		p.cropH = m_uiHeight;
+		return;
+	}
+
+	// In a battle: pull the two things you constantly need out of the HUD and hang them off the
+	// wrists, so the battlefield itself stays unobstructed. These crops are fractions of the
+	// game's own layout - the minimap sits bottom-left, the command bar bottom-right.
+	struct WristSpec { Int hand; Real cx0, cy0, cx1, cy1; Real widthMeters; };
+	const WristSpec specs[] =
+	{
+		{ VR_HAND_LEFT,  0.00f, 0.70f, 0.26f, 1.00f, 0.26f },	// minimap
+		{ VR_HAND_RIGHT, 0.62f, 0.66f, 1.00f, 1.00f, 0.30f },	// command bar
+	};
+	const Int panelIds[] = { UI_PANEL_LEFT_WRIST, UI_PANEL_RIGHT_WRIST };
+
+	for (Int i = 0; i < 2; ++i)
+	{
+		const VRControllerState& c = m_controllers[specs[i].hand];
+		if (!c.poseValid)
+			continue;
+
+		UiPanel& p = m_uiPanels[panelIds[i]];
+		p.cropX = (Int)(specs[i].cx0 * m_uiWidth);
+		p.cropY = (Int)(specs[i].cy0 * m_uiHeight);
+		p.cropW = (Int)((specs[i].cx1 - specs[i].cx0) * m_uiWidth);
+		p.cropH = (Int)((specs[i].cy1 - specs[i].cy0) * m_uiHeight);
+		if (p.cropW <= 0 || p.cropH <= 0)
+			continue;
+
+		p.widthMeters = specs[i].widthMeters;
+		p.heightMeters = p.widthMeters * (Real)p.cropH / (Real)p.cropW;
+
+		// Sit the panel just above the controller and tilt it back towards the player, the way
+		// you would tip a wristwatch to read it. The quad faces along its own +Z, and the aim
+		// pose's +Z already points back at the player, so a pitch-up is all it needs.
+		const XrQuaternionf tilt = quatFromAxisAngle(1.0f, 0.0f, 0.0f, -0.9f);	// ~50 degrees
+		p.pose.orientation = multiply(c.quatW == 0.0f && c.quatX == 0.0f ? XrQuaternionf{0,0,0,1}
+			: XrQuaternionf{c.quatX, c.quatY, c.quatZ, c.quatW}, tilt);
+
+		const XrVector3f offsetLocal = { 0.0f, 0.06f, -0.04f };	// up a little, just ahead of the hand
+		const XrQuaternionf handQuat = { c.quatX, c.quatY, c.quatZ, c.quatW };
+		const XrVector3f offsetWorld = rotate(handQuat, offsetLocal);
+		p.pose.position.x = c.posX + offsetWorld.x;
+		p.pose.position.y = c.posY + offsetWorld.y;
+		p.pose.position.z = c.posZ + offsetWorld.z;
+
+		p.active = TRUE;
+	}
+}
+
+//-------------------------------------------------------------------------------------------------
+Bool OpenXRManager::pickUiPanel(Int hand, Int &outScreenX, Int &outScreenY) const
+{
+	if (!m_uiReady || hand < 0 || hand >= VR_HAND_COUNT)
+		return FALSE;
+
+	const VRControllerState& c = m_controllers[hand];
+	if (!c.poseValid)
+		return FALSE;
+
+	const XrQuaternionf handQuat = { c.quatX, c.quatY, c.quatZ, c.quatW };
+	const XrVector3f origin = { c.posX, c.posY, c.posZ };
+	const XrVector3f forwardLocal = { 0.0f, 0.0f, -1.0f };	// controllers point down their -Z
+	const XrVector3f dir = rotate(handQuat, forwardLocal);
+
+	Real bestDistance = 1.0e9f;
+	Bool hit = FALSE;
+
+	for (Int i = 0; i < UI_PANEL_COUNT; ++i)
+	{
+		const UiPanel& p = m_uiPanels[i];
+		if (!p.active)
+			continue;
+
+		// Move the ray into the panel's own frame, where the panel is the z=0 plane.
+		const XrQuaternionf inv = conjugate(p.pose.orientation);
+		const XrVector3f rel = { origin.x - p.pose.position.x,
+		                         origin.y - p.pose.position.y,
+		                         origin.z - p.pose.position.z };
+		const XrVector3f localOrigin = rotate(inv, rel);
+		const XrVector3f localDir = rotate(inv, dir);
+
+		if (fabsf(localDir.z) < 0.0001f)
+			continue;	// parallel to the panel
+
+		const Real t = -localOrigin.z / localDir.z;
+		if (t <= 0.0f || t >= bestDistance)
+			continue;	// behind the hand, or further than a panel we already hit
+
+		const Real hx = localOrigin.x + localDir.x * t;
+		const Real hy = localOrigin.y + localDir.y * t;
+		const Real halfW = p.widthMeters * 0.5f;
+		const Real halfH = p.heightMeters * 0.5f;
+		if (fabsf(hx) > halfW || fabsf(hy) > halfH)
+			continue;	// missed the panel
+
+		// Panel space is +X right, +Y up; image space is +X right, +Y DOWN.
+		const Real u = (hx + halfW) / p.widthMeters;
+		const Real v = 1.0f - (hy + halfH) / p.heightMeters;
+
+		outScreenX = p.cropX + (Int)(u * p.cropW);
+		outScreenY = p.cropY + (Int)(v * p.cropH);
+		bestDistance = t;
+		hit = TRUE;
+	}
+
+	return hit;
+}
+
+//-------------------------------------------------------------------------------------------------
+Bool OpenXRManager::captureUiFrame(UnsignedInt uiImageIndex)
+{
+	if (!m_uiReady || m_d3d8Device == nullptr)
+		return FALSE;
+
+	IDirect3DSurface8* backbuffer = nullptr;
+	if (FAILED(m_d3d8Device->GetBackBuffer(0, D3DBACKBUFFER_TYPE_MONO, &backbuffer)) || backbuffer == nullptr)
+		return FALSE;
+
+	VkImageLayout srcLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	VkImage src = getVulkanImage(backbuffer, &srcLayout);
+	backbuffer->Release();
+
+	if (src == VK_NULL_HANDLE)
+		return FALSE;
+
+	VkImage dst = m_uiImages[uiImageIndex];
+
+	VkImageSubresourceRange range = {};
+	range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	range.levelCount = 1;
+	range.layerCount = 1;
+
+	VkImageMemoryBarrier pre[2] = {};
+	pre[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	pre[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	pre[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	pre[0].oldLayout = srcLayout;
+	pre[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	pre[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	pre[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	pre[0].image = src;
+	pre[0].subresourceRange = range;
+
+	pre[1] = pre[0];
+	pre[1].srcAccessMask = 0;
+	pre[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	pre[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	pre[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	pre[1].image = dst;
+
+	g_vk.cmdPipelineBarrier(m_vkCommandBuffer,
+		VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		0, 0, nullptr, 0, nullptr, 2, pre);
+
+	VkImageCopy copy = {};
+	copy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	copy.srcSubresource.layerCount = 1;
+	copy.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	copy.dstSubresource.layerCount = 1;
+	copy.extent.width = (uint32_t)m_uiWidth;
+	copy.extent.height = (uint32_t)m_uiHeight;
+	copy.extent.depth = 1;
+
+	g_vk.cmdCopyImage(m_vkCommandBuffer,
+		src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		1, &copy);
+
+	VkImageMemoryBarrier post[2] = {};
+	post[0] = pre[0];
+	post[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	post[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	post[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	post[0].newLayout = srcLayout;
+
+	post[1] = pre[1];
+	post[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	post[1].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+	post[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	post[1].newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+	g_vk.cmdPipelineBarrier(m_vkCommandBuffer,
+		VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+		0, 0, nullptr, 0, nullptr, 2, post);
+
+	return TRUE;
+}
+
+//-------------------------------------------------------------------------------------------------
 void OpenXRManager::initGraphics(IDirect3DDevice8* d3d8Device)
 {
+	m_d3d8Device = d3d8Device;
 	if (!isAvailable() || m_session != XR_NULL_HANDLE)
 		return;
 
@@ -972,6 +1313,10 @@ void OpenXRManager::initGraphics(IDirect3DDevice8* d3d8Device)
 		DEBUG_LOG(("OpenXR: eye targets unavailable - VR session runs but stereo is OFF"));
 		return;
 	}
+
+	// The UI panels are a bonus on top of stereo; failing to set them up must not cost us the
+	// battlefield, so this is deliberately not fatal.
+	createUiSwapchain();
 
 	m_stereoReady = TRUE;
 	DEBUG_LOG(("OpenXR: graphics ready - stereo path armed"));
@@ -1021,10 +1366,10 @@ void OpenXRManager::beginFrame()
 		}
 	}
 
-	// A frame was opened last tick but never rendered (game paused, render gated, window
-	// minimised). Close it out with no layers, or the runtime starves waiting for it.
+	// A frame was opened last tick but never finished (game paused, render gated, window
+	// minimised). Close it out, or the runtime starves waiting for it.
 	if (m_frameActive)
-		submitEyes();
+		submitFrame(FALSE);
 
 	if (!m_sessionRunning)
 		return;
@@ -1088,7 +1433,8 @@ void OpenXRManager::beginFrame()
 }
 
 //-------------------------------------------------------------------------------------------------
-Bool OpenXRManager::copyEyesToSwapchains(const UnsignedInt* imageIndices)
+Bool OpenXRManager::recordAndSubmitCopies(const UnsignedInt* imageIndices, Bool captureUi,
+	UnsignedInt uiImageIndex)
 {
 	// Wait for OUR PREVIOUS copy to finish before touching the command buffer again. This has
 	// to happen here, not after submitting: resetting or re-recording a command buffer that the
@@ -1115,7 +1461,7 @@ Bool OpenXRManager::copyEyesToSwapchains(const UnsignedInt* imageIndices)
 	if (g_vk.beginCommandBuffer(m_vkCommandBuffer, &cbBegin) != VK_SUCCESS)
 		return FALSE;
 
-	for (Int eye = 0; eye < m_eyeCount; ++eye)
+	for (Int eye = 0; imageIndices != nullptr && eye < m_eyeCount; ++eye)
 	{
 		// Re-query the eye image each frame: DXVK may recreate the backing image (a device
 		// reset, a resource move), which would leave a cached handle dangling.
@@ -1194,6 +1540,10 @@ Bool OpenXRManager::copyEyesToSwapchains(const UnsignedInt* imageIndices)
 			0, 0, nullptr, 0, nullptr, 2, post);
 	}
 
+	// The game's finished 2D frame rides along in the same command buffer.
+	if (captureUi)
+		captureUiFrame(uiImageIndex);
+
 	if (g_vk.endCommandBuffer(m_vkCommandBuffer) != VK_SUCCESS)
 		return FALSE;
 
@@ -1225,56 +1575,81 @@ Bool OpenXRManager::copyEyesToSwapchains(const UnsignedInt* imageIndices)
 	return TRUE;
 }
 
-//-------------------------------------------------------------------------------------------------
-void OpenXRManager::submitEyes()
+void OpenXRManager::submitFrame(Bool worldRendered)
 {
 	if (!m_frameActive)
 		return;
 
 	XrCompositionLayerProjectionView projViews[MAX_EYES];
-	XrCompositionLayerProjection layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
-	const XrCompositionLayerBaseHeader* layers[1];
+	XrCompositionLayerProjection worldLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+	XrCompositionLayerQuad quadLayers[UI_PANEL_COUNT];
+	const XrCompositionLayerBaseHeader* layers[1 + UI_PANEL_COUNT];
 	uint32_t layerCount = 0;
 
-	Bool copied = FALSE;
-	UnsignedInt imageIndices[MAX_EYES] = {0, 0};
+	layoutUiPanels();
 
-	if (m_stereoReady)
+	// Acquire everything we intend to write this frame, record it all into one command buffer,
+	// then submit once.
+	Bool haveEyes = FALSE;
+	Bool haveUi = FALSE;
+	UnsignedInt eyeIndices[MAX_EYES] = {0, 0};
+	UnsignedInt uiIndex = 0;
+
+	if (m_stereoReady && worldRendered)
 	{
-		Bool acquiredAll = TRUE;
+		haveEyes = TRUE;
 		for (Int eye = 0; eye < m_eyeCount; ++eye)
 		{
 			XrSwapchainImageAcquireInfo acquireInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
 			uint32_t index = 0;
-			if (XR_FAILED(xrAcquireSwapchainImage(m_swapchains[eye], &acquireInfo, &index)))
-			{
-				acquiredAll = FALSE;
-				break;
-			}
-			imageIndices[eye] = index;
-
 			XrSwapchainImageWaitInfo waitInfo = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
 			waitInfo.timeout = XR_INFINITE_DURATION;
-			if (XR_FAILED(xrWaitSwapchainImage(m_swapchains[eye], &waitInfo)))
+			if (XR_FAILED(xrAcquireSwapchainImage(m_swapchains[eye], &acquireInfo, &index))
+				|| XR_FAILED(xrWaitSwapchainImage(m_swapchains[eye], &waitInfo)))
 			{
-				acquiredAll = FALSE;
+				haveEyes = FALSE;
 				break;
 			}
-		}
-
-		if (acquiredAll)
-		{
-			copied = copyEyesToSwapchains(imageIndices);
-
-			for (Int eye = 0; eye < m_eyeCount; ++eye)
-			{
-				XrSwapchainImageReleaseInfo releaseInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-				xrReleaseSwapchainImage(m_swapchains[eye], &releaseInfo);
-			}
+			eyeIndices[eye] = index;
 		}
 	}
 
-	if (copied)
+	Bool anyPanel = FALSE;
+	for (Int i = 0; i < UI_PANEL_COUNT; ++i)
+		anyPanel = anyPanel || m_uiPanels[i].active;
+
+	if (m_uiReady && anyPanel)
+	{
+		XrSwapchainImageAcquireInfo acquireInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+		uint32_t index = 0;
+		XrSwapchainImageWaitInfo waitInfo = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+		waitInfo.timeout = XR_INFINITE_DURATION;
+		if (XR_SUCCEEDED(xrAcquireSwapchainImage(m_uiSwapchain, &acquireInfo, &index))
+			&& XR_SUCCEEDED(xrWaitSwapchainImage(m_uiSwapchain, &waitInfo)))
+		{
+			haveUi = TRUE;
+			uiIndex = index;
+		}
+	}
+
+	const Bool recorded = (haveEyes || haveUi)
+		&& recordAndSubmitCopies(haveEyes ? eyeIndices : nullptr, haveUi, uiIndex);
+
+	if (haveEyes)
+	{
+		for (Int eye = 0; eye < m_eyeCount; ++eye)
+		{
+			XrSwapchainImageReleaseInfo releaseInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+			xrReleaseSwapchainImage(m_swapchains[eye], &releaseInfo);
+		}
+	}
+	if (haveUi)
+	{
+		XrSwapchainImageReleaseInfo releaseInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+		xrReleaseSwapchainImage(m_uiSwapchain, &releaseInfo);
+	}
+
+	if (recorded && haveEyes)
 	{
 		for (Int eye = 0; eye < m_eyeCount; ++eye)
 		{
@@ -1287,11 +1662,36 @@ void OpenXRManager::submitEyes()
 			projViews[eye].subImage.imageRect.extent = {m_eyeWidth, m_eyeHeight};
 		}
 
-		layer.space = m_appSpace;
-		layer.viewCount = (uint32_t)m_eyeCount;
-		layer.views = projViews;
-		layers[0] = (const XrCompositionLayerBaseHeader*)&layer;
-		layerCount = 1;
+		worldLayer.space = m_appSpace;
+		worldLayer.viewCount = (uint32_t)m_eyeCount;
+		worldLayer.views = projViews;
+		layers[layerCount++] = (const XrCompositionLayerBaseHeader*)&worldLayer;
+	}
+
+	if (recorded && haveUi)
+	{
+		// Panels go on top of the world, in the order they were laid out.
+		for (Int i = 0; i < UI_PANEL_COUNT; ++i)
+		{
+			const UiPanel& p = m_uiPanels[i];
+			if (!p.active)
+				continue;
+
+			XrCompositionLayerQuad& q = quadLayers[i];
+			q = XrCompositionLayerQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
+			q.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+			q.space = m_appSpace;
+			q.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+			q.subImage.swapchain = m_uiSwapchain;
+			q.subImage.imageArrayIndex = 0;
+			q.subImage.imageRect.offset = {p.cropX, p.cropY};
+			q.subImage.imageRect.extent = {p.cropW, p.cropH};
+			q.pose = p.pose;
+			q.size.width = p.widthMeters;
+			q.size.height = p.heightMeters;
+
+			layers[layerCount++] = (const XrCompositionLayerBaseHeader*)&q;
+		}
 	}
 
 	XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
@@ -1316,7 +1716,8 @@ void OpenXRManager::submitEyes()
 		++m_framesSubmitted;
 		if ((m_framesSubmitted % 1000) == 0)
 		{
-			DEBUG_LOG(("OpenXR: %u frames submitted (layers=%u)", m_framesSubmitted, layerCount));
+			DEBUG_LOG(("OpenXR: %u frames submitted (layers=%u, ui=%d)",
+				m_framesSubmitted, layerCount, haveUi ? 1 : 0));
 		}
 	}
 	else if (!m_submitFailLogged)
@@ -1334,6 +1735,15 @@ void OpenXRManager::shutdown()
 		g_vk.deviceWaitIdle(m_vkDevice);
 	m_copyInFlight = FALSE;
 	m_stereoReady = FALSE;
+
+	if (m_uiSwapchain != XR_NULL_HANDLE)
+	{
+		xrDestroySwapchain(m_uiSwapchain);
+		m_uiSwapchain = XR_NULL_HANDLE;
+	}
+	m_uiImages.clear();
+	m_uiReady = FALSE;
+	m_d3d8Device = nullptr;
 
 	for (Int eye = 0; eye < MAX_EYES; ++eye)
 	{

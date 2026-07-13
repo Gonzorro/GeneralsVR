@@ -124,10 +124,19 @@ public:
 	IDirect3DSurface8* getEyeSurface(Int eye) const { return m_eyeSurfaces[eye]; }
 	IDirect3DSurface8* getDepthSurface() const { return m_depthSurface; }
 
-	/// Copy the rendered eye render targets into the runtime's swapchain images and submit
-	/// them as a projection layer. Ends the frame either way, so a frame with nothing
-	/// rendered still keeps the session alive.
-	void submitEyes();
+	/// Ends the OpenXR frame. Copies the rendered eye targets into the runtime's swapchains
+	/// (when \a worldRendered) and captures the finished flat frame from the backbuffer to
+	/// show the game's own 2D UI in VR - as a cinema screen in the menus, or as wrist panels
+	/// during a battle. Always ends the frame, so a frame with nothing rendered still keeps
+	/// the session alive.
+	void submitFrame(Bool worldRendered);
+
+	/// Menus get one big screen in front of the player; a battle gets the HUD on the wrists.
+	void setUiInGame(Bool inGame) { m_uiInGame = inGame; }
+
+	/// Cast a hand's aim ray at the UI panels. Returns the pixel in the captured frame that
+	/// the ray lands on, which the engine can feed to the mouse as if it were a real cursor.
+	Bool pickUiPanel(Int hand, Int &outScreenX, Int &outScreenY) const;
 
 	/// World units per real-world metre - the tabletop scale. Head motion and eye separation
 	/// are multiplied by this when composing the VR camera.
@@ -135,6 +144,22 @@ public:
 
 private:
 	enum { MAX_EYES = 2 };
+
+	/// A slab of the game's own 2D frame, floating in VR. \a crop selects the region of the
+	/// captured frame to show, so the minimap and the command bar can be pulled out of the
+	/// finished HUD and hung on the wrists without re-rendering a thing.
+	struct UiPanel
+	{
+		XrPosef pose;                       ///< in the app reference space
+		Real widthMeters, heightMeters;
+		Int cropX, cropY, cropW, cropH;     ///< pixels within the captured frame
+		Bool active;
+	};
+	enum { UI_PANEL_SCREEN = 0, UI_PANEL_LEFT_WRIST = 1, UI_PANEL_RIGHT_WRIST = 2, UI_PANEL_COUNT = 3 };
+
+	Bool createUiSwapchain();
+	void layoutUiPanels();                  ///< place the panels for this frame
+	Bool captureUiFrame(UnsignedInt uiImageIndex);  ///< backbuffer -> UI swapchain image
 
 	Bool hasExtension(const char* name) const;
 	void probeVulkanRequirements();
@@ -148,8 +173,9 @@ private:
 	Bool createVulkanCopyResources();
 	/// VkImage backing a D3D8 texture/surface created by DXVK (via ID3D9VkInteropTexture).
 	VkImage getVulkanImage(IUnknown* d3d8Resource, VkImageLayout* outLayout);
-	/// Record and submit one image copy per eye on DXVK's queue.
-	Bool copyEyesToSwapchains(const UnsignedInt* imageIndices);
+	/// Record the eye copies (when \a imageIndices is given) and the UI capture into one command
+	/// buffer and submit it on DXVK's queue.
+	Bool recordAndSubmitCopies(const UnsignedInt* imageIndices, Bool captureUi, UnsignedInt uiImageIndex);
 
 	XrInstance m_instance;
 	XrSystemId m_systemId;
@@ -203,11 +229,20 @@ private:
 	Bool m_copyInFlight; ///< our copy command buffer is still executing; must not be re-recorded
 
 	// Eye render targets (D3D8 side) and their Vulkan images
+	IDirect3DDevice8* m_d3d8Device;   ///< borrowed; used to fetch the backbuffer each frame
 	IDirect3DTexture8* m_eyeTextures[MAX_EYES];
 	IDirect3DSurface8* m_eyeSurfaces[MAX_EYES];
 	IDirect3DSurface8* m_depthSurface;
 	VkImage m_eyeImages[MAX_EYES];
 	VkImageLayout m_eyeImageLayout;
+
+	// The game's 2D frame, captured from the backbuffer and shown on panels in VR
+	XrSwapchain m_uiSwapchain;
+	std::vector<VkImage> m_uiImages;
+	Int m_uiWidth, m_uiHeight;
+	Bool m_uiInGame;
+	Bool m_uiReady;
+	UiPanel m_uiPanels[UI_PANEL_COUNT];
 
 	UnsignedInt m_framesSubmitted;
 	Bool m_submitFailLogged;

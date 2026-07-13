@@ -391,6 +391,10 @@ W3DDisplay::W3DDisplay()
 {
 	Int i;
 
+#ifdef RTS_HAS_OPENXR
+	m_vrWorldRendered = FALSE;
+#endif
+
 	m_initialized = false;
 	m_assetManager = nullptr;
 	m_3DScene = nullptr;
@@ -1815,6 +1819,14 @@ void W3DDisplay::drawVRScene( W3DView *view )
 		|| view == nullptr)
 		return;
 
+	// In the menus there is no battlefield to render: the player is looking at the game's own
+	// 2D frame on a screen in front of them (see OpenXRManager's UI panels), so rendering two
+	// eyes of empty world would only burn GPU time.
+	const Bool inGame = (TheGameLogic != nullptr && TheGameLogic->isInGame());
+	TheOpenXR->setUiInGame(inGame);
+	if (!inGame)
+		return;
+
 	CameraClass *tacticalCamera = view->get3DCamera();
 	if (tacticalCamera == nullptr || m_3DScene == nullptr)
 		return;
@@ -1888,7 +1900,10 @@ void W3DDisplay::drawVRScene( W3DView *view )
 			(TheVRControls != nullptr && TheVRControls->hasAimPoint()) ? 1 : 0));
 	}
 
-	TheOpenXR->submitEyes();
+	// The frame is NOT submitted here: the game's 2D interface has not been drawn yet. The
+	// OpenXR frame closes at the end of W3DDisplay::draw, once the flat frame (and therefore
+	// the UI we show on the VR panels) is complete.
+	m_vrWorldRendered = TRUE;
 }
 #endif // RTS_HAS_OPENXR
 
@@ -2212,6 +2227,20 @@ AGAIN:
 		}
 
 	} while (freezeTime && !TheTacticalView->isCameraMovementFinished());
+
+#ifdef RTS_HAS_OPENXR
+	// GeneralsVR @feature Close the OpenXR frame here, at the very end: the flat frame is now
+	// complete, so the backbuffer holds the game's own interface (menus, command bar, minimap,
+	// cursor) and can be captured and shown on the VR panels alongside the eyes.
+	if (TheOpenXR != nullptr && TheOpenXR->isFrameActive())
+	{
+		// Decided here rather than in the eye pass, because the eye pass does not run at all in
+		// the menus - and the menus are exactly when we need the screen panel.
+		TheOpenXR->setUiInGame(TheGameLogic != nullptr && TheGameLogic->isInGame());
+		TheOpenXR->submitFrame(m_vrWorldRendered);
+		m_vrWorldRendered = FALSE;
+	}
+#endif
 
 #ifdef EXTENDED_STATS
 	if (DX8Wrapper::stats.m_disableOverhead) {
