@@ -1815,30 +1815,41 @@ void W3DDisplay::drawVRScene( W3DView *view )
 	// isStereoReady() is the hard gate: if any VR resource failed to come up, the session may
 	// still be ticking, but the eye render targets and their depth surface do not exist and
 	// binding them would fault.
-	if (TheOpenXR == nullptr || !TheOpenXR->isStereoReady() || !TheOpenXR->isFrameActive()
-		|| view == nullptr)
+	if (TheOpenXR == nullptr || !TheOpenXR->isStereoReady() || !TheOpenXR->isFrameActive())
 		return;
 
-	// In the menus there is no battlefield to render: the player is looking at the game's own
-	// 2D frame on a screen in front of them (see OpenXRManager's UI panels), so rendering two
-	// eyes of empty world would only burn GPU time.
 	const Bool inGame = (TheGameLogic != nullptr && TheGameLogic->isInGame());
 	TheOpenXR->setUiInGame(inGame);
-	if (!inGame)
-		return;
 
-	CameraClass *tacticalCamera = view->get3DCamera();
-	if (tacticalCamera == nullptr || m_3DScene == nullptr)
-		return;
-
-	const Real scale = TheOpenXR->getWorldUnitsPerMeter();
-
-	// Where the headset floats in the world. Shared with VRControls so the hands and the eyes
-	// are guaranteed to live in the same space - if these two ever disagreed, the controller
-	// rays would not land where the player is pointing.
+	// In the menus there is no battlefield: the player is looking at the game's own 2D frame on
+	// a screen floating in front of them. We still run an eye pass, but it draws ONLY the laser
+	// pointers - without it the player would be aiming at that screen blind. There, the eye
+	// space is plain metres with an identity anchor, which is the same space the screen hangs
+	// in, so the beams land exactly where they appear to.
 	Matrix3D anchor;
-	if (!VRControls::getAnchor(view, anchor))
-		return;
+	Real scale;
+
+	if (inGame)
+	{
+		if (view == nullptr || view->get3DCamera() == nullptr || m_3DScene == nullptr)
+			return;
+
+		scale = TheOpenXR->getWorldUnitsPerMeter();
+
+		// Where the headset floats in the world. Shared with VRControls so the hands and the
+		// eyes are guaranteed to live in the same space - if these two ever disagreed, the
+		// controller rays would not land where the player is pointing.
+		if (!VRControls::getAnchor(view, anchor))
+			return;
+	}
+	else
+	{
+		if (TheVRControls == nullptr || TheVRControls->getRayScene() == nullptr)
+			return;
+
+		anchor.Make_Identity();
+		scale = 1.0f;
+	}
 
 	// One reusable camera for the eye passes; the tactical camera is left untouched so the
 	// monitor pass that follows still renders the normal flat view.
@@ -1869,21 +1880,25 @@ void W3DDisplay::drawVRScene( W3DView *view )
 		Vector2 vMin(tanf(v.angleLeft), tanf(v.angleDown));
 		Vector2 vMax(tanf(v.angleRight), tanf(v.angleUp));
 		vrCamera->Set_View_Plane(vMin, vMax);
-		vrCamera->Set_Clip_Planes(0.05f * scale, 15000.0f);
+		vrCamera->Set_Clip_Planes(inGame ? (0.05f * scale) : 0.02f, inGame ? 15000.0f : 100.0f);
 		vrCamera->Set_Viewport(Vector2(0.0f, 0.0f), Vector2(1.0f, 1.0f));
 
 		DX8Wrapper::Set_Render_Target(eyeSurface, TheOpenXR->getDepthSurface());
 
-		// Deliberately not black: the headset showing this blue means the swapchain path is
-		// healthy and the *scene* is what's empty (in the menus nothing 3D exists to draw -
-		// only the battlefield goes to the headset). Black would mean the copy never landed.
-		if (WW3D::Begin_Render(true, true, Vector3(0.05f, 0.10f, 0.30f)) == WW3D_ERROR_OK)
+		// Menus clear to black - the floating screen provides everything the player looks at, so
+		// anything else here would just be a coloured void behind it.
+		const Vector3 clearColor = inGame ? Vector3(0.05f, 0.10f, 0.30f)
+		                                  : Vector3(0.0f, 0.0f, 0.0f);
+
+		if (WW3D::Begin_Render(true, true, clearColor) == WW3D_ERROR_OK)
 		{
 			vrCamera->Apply();
-			WW3D::Render(m_3DScene, vrCamera);
 
-			// The laser pointers go on top of the battlefield, in the same eye pass, so they
-			// land in the headset (and in the monitor mirror) with correct depth.
+			if (inGame)
+				WW3D::Render(m_3DScene, vrCamera);
+
+			// The laser pointers go on top, in the same eye pass, so they land in the headset
+			// (and in the monitor mirror) with correct depth. In the menus they are all there is.
 			if (TheVRControls != nullptr && TheVRControls->getRayScene() != nullptr)
 				WW3D::Render(TheVRControls->getRayScene(), vrCamera);
 

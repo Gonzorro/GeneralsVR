@@ -63,11 +63,14 @@ namespace
 	const Real MIN_SCALE           = 80.0f;
 	const Real MAX_SCALE           = 4000.0f;
 
-	// Dragging the world. A 1:1 drag makes crossing a big map a chore, so a flick throws the
-	// map and it coasts: the harder you flick, the further it slides.
-	const Real GRAB_GAIN           = 2.2f;   ///< world moves this much further than the hand
-	const Real SLIDE_FRICTION      = 3.2f;   ///< per second; how quickly a throw dies away
-	const Real SLIDE_MIN_SPEED     = 15.0f;  ///< world units per second below which we stop
+	// Dragging the world. The grab is 1:1 - the ground stays stuck to your hand, which is the
+	// whole point of grabbing it - and releasing mid-sweep lets it coast a little further.
+	// Everything here is deliberately tame: a throw that overshoots the map is useless.
+	const Real GRAB_GAIN           = 1.0f;   ///< 1:1. The world stays under your hand.
+	const Real SLIDE_FRICTION      = 7.0f;   ///< per second; a throw dies away in a few tenths
+	const Real SLIDE_MIN_SPEED     = 0.05f;  ///< table-metres per second below which we stop
+	const Real SLIDE_MAX_SPEED     = 2.5f;   ///< table-metres per second; hard ceiling on a throw
+	const Real SLIDE_SMOOTHING     = 0.25f;  ///< how much of each frame's velocity we believe
 
 	const Real RAY_WIDTH_METERS    = 0.004f;
 	const Real RAY_MAX_METERS      = 6.0f;   ///< how far a laser reaches when it hits nothing
@@ -300,6 +303,12 @@ void VRControls::updateLocomotion(W3DView *view)
 			const Vector3 span = handWorld[1] - handWorld[0];
 			m_grabHandSpan = span.Length();
 		}
+
+		// Start the throw measurement from HERE. Without this the first frame of a grab
+		// measures against wherever the camera was last time - possibly another map - and
+		// launches the world at an absurd speed.
+		m_lastCameraPos = m_grabCameraPos;
+		m_slideVelocity.x = m_slideVelocity.y = 0.0f;
 	}
 	m_grabbing[VR_HAND_LEFT] = leftGrab;
 	m_grabbing[VR_HAND_RIGHT] = rightGrab;
@@ -346,29 +355,44 @@ void VRControls::updateLocomotion(W3DView *view)
 			view->lookAt(&pos);
 		}
 
-		// While gripping, remember how fast the map is actually travelling, so that letting go
-		// mid-sweep throws it rather than stopping it dead.
+		// While gripping, track how fast the map is travelling so that letting go mid-sweep lets
+		// it coast on. Measured in TABLE-METRES per second, not world units, so the feel is the
+		// same whether the map is a tabletop or a landscape - a raw world-unit velocity scales
+		// with the zoom and turns into a catapult when you are zoomed out.
 		const Coord3D nowPos = view->getPosition();
 		const Real dtVel = TheFramePacer != nullptr ? TheFramePacer->getUpdateTime() : (1.0f / 90.0f);
-		if (dtVel > 0.0001f)
+		if (dtVel > 0.0001f && scale > 0.0f)
 		{
-			m_slideVelocity.x = (nowPos.x - m_lastCameraPos.x) / dtVel;
-			m_slideVelocity.y = (nowPos.y - m_lastCameraPos.y) / dtVel;
+			const Real instantX = ((nowPos.x - m_lastCameraPos.x) / scale) / dtVel;
+			const Real instantY = ((nowPos.y - m_lastCameraPos.y) / scale) / dtVel;
+
+			// Smoothed: one jittery frame must not become a launch.
+			m_slideVelocity.x += (instantX - m_slideVelocity.x) * SLIDE_SMOOTHING;
+			m_slideVelocity.y += (instantY - m_slideVelocity.y) * SLIDE_SMOOTHING;
+
+			const Real speed = sqrtf(m_slideVelocity.x * m_slideVelocity.x
+				+ m_slideVelocity.y * m_slideVelocity.y);
+			if (speed > SLIDE_MAX_SPEED)
+			{
+				const Real clamp = SLIDE_MAX_SPEED / speed;
+				m_slideVelocity.x *= clamp;
+				m_slideVelocity.y *= clamp;
+			}
 		}
 	}
 	else
 	{
 		m_twoHandGrab = FALSE;
 
-		// Let go and the map keeps going, coasting to a stop - a flick can cross the battlefield.
+		// Let go and the map coasts to a stop.
 		const Real dtSlide = TheFramePacer != nullptr ? TheFramePacer->getUpdateTime() : (1.0f / 90.0f);
 		const Real speed = sqrtf(m_slideVelocity.x * m_slideVelocity.x
 			+ m_slideVelocity.y * m_slideVelocity.y);
 		if (speed > SLIDE_MIN_SPEED)
 		{
 			Coord3D pos = view->getPosition();
-			pos.x += m_slideVelocity.x * dtSlide;
-			pos.y += m_slideVelocity.y * dtSlide;
+			pos.x += m_slideVelocity.x * scale * dtSlide;
+			pos.y += m_slideVelocity.y * scale * dtSlide;
 			view->lookAt(&pos);
 
 			const Real decay = 1.0f - SLIDE_FRICTION * dtSlide;
@@ -549,8 +573,13 @@ void VRControls::applyControlGroup(Int slot, Bool assign)
 	* beam that stops exactly where it lands - on a panel, or on the ground. */
 void VRControls::updateRays(W3DView *view)
 {
-	const Real scale = TheOpenXR->getWorldUnitsPerMeter();
 	const Bool inGame = (TheGameLogic != nullptr && TheGameLogic->isInGame());
+
+	// In a battle the beams live in world units, alongside the battlefield. In the menus there
+	// is no battlefield at all - the eye pass draws the rays and nothing else - so they live in
+	// plain metres, the same space the menu screen hangs in. (W3DDisplay renders the menu eye
+	// pass with an identity anchor and a scale of one, so the two agree.)
+	const Real scale = inGame ? TheOpenXR->getWorldUnitsPerMeter() : 1.0f;
 
 	for (Int hand = 0; hand < 2; ++hand)
 	{
@@ -559,21 +588,32 @@ void VRControls::updateRays(W3DView *view)
 			continue;
 
 		const VRControllerState &c = TheOpenXR->getController(hand);
-		if (!c.poseValid || !inGame)
+		if (!c.poseValid)
 		{
-			// Outside a battle the world is not rendered, so there is nothing to draw the beam
-			// into; the menu screen shows the game's own cursor instead.
 			line->Set_Hidden(true);
 			m_rayVisible[hand] = FALSE;
 			continue;
 		}
 
 		Vector3 origin, dir;
-		if (!computeHandRay(hand, origin, dir))
+		if (inGame)
 		{
-			line->Set_Hidden(true);
-			m_rayVisible[hand] = FALSE;
-			continue;
+			if (!computeHandRay(hand, origin, dir))
+			{
+				line->Set_Hidden(true);
+				m_rayVisible[hand] = FALSE;
+				continue;
+			}
+		}
+		else
+		{
+			// Straight from the controller pose, in metres.
+			Quaternion q(c.quatX, c.quatY, c.quatZ, c.quatW);
+			Matrix3D handPose;
+			Build_Matrix3D(q, handPose);
+			origin = Vector3(c.posX, c.posY, c.posZ);
+			dir = -handPose.Get_Z_Vector();	// controllers point down their -Z
+			dir.Normalize();
 		}
 
 		// Stop the beam where it actually lands: on a panel if one is in the way, otherwise on
@@ -586,7 +626,7 @@ void VRControls::updateRays(W3DView *view)
 		{
 			length = panelDistance * scale;
 		}
-		else
+		else if (inGame)
 		{
 			Coord3D hit;
 			if (traceTerrain(origin, dir, hit))
@@ -704,6 +744,6 @@ void VRControls::update()
 	// wrist panels, and at the battlefield.
 	updatePointer(inGame ? view : nullptr);
 
-	if (view != nullptr)
-		updateRays(view);
+	// The beams are drawn everywhere, including the menus - that is the whole point of them.
+	updateRays(view);
 }
