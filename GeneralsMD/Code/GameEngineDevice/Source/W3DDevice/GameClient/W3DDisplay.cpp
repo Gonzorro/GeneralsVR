@@ -1854,7 +1854,9 @@ void W3DDisplay::composeVRUiPanel()
 
 	if (began == WW3D_ERROR_OK)
 	{
-		DX8Wrapper::Clear(true, false, Vector3(0.0f, 0.0f, 0.0f), 0.0f);
+		// Colour and alpha to nothing - but NOT the stencil, which is carrying the interface's
+		// silhouette from the pass that just drew it.
+		device->Clear(0, nullptr, D3DCLEAR_TARGET, 0x00000000, 1.0f, 0);
 
 		device->SetVertexShader(SCREEN_FVF);
 		device->SetPixelShader(0);
@@ -1873,47 +1875,42 @@ void W3DDisplay::composeVRUiPanel()
 		device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
 		device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
 
-		// Everything below is done WITHOUT masking the colour channels.
-		//
-		// The first version of this leaned on COLORWRITEENABLE to touch alpha while leaving colour
-		// alone. If the driver quietly ignores that mask - and this one appears to - the alpha
-		// never gets built up and the panel stays exactly as see-through as it was, which is the
-		// symptom we had. The masks are gone. Every pass below is arranged so that what it writes
-		// to the colour channels is harmless on its own terms.
+		// Only where the interface actually painted. The stencil carries its silhouette, marked
+		// pixel by pixel as it was drawn - which is the one description of its shape that does not
+		// depend on an alpha channel it never wrote.
+		device->SetRenderState(D3DRS_STENCILENABLE, TRUE);
+		device->SetRenderState(D3DRS_STENCILFUNC, D3DCMP_EQUAL);
+		device->SetRenderState(D3DRS_STENCILREF, 1);
+		device->SetRenderState(D3DRS_STENCILMASK, 0xFF);
+		device->SetRenderState(D3DRS_STENCILWRITEMASK, 0x00);
+		device->SetRenderState(D3DRS_STENCILPASS, D3DSTENCILOP_KEEP);
+		device->SetRenderState(D3DRS_STENCILFAIL, D3DSTENCILOP_KEEP);
+		device->SetRenderState(D3DRS_STENCILZFAIL, D3DSTENCILOP_KEEP);
 
-		// ---- 1. THE BLACK COPY. Colour is pure black, taken from the texture factor. The SHAPE
-		// is the interface's own alpha, so the copy fits it exactly - to the pixel, because it is
-		// a copy of it.
+		// ---- 1. THE BLACK COPY: solid black, fully opaque, in the interface's exact shape.
 		device->SetRenderState(D3DRS_TEXTUREFACTOR, 0xFF000000);
 		device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
 		device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
 		device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TFACTOR);
 		device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
-		device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+		device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TFACTOR);
 		device->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, quad, sizeof(ScreenVertex));
 
-		// ---- 2. MAKE THE COPY SOLID. Its shape is right, but it inherited the interface's thin
-		// alpha, so it is as see-through as the thing it is meant to be backing. Drawn again,
-		// additively: the colour being added is BLACK, which adds nothing at all, while the alpha
-		// adds to itself. Four more passes and anything the interface touched is solid, while the
-		// space it never touched is still adding zero to zero.
+		// ---- 2. THE INTERFACE ITSELF, standing on its own black copy. Its colour is laid over the
+		// backing and the backing's opacity is kept: an interface with no alpha of its own cannot
+		// take any away.
 		device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
 		device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
-		device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
-		for (Int pass = 0; pass < 4; ++pass)
-			device->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, quad, sizeof(ScreenVertex));
-
-		// ---- 3. THE INTERFACE ITSELF, standing on its black copy. Its colour arrives already
-		// multiplied by its own alpha (that is what came out of the draw), so it is laid over the
-		// backing as-is. The alpha underneath is solid, and this leaves it solid: a over 1 is 1.
-		device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
-		device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+		device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ZERO);
 		device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
 		device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+		device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+		device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TFACTOR);	// stay opaque
 		device->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, quad, sizeof(ScreenVertex));
 
 		// Hand the device back the way we found it.
 		device->SetTexture(0, nullptr);
+		device->SetRenderState(D3DRS_STENCILENABLE, FALSE);
 		device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
 		device->SetRenderState(D3DRS_ZENABLE, TRUE);
 		device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
@@ -2188,17 +2185,45 @@ void W3DDisplay::drawVRScene( W3DView *view )
 
 		if (WW3D::Begin_Render(false, false, Vector3(0.0f, 0.0f, 0.0f)) == WW3D_ERROR_OK)
 		{
-			// Black, but TRANSPARENT. What makes the sprites solid is the alpha pass below, not
-			// the clear: it raises the alpha wherever the interface painted and leaves the rest at
-			// zero. Clearing to opaque instead gave every pixel a backing - including the millions
-			// the interface never touched - and the menu became a rectangle of screen hanging in
-			// the air. Black is still the right colour, because the sprites end up composited over
-			// it, and that is exactly the black backing they need.
-			DX8Wrapper::Clear(true, false, Vector3(0.0f, 0.0f, 0.0f), 0.0f);
+			IDirect3DDevice8 *dev = DX8Wrapper::_Get_D3D_Device8();
+
+			// THE INTERFACE LEAVES NO ALPHA BEHIND. That one fact explains every failed attempt at
+			// giving this panel a backing: the engine's 2D drawing writes colour into the target
+			// and nothing usable into the alpha channel, so the menu reaches the compositor as a
+			// ghost - and every trick that tried to build a backing from that alpha was masking
+			// with a mask that does not exist.
+			//
+			// So the shape is taken from the STENCIL instead. Every pixel the interface touches is
+			// marked as it is drawn, and the mark is the menu's exact silhouette - no alpha
+			// required, and nothing to guess at.
+			if (dev != nullptr)
+			{
+				dev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_STENCIL, 0x00000000, 1.0f, 0);
+
+				dev->SetRenderState(D3DRS_STENCILENABLE, TRUE);
+				dev->SetRenderState(D3DRS_STENCILFUNC, D3DCMP_ALWAYS);
+				dev->SetRenderState(D3DRS_STENCILREF, 1);
+				dev->SetRenderState(D3DRS_STENCILMASK, 0xFF);
+				dev->SetRenderState(D3DRS_STENCILWRITEMASK, 0xFF);
+				dev->SetRenderState(D3DRS_STENCILPASS, D3DSTENCILOP_REPLACE);
+				dev->SetRenderState(D3DRS_STENCILFAIL, D3DSTENCILOP_KEEP);
+				dev->SetRenderState(D3DRS_STENCILZFAIL, D3DSTENCILOP_KEEP);
+				DX8Wrapper::Invalidate_Cached_Render_States();
+			}
+			else
+			{
+				DX8Wrapper::Clear(true, false, Vector3(0.0f, 0.0f, 0.0f), 0.0f);
+			}
 
 			TheInGameUI->DRAW();	// this repaints the whole window system, menus included
 			if (TheMouse != nullptr)
 				TheMouse->DRAW();
+
+			if (dev != nullptr)
+			{
+				dev->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+				DX8Wrapper::Invalidate_Cached_Render_States();
+			}
 
 			WW3D::End_Render(false);
 		}
