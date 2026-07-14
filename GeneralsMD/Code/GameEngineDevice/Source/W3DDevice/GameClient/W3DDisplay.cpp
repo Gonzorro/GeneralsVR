@@ -1798,6 +1798,78 @@ void W3DDisplay::step()
 }
 
 #ifdef RTS_HAS_OPENXR
+// W3DDisplay::blackenVRUiBacking =============================================
+/** GeneralsVR @feature Put a black copy of the interface behind the interface.
+	*
+	* The sprites the game draws carry only a partial alpha, so in VR the battlefield shone right
+	* through the buttons. A rectangle of black behind the panel cures that and ruins everything
+	* else: the menu stops being a menu and becomes a screen hanging in the air.
+	*
+	* What is wanted is a backing shaped EXACTLY like the interface - and the interface is already
+	* sitting in the target. So darken what is there, in place, in proportion to how thin it is:
+	* solid sprites are left alone, and see-through ones are pulled towards black instead of
+	* towards the battlefield. It fits the sprites perfectly because it is made of them.
+	*/
+//=============================================================================
+void W3DDisplay::blackenVRUiBacking()
+{
+	IDirect3DDevice8 *device = DX8Wrapper::_Get_D3D_Device8();
+	if (device == nullptr)
+		return;
+
+	struct ScreenVertex { Real x, y, z, rhw; DWORD color; };
+	const DWORD SCREEN_FVF = D3DFVF_XYZRHW | D3DFVF_DIFFUSE;
+
+	const Real w = (Real)getWidth();
+	const Real h = (Real)getHeight();
+	const DWORD black = 0xFF000000;
+
+	ScreenVertex quad[4] =
+	{
+		{ 0.0f, 0.0f, 0.0f, 1.0f, black },
+		{ w,    0.0f, 0.0f, 1.0f, black },
+		{ w,    h,    0.0f, 1.0f, black },
+		{ 0.0f, h,    0.0f, 1.0f, black },
+	};
+
+	device->SetVertexShader(SCREEN_FVF);
+	device->SetPixelShader(0);
+	device->SetTexture(0, nullptr);
+
+	device->SetRenderState(D3DRS_LIGHTING, FALSE);
+	device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+	device->SetRenderState(D3DRS_ZENABLE, FALSE);
+	device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+	device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+	device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+
+	// Colour only. The alpha channel is the next pass's business.
+	device->SetRenderState(D3DRS_COLORWRITEENABLE, D3DCOLORWRITEENABLE_RED
+		| D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE);
+
+	// Weighted by how transparent the pixel already is: solid sprites keep their colour, thin
+	// ones get black mixed in behind them.
+	device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+	device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_INVDESTALPHA);
+	device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
+
+	device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+	device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+	device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+	device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
+	device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+	device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+
+	device->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, quad, sizeof(ScreenVertex));
+
+	device->SetRenderState(D3DRS_COLORWRITEENABLE, D3DCOLORWRITEENABLE_RED
+		| D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE | D3DCOLORWRITEENABLE_ALPHA);
+	device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+	device->SetRenderState(D3DRS_ZENABLE, TRUE);
+	device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+	DX8Wrapper::Invalidate_Cached_Render_States();
+}
+
 // W3DDisplay::solidifyVRUiAlpha ==============================================
 /** GeneralsVR @feature Make the interface solid in VR.
 	*
@@ -2111,12 +2183,6 @@ void W3DDisplay::drawVRScene( W3DView *view )
 
 			// The laser pointers go on top, in the same eye pass, so they land in the headset
 			// (and in the monitor mirror) with correct depth. In the menus they are all there is.
-			// The panels go down BEFORE the beams. They are solid geometry and write depth; the
-			// beams are alpha-blended lines, which do not. Drawn the other way round, the panel
-			// passed the depth test over the top of the laser and simply painted it out - which
-			// is precisely what "the ray does not reach the menu" looked like.
-			drawVRPanels(anchor, scale);
-
 			if (TheVRControls != nullptr && TheVRControls->getRayScene() != nullptr)
 				WW3D::Render(TheVRControls->getRayScene(), vrCamera);
 
@@ -2153,6 +2219,11 @@ void W3DDisplay::drawVRScene( W3DView *view )
 			if (TheMouse != nullptr)
 				TheMouse->DRAW();
 
+			// Stand a BLACK COPY of the interface behind itself. The sprites carry only a partial
+			// alpha, so the battlefield shone through the buttons; a backing shaped exactly like
+			// the interface - because it is MADE of the interface - gives every sprite something
+			// solid to sit on without putting a rectangle anywhere.
+			blackenVRUiBacking();
 			solidifyVRUiAlpha();
 
 			WW3D::End_Render(false);

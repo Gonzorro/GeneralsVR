@@ -98,6 +98,8 @@ public:
 	/// The VR panel blends on that alpha, and the engine only leaves a partial one behind - which
 	/// is why the menu came out see-through.
 	void solidifyVRUiAlpha();
+	/// Stand a black copy of the interface behind itself, shaped exactly like it.
+	void blackenVRUiBacking();
 	Bool m_vrWorldRendered;  ///< did the eye pass run this frame?
 #endif
 
