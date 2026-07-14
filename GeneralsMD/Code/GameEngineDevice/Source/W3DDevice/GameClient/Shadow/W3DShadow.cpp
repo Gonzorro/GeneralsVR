@@ -213,9 +213,17 @@ Shadow *W3DShadowManager::addShadow( RenderObjClass *robj, Shadow::ShadowTypeInf
 	if (TheGlobalData != nullptr && TheGlobalData->m_vrMode && type == SHADOW_VOLUME
 		&& TheW3DProjectedShadowManager != nullptr)
 	{
+		// "shadows" -> shadows.tga -> Art\Textures\shadows.dds, a file the game actually ships.
+		//
+		// The obvious move was to leave the name empty and let the manager reach for its own default.
+		// Its default is "shadow.tga", and THERE IS NO SUCH FILE in Zero Hour - the only shadow
+		// textures shipped are shadows.dds and shadowd.dds. A missing texture comes back white, and
+		// white through a modulate blend is perfectly invisible. So the decals were created, enabled
+		// and drawn - the log said DRAWN=8 - and not one pixel of them could ever have appeared.
+		// Name a file that is really there.
 		Shadow::ShadowTypeInfo vrInfo;
 		vrInfo.m_type = SHADOW_DECAL;
-		vrInfo.m_ShadowName[0] = '\0';   // empty: the manager falls back to its own default decal
+		strlcpy(vrInfo.m_ShadowName, "shadows", ARRAY_SIZE(vrInfo.m_ShadowName));
 		vrInfo.allowUpdates = FALSE;     // the image never changes, so it is never re-rendered
 		vrInfo.allowWorldAlign = TRUE;   // let it wrap over the ground it lands on
 		vrInfo.m_sizeX = 0.0f;           // zero: take the size from the object's bounding box

@@ -101,6 +101,7 @@ private:
 	void jumpToSelection();
 	void updateUiCrop();
 	Bool m_placing;
+	Bool m_placeArmed;             ///< the trigger has been LET GO of since placement began
 	UnsignedInt m_placePressTime;  ///< when the trigger went down; 0 when not placing
 	Bool m_placeTurning;           ///< held long enough that the building now turns with the beam
 	Coord3D m_placeAnchor;         ///< where it pinned itself when the trigger went down

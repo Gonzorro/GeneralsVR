@@ -169,6 +169,7 @@ VRControls::VRControls()
 	m_boxing = FALSE;
 	m_boxArmed = FALSE;
 	m_placing = FALSE;
+	m_placeArmed = FALSE;
 	m_placePressTime = 0;
 	m_placeTurning = FALSE;
 	m_placeAnchor.zero();
@@ -437,11 +438,31 @@ void VRControls::updatePlacement(const Vector3 &origin, const Vector3 &dir)
 	{
 		if (m_placing)
 		{
+			// Leave nothing behind. A press time left lying around here is a press time that is
+			// already hundreds of milliseconds old the next time a building is picked up - which
+			// reads as 'held long enough to turn' the instant placement begins.
 			m_placing = FALSE;
+			m_placeTurning = FALSE;
+			m_placePressTime = 0;
+			m_placeArmed = FALSE;
+			if (TheWritableGlobalData != nullptr)
+				TheWritableGlobalData->m_vrPlaceAngleValid = FALSE;
 			updateBoxVisual(FALSE);
 		}
 		return;
 	}
+
+	// THE TRIGGER THAT PICKED THE BUILDING IS NOT THE TRIGGER THAT PLACES IT.
+	//
+	// The building is chosen by pulling the trigger on the menu, and that trigger is still down when
+	// placement begins a frame later. Taken as the placement press it starts the hold timer at once,
+	// pinned to wherever the beam happened to cross the ground on its way to the menu - so half a
+	// second later the building is spinning, anchored to a spot the player never chose, and there is
+	// no way to commit it. Which is exactly what it did.
+	//
+	// So placement will not listen to a trigger it never saw go down: the player must LET GO first.
+	if (!m_placing)
+		m_placeArmed = FALSE;
 
 	m_placing = TRUE;
 
@@ -460,6 +481,13 @@ void VRControls::updatePlacement(const Vector3 &origin, const Vector3 &dir)
 	// turns to follow the laser - sweep the beam around it like a compass needle, release to
 	// commit. The threshold is what separates the two, and it costs a tap nothing.
 	const UnsignedInt HOLD_TO_TURN_MS = 500;
+
+	// Let go of the menu's trigger, and from here on the trigger is the placement's own.
+	if (!right.trigger)
+		m_placeArmed = TRUE;
+
+	if (!m_placeArmed)
+		return;
 
 	if (right.triggerPressed)
 	{
