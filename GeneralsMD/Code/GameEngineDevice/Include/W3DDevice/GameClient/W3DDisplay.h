@@ -100,6 +100,8 @@ public:
 	void solidifyVRUiAlpha();
 	/// Stand a black copy of the interface behind itself, shaped exactly like it.
 	void blackenVRUiBacking();
+	/// Duplicate the interface, blacken the copy, and stand the interface back on top of it.
+	void composeVRUiPanel();
 	Bool m_vrWorldRendered;  ///< did the eye pass run this frame?
 #endif
 

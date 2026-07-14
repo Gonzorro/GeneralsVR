@@ -166,6 +166,11 @@ public:
 	IDirect3DSurface8* getUiSurface() const { return m_uiSurface; }
 	Bool hasUiSurface() const { return m_uiSurface != nullptr; }
 
+	/// Where the finished panel is composed: a black copy of the interface, with the interface
+	/// itself standing on top of it. This is what the headset actually sees.
+	IDirect3DSurface8* getUiCompositeSurface() const { return m_uiCompositeSurface; }
+	IDirect3DTexture8* getUiTexture() const { return m_uiTexture; }
+
 	/// While a movie plays there IS no interface to draw - the film is painted straight to the
 	/// backbuffer - so the VR screen shows the finished flat frame instead. Without this the
 	/// headset just holds the last thing it saw while the intro plays on the monitor.
@@ -189,7 +194,6 @@ public:
 	Int getPanelCount() const { return UI_PANEL_COUNT; }
 	Bool getPanelInfo(Int index, VRPanelInfo &out) const;
 
-	IDirect3DTexture8* getUiTexture() const { return m_uiTexture; }
 	IDirect3DTexture8* getGroupBarTexture() const { return m_groupBarTexture; }
 
 	/// The control-group bar the engine draws for us (10 slots), shown on the wrist panel.
@@ -317,6 +321,8 @@ private:
 	std::vector<VkImage> m_uiImages;
 	IDirect3DTexture8* m_uiTexture;   ///< the engine draws the real interface here
 	IDirect3DSurface8* m_uiSurface;
+	IDirect3DTexture8* m_uiCompositeTexture;  ///< black copy + interface, composed
+	IDirect3DSurface8* m_uiCompositeSurface;
 	Int m_uiWidth, m_uiHeight;
 	Bool m_uiInGame;
 	Bool m_uiReady;

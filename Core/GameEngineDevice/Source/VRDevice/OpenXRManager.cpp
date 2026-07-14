@@ -114,6 +114,8 @@ OpenXRManager::OpenXRManager()
 	, m_uiSwapchain(XR_NULL_HANDLE)
 	, m_uiTexture(nullptr)
 	, m_uiSurface(nullptr)
+	, m_uiCompositeTexture(nullptr)
+	, m_uiCompositeSurface(nullptr)
 	, m_uiWidth(0)
 	, m_uiHeight(0)
 	, m_uiInGame(FALSE)
@@ -1151,6 +1153,17 @@ Bool OpenXRManager::createUiSwapchain()
 	if (FAILED(m_uiTexture->GetSurfaceLevel(0, &m_uiSurface)))
 		return FALSE;
 
+	// And this is where the black copy and the interface are put together. It has to be a
+	// separate target: a texture cannot be read and written in the same draw.
+	if (FAILED(m_d3d8Device->CreateTexture(m_uiWidth, m_uiHeight, 1, D3DUSAGE_RENDERTARGET,
+		D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &m_uiCompositeTexture)))
+	{
+		DEBUG_LOG(("OpenXR: ui: composite CreateTexture failed"));
+		return FALSE;
+	}
+	if (FAILED(m_uiCompositeTexture->GetSurfaceLevel(0, &m_uiCompositeSurface)))
+		return FALSE;
+
 	XrSwapchainCreateInfo swci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
 	swci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
 	swci.format = VK_FORMAT_B8G8R8A8_SRGB;
@@ -1608,8 +1621,9 @@ Bool OpenXRManager::captureUiFrame(UnsignedInt uiImageIndex)
 	if (!m_uiReady || m_uiTexture == nullptr)
 		return FALSE;
 
-	// Normally the engine's freshly drawn interface. While a movie plays there is no interface -
-	// the film goes straight to the backbuffer - so we show the finished flat frame instead.
+	// The composed panel: a black copy of the interface with the interface standing on it. While
+	// a movie plays there is no interface at all - the film goes straight to the backbuffer - so
+	// we show the finished flat frame instead.
 	VkImageLayout srcLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 	VkImage src = VK_NULL_HANDLE;
 
@@ -1625,7 +1639,7 @@ Bool OpenXRManager::captureUiFrame(UnsignedInt uiImageIndex)
 	}
 
 	if (src == VK_NULL_HANDLE)
-		src = getVulkanImage(m_uiTexture, &srcLayout);
+		src = getVulkanImage(m_uiCompositeTexture, &srcLayout);
 
 	if (src == VK_NULL_HANDLE)
 		return FALSE;
@@ -2204,6 +2218,8 @@ void OpenXRManager::shutdown()
 	m_uiImages.clear();
 	if (m_uiSurface != nullptr) { m_uiSurface->Release(); m_uiSurface = nullptr; }
 	if (m_uiTexture != nullptr) { m_uiTexture->Release(); m_uiTexture = nullptr; }
+	if (m_uiCompositeSurface != nullptr) { m_uiCompositeSurface->Release(); m_uiCompositeSurface = nullptr; }
+	if (m_uiCompositeTexture != nullptr) { m_uiCompositeTexture->Release(); m_uiCompositeTexture = nullptr; }
 	m_uiReady = FALSE;
 
 	if (m_groupBarSwapchain != XR_NULL_HANDLE)

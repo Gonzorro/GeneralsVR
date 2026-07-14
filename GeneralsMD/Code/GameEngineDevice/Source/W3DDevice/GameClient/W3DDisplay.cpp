@@ -1798,6 +1798,118 @@ void W3DDisplay::step()
 }
 
 #ifdef RTS_HAS_OPENXR
+// W3DDisplay::composeVRUiPanel ===============================================
+/** GeneralsVR @feature Duplicate the interface, blacken the copy, put it behind the original.
+	*
+	* The sprites the game draws carry only a partial alpha, so in VR the battlefield shone right
+	* through the buttons. Every trick that fixes that by painting a shape - a rectangle, a strip,
+	* a crop - is wrong, because the interface is not a rectangle: it is a ragged arrangement of
+	* panels and bevels with holes in it, and a box around it looks like a box around it.
+	*
+	* So the backing is the interface. The finished interface is copied into this target twice:
+	* once flattened to pure black, to be the thing behind, and once as itself, standing on top.
+	* The black copy has the interface's shape to the pixel, because it is a copy of it.
+	*/
+//=============================================================================
+void W3DDisplay::composeVRUiPanel()
+{
+	if (TheOpenXR == nullptr || !TheOpenXR->hasUiSurface())
+		return;
+
+	IDirect3DDevice8 *device = DX8Wrapper::_Get_D3D_Device8();
+	IDirect3DSurface8 *target = TheOpenXR->getUiCompositeSurface();
+	IDirect3DTexture8 *source = TheOpenXR->getUiTexture();
+	if (device == nullptr || target == nullptr || source == nullptr)
+		return;
+
+	struct ScreenVertex { Real x, y, z, rhw; Real u, v; };
+	const DWORD SCREEN_FVF = D3DFVF_XYZRHW | D3DFVF_TEX1;
+
+	const Real w = (Real)getWidth();
+	const Real h = (Real)getHeight();
+
+	// Half-texel offset, so the copy lands on the pixels it came from.
+	ScreenVertex quad[4] =
+	{
+		{ -0.5f,     -0.5f,     0.0f, 1.0f, 0.0f, 0.0f },
+		{ w - 0.5f,  -0.5f,     0.0f, 1.0f, 1.0f, 0.0f },
+		{ w - 0.5f,  h - 0.5f,  0.0f, 1.0f, 1.0f, 1.0f },
+		{ -0.5f,     h - 0.5f,  0.0f, 1.0f, 0.0f, 1.0f },
+	};
+
+	DX8Wrapper::Set_Render_Target(target, true);
+
+	if (WW3D::Begin_Render(false, false, Vector3(0.0f, 0.0f, 0.0f)) == WW3D_ERROR_OK)
+	{
+		DX8Wrapper::Clear(true, false, Vector3(0.0f, 0.0f, 0.0f), 0.0f);
+
+		device->SetVertexShader(SCREEN_FVF);
+		device->SetPixelShader(0);
+		device->SetTexture(0, source);
+
+		device->SetRenderState(D3DRS_LIGHTING, FALSE);
+		device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+		device->SetRenderState(D3DRS_ZENABLE, FALSE);
+		device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+		device->SetRenderState(D3DRS_FOGENABLE, FALSE);
+		device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+		device->SetTextureStageState(0, D3DTSS_MINFILTER, D3DTEXF_POINT);
+		device->SetTextureStageState(0, D3DTSS_MAGFILTER, D3DTEXF_POINT);
+		device->SetTextureStageState(0, D3DTSS_ADDRESSU, D3DTADDRESS_CLAMP);
+		device->SetTextureStageState(0, D3DTSS_ADDRESSV, D3DTADDRESS_CLAMP);
+		device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+		device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+
+		// ---- 1. THE BLACK COPY. Colour comes from the texture factor (pure black); the SHAPE
+		// comes from the interface's own alpha. Written straight in, replacing nothing.
+		device->SetRenderState(D3DRS_TEXTUREFACTOR, 0xFF000000);
+		device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+		device->SetRenderState(D3DRS_COLORWRITEENABLE, D3DCOLORWRITEENABLE_RED
+			| D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE | D3DCOLORWRITEENABLE_ALPHA);
+		device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+		device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TFACTOR);
+		device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+		device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+		device->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, quad, sizeof(ScreenVertex));
+
+		// ---- 2. Make that copy SOLID. Its shape is right but it inherited the interface's thin
+		// alpha, so it would be as see-through as the thing it is meant to be backing. Add the
+		// alpha to itself a few times and anything the interface touched at all becomes opaque,
+		// while the empty space it never touched stays exactly zero.
+		device->SetRenderState(D3DRS_COLORWRITEENABLE, D3DCOLORWRITEENABLE_ALPHA);
+		device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+		device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
+		device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
+		for (Int pass = 0; pass < 4; ++pass)
+			device->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, quad, sizeof(ScreenVertex));
+
+		// ---- 3. THE INTERFACE ITSELF, standing on its black copy. Colour only: the alpha
+		// underneath is already solid and must not be touched.
+		device->SetRenderState(D3DRS_COLORWRITEENABLE, D3DCOLORWRITEENABLE_RED
+			| D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE);
+		device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);          // the interface arrives
+		device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA); // premultiplied already
+		device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+		device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+		device->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, quad, sizeof(ScreenVertex));
+
+		// Hand the device back the way we found it.
+		device->SetTexture(0, nullptr);
+		device->SetRenderState(D3DRS_COLORWRITEENABLE, D3DCOLORWRITEENABLE_RED
+			| D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE | D3DCOLORWRITEENABLE_ALPHA);
+		device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+		device->SetRenderState(D3DRS_ZENABLE, TRUE);
+		device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+		device->SetTextureStageState(0, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
+		device->SetTextureStageState(0, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
+		DX8Wrapper::Invalidate_Cached_Render_States();
+
+		WW3D::End_Render(false);
+	}
+
+	DX8Wrapper::Set_Render_Target((IDirect3DSurface8 *)nullptr);
+}
+
 // W3DDisplay::blackenVRUiBacking =============================================
 /** GeneralsVR @feature Put a black copy of the interface behind the interface.
 	*
@@ -2219,17 +2331,15 @@ void W3DDisplay::drawVRScene( W3DView *view )
 			if (TheMouse != nullptr)
 				TheMouse->DRAW();
 
-			// Stand a BLACK COPY of the interface behind itself. The sprites carry only a partial
-			// alpha, so the battlefield shone through the buttons; a backing shaped exactly like
-			// the interface - because it is MADE of the interface - gives every sprite something
-			// solid to sit on without putting a rectangle anywhere.
-			blackenVRUiBacking();
-			solidifyVRUiAlpha();
-
 			WW3D::End_Render(false);
 		}
 
 		DX8Wrapper::Set_Render_Target((IDirect3DSurface8 *)nullptr);
+
+		// Now take that finished interface, make a BLACK COPY of it, and stand the interface back
+		// on top of its own copy. The backing is the interface's exact shape because it IS the
+		// interface - no rectangle, no box, nothing but the sprites and their own shadow.
+		composeVRUiPanel();
 	}
 
 	// The control-group bar is our own drawing, so it has to be refreshed while we still own the
