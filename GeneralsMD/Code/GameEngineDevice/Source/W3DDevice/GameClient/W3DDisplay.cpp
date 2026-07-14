@@ -1983,6 +1983,7 @@ void W3DDisplay::dumpVRUiPixels()
 	struct Probe { const char *what; Int x, y; };
 	const Probe probes[] =
 	{
+		{ "MARKER(red)",  150, 150 },
 		{ "control bar", w / 2, (Int)(h * 0.93f) },
 		{ "minimap",     (Int)(w * 0.08f), (Int)(h * 0.90f) },
 		{ "empty sky",   w / 2, (Int)(h * 0.20f) },
@@ -2023,7 +2024,7 @@ void W3DDisplay::dumpVRUiPixels()
 			continue;
 		}
 
-		for (Int i = 0; i < 3; ++i)
+		for (Int i = 0; i < 4; ++i)
 		{
 			const UnsignedByte *row = (const UnsignedByte *)locked.pBits + probes[i].y * locked.Pitch;
 			const UnsignedInt pixel = ((const UnsignedInt *)row)[probes[i].x];
@@ -2330,6 +2331,9 @@ void W3DDisplay::drawVRScene( W3DView *view )
 			{
 				DX8Wrapper::Clear(true, false, Vector3(0.0f, 0.0f, 0.0f), 0.0f);
 			}
+
+			// A known marker, drawn with the same 2D call the interface itself uses.
+			drawFillRect(100, 100, 200, 200, GameMakeColor(255, 0, 0, 255));
 
 			TheInGameUI->DRAW();	// this repaints the whole window system, menus included
 			if (TheMouse != nullptr)
