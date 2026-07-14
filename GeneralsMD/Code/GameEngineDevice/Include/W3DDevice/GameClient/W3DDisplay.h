@@ -97,9 +97,6 @@ public:
 	/// Duplicate the interface, blacken the copy, and stand the interface back on top of it, so
 	/// the panel's backing is the menu's own silhouette rather than a box drawn around it.
 	void composeVRUiPanel();
-	/// Read back what is actually IN the interface and composed targets, and what depth-stencil we
-	/// are drawing against. Three rewrites have looked right on paper and done nothing on screen.
-	void dumpVRUiPixels();
 	Bool m_vrWorldRendered;  ///< did the eye pass run this frame?
 #endif
 

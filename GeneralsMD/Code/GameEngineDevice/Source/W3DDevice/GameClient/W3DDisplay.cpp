@@ -1841,17 +1841,6 @@ void W3DDisplay::composeVRUiPanel()
 
 	const WW3DErrorType began = WW3D::Begin_Render(false, false, Vector3(0.0f, 0.0f, 0.0f));
 
-	// This has now failed twice while looking correct on paper, so it reports for itself. If the
-	// panel is still see-through and this says the pass ran, the fault is in the blending; if it
-	// says the pass never ran, the fault is here.
-	static Bool reported = FALSE;
-	if (!reported)
-	{
-		reported = TRUE;
-		DEBUG_LOG(("OpenXR: ui composite: begin=%d target=%p source=%p",
-			(int)began, target, source));
-	}
-
 	if (began == WW3D_ERROR_OK)
 	{
 		// Colour and alpha to nothing - but NOT the stencil, which is carrying the interface's
@@ -1887,14 +1876,12 @@ void W3DDisplay::composeVRUiPanel()
 		device->SetRenderState(D3DRS_STENCILFAIL, D3DSTENCILOP_KEEP);
 		device->SetRenderState(D3DRS_STENCILZFAIL, D3DSTENCILOP_KEEP);
 
-		// ---- 1. THE BACKING. RED for this run, and this time the test means something: the pass
-		// that was erasing it (ONE/ZERO) is fixed, so if the backing is being written you will SEE
-		// it. Black is invisible behind a dark interface, which is why "no backing" and "a backing
-		// that works" have looked identical to us this whole time.
+		// ---- 1. THE BLACK COPY: solid, opaque, in the interface's exact shape.
 		//
-		//   red behind the menu  -> the backing works; make it black and we are done
-		//   no red at all        -> this pass is still not writing, stencil or no stencil
-		device->SetRenderState(D3DRS_TEXTUREFACTOR, 0xFFFF0000);
+		// Black is the point, and black is also what hid this bug for days: behind a dark
+		// interface a working backing and a missing one look the same, and only the battlefield
+		// showing faintly through tells them apart. Painting it red is what finally settled it.
+		device->SetRenderState(D3DRS_TEXTUREFACTOR, 0xFF000000);
 		device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
 		device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
 		device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TFACTOR);
@@ -1936,125 +1923,6 @@ void W3DDisplay::composeVRUiPanel()
 
 	DX8Wrapper::Set_Render_Target((IDirect3DSurface8 *)nullptr);
 
-	dumpVRUiPixels();
-}
-
-// W3DDisplay::dumpVRUiPixels =================================================
-/** GeneralsVR @feature Say what is ACTUALLY in these targets.
-	*
-	* Three rewrites of this panel have now looked correct on paper and done nothing on screen,
-	* and each time I have reasoned about what the pixels ought to be instead of looking at them.
-	* This looks at them. It reads back the interface target and the composed target, and prints
-	* the depth-stencil format - because if that format carries no stencil bits, the silhouette
-	* mask the composite depends on was never written and every conclusion drawn from it is void.
-	*/
-//=============================================================================
-void W3DDisplay::dumpVRUiPixels()
-{
-	static Bool done = FALSE;
-	if (done || TheOpenXR == nullptr || !TheOpenXR->hasUiSurface())
-		return;
-
-	// Wait for the interface to actually exist before reading it.
-	if (TheGameLogic == nullptr || !TheGameLogic->isInGame())
-		return;
-
-	IDirect3DDevice8 *device = DX8Wrapper::_Get_D3D_Device8();
-	if (device == nullptr)
-		return;
-
-	done = TRUE;
-
-	// What depth-stencil are we actually rendering against? No stencil bits, no mask.
-	IDirect3DSurface8 *ds = nullptr;
-	if (SUCCEEDED(device->GetDepthStencilSurface(&ds)) && ds != nullptr)
-	{
-		D3DSURFACE_DESC dsDesc;
-		if (SUCCEEDED(ds->GetDesc(&dsDesc)))
-		{
-			DEBUG_LOG(("OpenXR: ui diag: depth-stencil format %d (D3DFMT_D24S8=%d, D3DFMT_D24X8=%d)",
-				(int)dsDesc.Format, (int)D3DFMT_D24S8, (int)D3DFMT_D24X8));
-		}
-		ds->Release();
-	}
-	else
-	{
-		DEBUG_LOG(("OpenXR: ui diag: NO depth-stencil surface bound"));
-	}
-
-	const Int w = getWidth();
-	const Int h = getHeight();
-
-	IDirect3DSurface8 *sysSurface = nullptr;
-	if (FAILED(device->CreateImageSurface(w, h, D3DFMT_A8R8G8B8, &sysSurface)) || sysSurface == nullptr)
-	{
-		DEBUG_LOG(("OpenXR: ui diag: CreateImageSurface failed"));
-		return;
-	}
-
-	// A point that should be INSIDE the control bar, and one that should be empty sky.
-	struct Probe { const char *what; Int x, y; };
-	const Probe probes[] =
-	{
-		{ "MARKER(red)",  150, 150 },
-		{ "control bar", w / 2, (Int)(h * 0.93f) },
-		{ "minimap",     (Int)(w * 0.08f), (Int)(h * 0.90f) },
-		{ "empty sky",   w / 2, (Int)(h * 0.20f) },
-	};
-
-	// The backbuffer is the control. It certainly holds a picture of the game, so if the probe
-	// reads the same flat nothing out of it as out of the other two, the probe is the thing that
-	// is broken - and everything it has said so far is worthless.
-	IDirect3DSurface8 *backbuffer = nullptr;
-	device->GetBackBuffer(0, D3DBACKBUFFER_TYPE_MONO, &backbuffer);
-
-	struct Target { const char *name; IDirect3DSurface8 *surface; };
-	const Target targets[] =
-	{
-		{ "BACKBUFFER(control)", backbuffer },
-		// NOTE: CopyRects returns success on these and copies nothing - the marker proved it, by
-		// arriving in the headset while the probe swore the target was empty. Kept only so the
-		// backbuffer control keeps printing next to them.
-		{ "interface(UNRELIABLE)", TheOpenXR->getUiSurface() },
-		{ "composed(UNRELIABLE)",  TheOpenXR->getUiCompositeSurface() },
-	};
-
-	for (Int t = 0; t < 3; ++t)
-	{
-		if (targets[t].surface == nullptr)
-		{
-			DEBUG_LOG(("OpenXR: ui diag: %s target is NULL", targets[t].name));
-			continue;
-		}
-
-		if (FAILED(device->CopyRects(targets[t].surface, nullptr, 0, sysSurface, nullptr)))
-		{
-			DEBUG_LOG(("OpenXR: ui diag: CopyRects failed for %s", targets[t].name));
-			continue;
-		}
-
-		D3DLOCKED_RECT locked;
-		if (FAILED(sysSurface->LockRect(&locked, nullptr, D3DLOCK_READONLY)))
-		{
-			DEBUG_LOG(("OpenXR: ui diag: LockRect failed for %s", targets[t].name));
-			continue;
-		}
-
-		for (Int i = 0; i < 4; ++i)
-		{
-			const UnsignedByte *row = (const UnsignedByte *)locked.pBits + probes[i].y * locked.Pitch;
-			const UnsignedInt pixel = ((const UnsignedInt *)row)[probes[i].x];
-			DEBUG_LOG(("OpenXR: ui diag: %s @ %s (%d,%d) = A%3u R%3u G%3u B%3u",
-				targets[t].name, probes[i].what, probes[i].x, probes[i].y,
-				(pixel >> 24) & 0xFF, (pixel >> 16) & 0xFF, (pixel >> 8) & 0xFF, pixel & 0xFF));
-		}
-
-		sysSurface->UnlockRect();
-	}
-
-	if (backbuffer != nullptr)
-		backbuffer->Release();
-	sysSurface->Release();
 }
 
 // W3DDisplay::drawVRPanels ===================================================
