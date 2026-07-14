@@ -1839,7 +1839,20 @@ void W3DDisplay::composeVRUiPanel()
 
 	DX8Wrapper::Set_Render_Target(target, true);
 
-	if (WW3D::Begin_Render(false, false, Vector3(0.0f, 0.0f, 0.0f)) == WW3D_ERROR_OK)
+	const WW3DErrorType began = WW3D::Begin_Render(false, false, Vector3(0.0f, 0.0f, 0.0f));
+
+	// This has now failed twice while looking correct on paper, so it reports for itself. If the
+	// panel is still see-through and this says the pass ran, the fault is in the blending; if it
+	// says the pass never ran, the fault is here.
+	static Bool reported = FALSE;
+	if (!reported)
+	{
+		reported = TRUE;
+		DEBUG_LOG(("OpenXR: ui composite: begin=%d target=%p source=%p",
+			(int)began, target, source));
+	}
+
+	if (began == WW3D_ERROR_OK)
 	{
 		DX8Wrapper::Clear(true, false, Vector3(0.0f, 0.0f, 0.0f), 0.0f);
 

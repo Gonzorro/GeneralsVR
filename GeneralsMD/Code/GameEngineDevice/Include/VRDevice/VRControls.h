@@ -127,6 +127,7 @@ private:
 	/// moment you turn, and you find yourself dragging a diamond.
 	Vector3 m_boxRight;
 	Vector3 m_boxForward;
+	UnsignedInt m_boxPressTime;   ///< when the trigger went down; a box must be HELD, not just swept
 	/// Where the ray lands: an object if it hits one, otherwise the ground.
 	Bool traceAim(const Vector3 &origin, const Vector3 &dir, Coord3D &outHit) const;
 	void updateLocomotion(W3DView *view);

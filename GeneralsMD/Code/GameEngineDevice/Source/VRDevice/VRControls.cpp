@@ -177,6 +177,7 @@ VRControls::VRControls()
 	m_boxEnd.zero();
 	m_boxRight = Vector3(1.0f, 0.0f, 0.0f);
 	m_boxForward = Vector3(0.0f, 1.0f, 0.0f);
+	m_boxPressTime = 0;
 }
 
 VRControls::~VRControls()
@@ -633,7 +634,7 @@ void VRControls::updateBoxVisual(Bool visible)
 	if (TheTerrainLogic == nullptr)
 		return;
 
-	const Real width = 3.0f + 0.004f * TheOpenXR->getWorldUnitsPerMeter();
+	const Real width = (3.0f + 0.004f * TheOpenXR->getWorldUnitsPerMeter()) * 0.2f;
 	const Real lift = 4.0f;	// float it clear of the ground so it is not swallowed by the terrain
 
 	// The box lives in the player's frame: one pair of edges runs left-right across their view,
@@ -691,6 +692,7 @@ void VRControls::updateBoxSelect(const Vector3 &origin, const Vector3 &dir)
 		m_boxing = FALSE;
 		m_boxStart = ground;
 		m_boxEnd = ground;
+		m_boxPressTime = GetTickCount();
 
 		// Take the player's heading now and hold it for the whole sweep, so the box does not
 		// swivel under their hand if they turn their head mid-drag.
@@ -722,11 +724,18 @@ void VRControls::updateBoxSelect(const Vector3 &origin, const Vector3 &dir)
 	{
 		m_boxEnd = ground;
 
-		// Only a real sweep becomes a box; a twitch while clicking a tank must not.
+		// A box has to be HELD, and it has to be swept. Distance alone was not enough: a click
+		// that drifts a few feet while the trigger is going down would quietly become a box and
+		// take half the base with it. A quarter of a second is the line between the two.
+		const UnsignedInt HOLD_TO_BOX_MS = 250;
+		const Bool heldLongEnough = (GetTickCount() - m_boxPressTime) >= HOLD_TO_BOX_MS;
+
 		const Real dx = m_boxEnd.x - m_boxStart.x;
 		const Real dy = m_boxEnd.y - m_boxStart.y;
 		const Real minSweep = 0.05f * TheOpenXR->getWorldUnitsPerMeter();
-		if (!m_boxing && (dx * dx + dy * dy) > (minSweep * minSweep))
+		const Bool sweptFarEnough = (dx * dx + dy * dy) > (minSweep * minSweep);
+
+		if (!m_boxing && heldLongEnough && sweptFarEnough)
 			m_boxing = TRUE;
 
 		if (m_boxing)
