@@ -1875,11 +1875,15 @@ void W3DDisplay::composeVRUiPanel()
 		device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
 		device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
 
-		// Only where the interface actually painted. The stencil carries its silhouette, marked
-		// pixel by pixel as it was drawn - which is the one description of its shape that does not
-		// depend on an alpha channel it never wrote.
-		device->SetRenderState(D3DRS_STENCILENABLE, TRUE);
-		device->SetRenderState(D3DRS_STENCILFUNC, D3DCMP_EQUAL);
+		// TEMPORARY, and deliberately loud. The pixel probe lies about render-target textures, so
+		// the only instrument left that I trust is the headset itself. The backing below is RED and
+		// the stencil test is OFF, which makes the answer unmissable:
+		//   the whole panel turns red -> the headset IS showing this composite, and the stencil is
+		//                                what is failing
+		//   the panel is unchanged    -> the headset is NOT showing this composite, and no backing
+		//                                built here was ever going to reach it
+		device->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+		device->SetRenderState(D3DRS_STENCILFUNC, D3DCMP_ALWAYS);
 		device->SetRenderState(D3DRS_STENCILREF, 1);
 		device->SetRenderState(D3DRS_STENCILMASK, 0xFF);
 		device->SetRenderState(D3DRS_STENCILWRITEMASK, 0x00);
@@ -1887,8 +1891,8 @@ void W3DDisplay::composeVRUiPanel()
 		device->SetRenderState(D3DRS_STENCILFAIL, D3DSTENCILOP_KEEP);
 		device->SetRenderState(D3DRS_STENCILZFAIL, D3DSTENCILOP_KEEP);
 
-		// ---- 1. THE BLACK COPY: solid black, fully opaque, in the interface's exact shape.
-		device->SetRenderState(D3DRS_TEXTUREFACTOR, 0xFF000000);
+		// ---- 1. THE BACKING - RED for this run, so it cannot be mistaken for anything else.
+		device->SetRenderState(D3DRS_TEXTUREFACTOR, 0xFFFF0000);
 		device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
 		device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
 		device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TFACTOR);
@@ -1999,8 +2003,11 @@ void W3DDisplay::dumpVRUiPixels()
 	const Target targets[] =
 	{
 		{ "BACKBUFFER(control)", backbuffer },
-		{ "interface", TheOpenXR->getUiSurface() },
-		{ "composed",  TheOpenXR->getUiCompositeSurface() },
+		// NOTE: CopyRects returns success on these and copies nothing - the marker proved it, by
+		// arriving in the headset while the probe swore the target was empty. Kept only so the
+		// backbuffer control keeps printing next to them.
+		{ "interface(UNRELIABLE)", TheOpenXR->getUiSurface() },
+		{ "composed(UNRELIABLE)",  TheOpenXR->getUiCompositeSurface() },
 	};
 
 	for (Int t = 0; t < 3; ++t)
