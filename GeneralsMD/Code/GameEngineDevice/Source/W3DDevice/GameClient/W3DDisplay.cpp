@@ -1956,20 +1956,12 @@ void W3DDisplay::drawVRPanels( const Matrix3D &anchor, Real scale )
 			device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
 			device->SetRenderState(D3DRS_FOGENABLE, FALSE);
 
-			// Blend, and reject only the pixels the interface never touched at all.
-			//
-			// A hard alpha test was the obvious way to get crisp sprites on nothing, but the
-			// alpha the UI leaves behind in the render target is weak - which is exactly why the
-			// panel looked washed out in the first place - so a 25% threshold threw the ENTIRE
-			// menu away. A near-zero threshold keeps everything that was painted and discards
-			// only the untouched background, and blending shows it for what it is.
-			device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
-			device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
-			device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
-			device->SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
-			device->SetRenderState(D3DRS_ALPHAREF, 0x04);
-			device->SetRenderState(D3DRS_ALPHAFUNC, D3DCMP_GREATER);
-			device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+			// Plain and opaque. The panel has a solid backing now, so there is no alpha to fuss
+			// over - and no alpha test to accidentally throw the entire menu away, which is what
+			// happened the last time these were geometry.
+			device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+			device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+			device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
 
 			device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
 			device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
@@ -2113,6 +2105,10 @@ void W3DDisplay::drawVRScene( W3DView *view )
 			// (and in the monitor mirror) with correct depth. In the menus they are all there is.
 			if (TheVRControls != nullptr && TheVRControls->getRayScene() != nullptr)
 				WW3D::Render(TheVRControls->getRayScene(), vrCamera);
+
+			// The panels are geometry, so a beam pointing at one lands ON it - a compositor layer
+			// has no depth and swallowed the laser whole.
+			drawVRPanels(anchor, scale);
 
 			WW3D::End_Render(false);  // no present: the image belongs to the headset
 		}

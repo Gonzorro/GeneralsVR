@@ -491,8 +491,11 @@ void VRControls::updatePlacement(const Vector3 &origin, const Vector3 &dir)
 	// Where and how it lands: where the beam was when it was pinned, turned however the player
 	// turned it. A tap never entered the turn, so it takes the heading the player is facing.
 	const Coord3D where = (m_placePressTime != 0) ? m_placeAnchor : spot;
-	Real angle = m_placeTurning ? m_placeAngle
-		: ((TheTacticalView != nullptr) ? TheTacticalView->getAngle() : 0.0f);
+
+	// A tap builds it exactly as the ghost was standing - which is the default heading, the one
+	// the game itself uses. Handing it the CAMERA's angle instead meant the building you got was
+	// never the building you were shown: it spun to some other heading the moment you let go.
+	const Real angle = m_placeTurning ? m_placeAngle : 0.0f;
 
 	GameMessage *msg = TheMessageStream->appendMessage(GameMessage::MSG_DOZER_CONSTRUCT);
 	msg->appendIntegerArgument(build->getTemplateID());
@@ -1008,15 +1011,35 @@ void VRControls::updateLocomotion(W3DView *view)
 	{
 		if (turn != 0.0f)
 		{
-			view->setAngle(view->getAngle() + turn * STICK_TURN_SPEED * dt);
+			const Real delta = turn * STICK_TURN_SPEED * dt;
 
-			// setAngle only stores the number. The camera is rebuilt from it just once, when the
-			// view is marked dirty - and setAngle does not mark it. So the stick was turning a
-			// value that nothing ever read, which is why the rotation never happened. lookAt sets
-			// the dirty flag, so asking the view to look where it is already looking rebuilds the
-			// camera with the new heading.
-			const Coord3D here = view->getPosition();
-			view->lookAt(&here);
+			// Turn on the spot. The RTS camera orbits its look-at point, so turning swung the
+			// player around a pivot far out on the battlefield - you were on the end of a boom,
+			// not standing and looking around. To turn in place, spin the look-at point around
+			// the PLAYER instead, which leaves the camera exactly where it is and only changes
+			// which way it faces.
+			CameraClass *camera = view->get3DCamera();
+			if (camera != nullptr)
+			{
+				const Vector3 me = camera->Get_Position();
+				const Coord3D target = view->getPosition();
+
+				const Real dx = target.x - me.X;
+				const Real dy = target.y - me.Y;
+				const Real c = cosf(delta);
+				const Real s = sinf(delta);
+
+				Coord3D newTarget;
+				newTarget.x = me.X + dx * c - dy * s;
+				newTarget.y = me.Y + dx * s + dy * c;
+				newTarget.z = target.z;
+
+				view->setAngle(view->getAngle() + delta);
+
+				// lookAt also marks the view dirty, which setAngle does not do - without it the
+				// camera is never rebuilt and the heading is a number nothing reads.
+				view->lookAt(&newTarget);
+			}
 		}
 	}
 	else if (grow != 0.0f)

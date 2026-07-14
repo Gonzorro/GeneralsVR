@@ -2027,17 +2027,14 @@ void OpenXRManager::submitFrame(Bool worldRendered)
 	// attempt to let the laser sort in front of them - but it lost the panel entirely, and a
 	// menu you cannot see is worse than a menu the laser hides behind. Layers work; the beam is
 	// the thing to solve, not this.
-	Bool anyFramePanel = FALSE;
-	Bool anyGroupPanel = FALSE;
-	for (Int i = 0; i < UI_PANEL_COUNT; ++i)
-	{
-		if (!m_uiPanels[i].active)
-			continue;
-		if (m_uiPanels[i].isGroupBar)
-			anyGroupPanel = TRUE;
-		else
-			anyFramePanel = TRUE;
-	}
+	// The panels are drawn as geometry in the eye pass (see W3DDisplay::drawVRPanels), so a laser
+	// aimed at one lands in front of it. A compositor layer is painted flat over the finished
+	// image with no depth at all, and swallowed the beam whole.
+	//
+	// A MOVIE is the exception: it goes straight to the backbuffer and draws no interface, so
+	// there is nothing for a geometry panel to show and the layer is all we have.
+	const Bool anyFramePanel = m_showFlatFrame && m_uiPanels[UI_PANEL_SCREEN].active;
+	const Bool anyGroupPanel = FALSE;
 
 	if (m_uiReady && anyFramePanel)
 	{
