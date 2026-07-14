@@ -638,6 +638,8 @@ GlobalData::GlobalData()
 	m_headless = FALSE;
 	m_vrMode = FALSE;
 	m_smoothMotion = FALSE;
+	m_vrAimValid = FALSE;
+	m_vrAimPoint.zero();
 	m_vrWorldUnitsPerMeter = 500.0f;
 	m_vrResolutionScale = 1.0f;
 	m_windowed = 0;

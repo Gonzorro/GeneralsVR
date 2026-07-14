@@ -433,20 +433,11 @@ void VRControls::updatePlacement(const Vector3 &origin, const Vector3 &dir)
 
 	Coord3D spot;
 	if (!traceTerrain(origin, dir, spot))
-	{
-		updateBoxVisual(FALSE);
 		return;
-	}
 
-	// Show the footprint where it would land, sized from the building itself.
-	const Real radius = build->getTemplateGeometryInfo().getMajorRadius();
-	m_boxStart.x = spot.x - radius;
-	m_boxStart.y = spot.y - radius;
-	m_boxStart.z = spot.z;
-	m_boxEnd.x = spot.x + radius;
-	m_boxEnd.y = spot.y + radius;
-	m_boxEnd.z = spot.z;
-	updateBoxVisual(TRUE);
+	// The building itself is the preview: the engine's own ghost, with its own legality tint,
+	// now follows the laser because the aim point is published where the placement code reads it
+	// (see GlobalData::m_vrAimPoint). No stand-in footprint required - you see the building.
 
 	const VRControllerState &right = TheOpenXR->getController(VR_HAND_RIGHT);
 	if (!right.triggerPressed && !right.primaryPressed)
@@ -465,7 +456,6 @@ void VRControls::updatePlacement(const Vector3 &origin, const Vector3 &dir)
 	// Leave placement mode, exactly as the mouse path does once it has placed.
 	TheInGameUI->placeBuildAvailable(nullptr, nullptr);
 	m_placing = FALSE;
-	updateBoxVisual(FALSE);
 
 	DEBUG_LOG(("OpenXR: placed building at (%.0f %.0f)", spot.x, spot.y));
 }
@@ -1092,26 +1082,42 @@ void VRControls::updatePointer(W3DView *view)
 		Vector3 origin, dir;
 		if (computeHandRay(VR_HAND_RIGHT, origin, dir))
 		{
-			// A held-and-swept trigger is a box; a tapped one is a click. The box runs first so
-			// it can tell us, on release, whether the gesture turned into a sweep.
+			// ONE trigger does both jobs, the way one mouse button does: what happens depends on
+			// what you are pointing at, not on which button you chose. The decision waits for the
+			// RELEASE - a press cannot know yet whether it is the start of a box sweep.
 			const Bool wasBoxing = m_boxing;
 			updateBoxSelect(origin, dir);
 
-			// Release after a sweep already selected the box - do not also single-click, or the
-			// click would immediately replace the group we just gathered.
-			if (rightState.triggerReleased && wasBoxing)
+			if (rightState.triggerReleased && !wasBoxing)
 			{
-				// handled by the box
-			}
-			else if (rightState.triggerPressed)
-				selectUnderRay(origin, dir);
+				Drawable *underRay = pickDrawable(origin, dir);
+				const Bool isOwn = (underRay != nullptr && underRay->getObject() != nullptr
+					&& underRay->getObject()->isLocallyControlled() && underRay->isSelectable());
 
-			// Orders live on A as well as the left trigger. On a mouse the same button does both
-			// jobs by context, but a trigger has no such context in the hand, and one button that
-			// sometimes selects and sometimes orders is a button you cannot trust mid-battle.
-			const VRControllerState &leftState = TheOpenXR->getController(VR_HAND_LEFT);
-			if (rightState.primaryPressed || leftState.triggerPressed)
+				const DrawableList *selected = (TheInGameUI != nullptr)
+					? TheInGameUI->getAllSelectedDrawables() : nullptr;
+				const Bool haveSelection = (selected != nullptr && !selected->empty());
+
+				if (isOwn)
+					selectUnderRay(origin, dir);	// your own unit: take it
+				else if (haveSelection)
+					commandUnderRay(origin, dir);	// something of yours is waiting for an order
+				else
+					selectUnderRay(origin, dir);	// nothing selected: a click on nothing clears
+			}
+
+			// A is still an explicit order, for when you want to command without any chance of
+			// picking up whatever you happened to be pointing at.
+			if (rightState.primaryPressed)
 				commandUnderRay(origin, dir);
+
+			// The left trigger drops the selection.
+			const VRControllerState &leftState = TheOpenXR->getController(VR_HAND_LEFT);
+			if (leftState.triggerPressed && TheInGameUI != nullptr && TheMessageStream != nullptr)
+			{
+				TheInGameUI->deselectAllDrawables();
+				TheMessageStream->appendMessage(GameMessage::MSG_DESTROY_SELECTED_GROUP);
+			}
 		}
 	}
 
@@ -1452,6 +1458,25 @@ void VRControls::update()
 	// Pointing works everywhere: at the menu screen floating in front of the player, at the
 	// wrist panels, and at the battlefield.
 	updatePointer(inGame ? view : nullptr);
+
+	// Publish where the laser meets the ground. The engine's building placement reads this: its
+	// ghost used to be derived from the mouse cursor, which only exists where the flat camera can
+	// see, and so the building would never go where the player was pointing.
+	if (TheWritableGlobalData != nullptr)
+	{
+		Vector3 origin, dir;
+		Coord3D ground;
+		if (inGame && computeHandRay(VR_HAND_RIGHT, origin, dir)
+			&& traceTerrain(origin, dir, ground))
+		{
+			TheWritableGlobalData->m_vrAimValid = TRUE;
+			TheWritableGlobalData->m_vrAimPoint = ground;
+		}
+		else
+		{
+			TheWritableGlobalData->m_vrAimValid = FALSE;
+		}
+	}
 
 	// The beams are drawn everywhere, including the menus - that is the whole point of them.
 	updateRays(view);

@@ -1860,7 +1860,9 @@ void W3DDisplay::solidifyVRUiAlpha()
 	device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
 	device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
 
-	for (Int pass = 0; pass < 3; ++pass)
+	// Five doublings: even a faint tenth of an alpha ends up solid, while a true zero - the
+	// background the interface never touched - stays exactly zero and shows no panel at all.
+	for (Int pass = 0; pass < 5; ++pass)
 		device->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, quad, sizeof(ScreenVertex));
 
 	// Give the device back exactly as we found it.

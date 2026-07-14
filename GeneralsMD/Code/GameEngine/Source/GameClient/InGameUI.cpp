@@ -1681,7 +1681,21 @@ void InGameUI::handleBuildPlacements()
 		// set the location and angle of the place icon
 		/**@todo this whole orientation vector thing is LAME! Must replace, all I want to
 		to do is set a simple angle and have it automatically change, ug! */
-		if( TheTacticalView->screenToTerrain( &loc, &world ) )
+		// GeneralsVR @feature In a headset the ghost follows the LASER, not the cursor. The cursor
+		// only exists where the flat camera can see, which is a fraction of what the player does,
+		// so deriving the ghost from it made the building lurch and stick and refuse to land.
+		Bool haveWorld = FALSE;
+		if( TheGlobalData->m_vrMode && TheGlobalData->m_vrAimValid )
+		{
+			world = TheGlobalData->m_vrAimPoint;
+			haveWorld = TRUE;
+		}
+		else
+		{
+			haveWorld = TheTacticalView->screenToTerrain( &loc, &world );
+		}
+
+		if( haveWorld )
 		{
 			m_placeIcon[ 0 ]->setPosition( &world );
 			m_placeIcon[ 0 ]->setOrientation( angle );

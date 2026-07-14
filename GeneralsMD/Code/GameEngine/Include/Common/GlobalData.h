@@ -124,6 +124,14 @@ public:
 	// GeneralsVR @feature Run with OpenXR VR output when available (-vr).
 	Bool m_vrMode;
 
+	// GeneralsVR @feature Where the player's laser meets the ground, in world space.
+	// The engine places its building ghost from the MOUSE, turning the cursor into a world
+	// position with screenToTerrain - and our cursor is a fiction that only exists where the flat
+	// camera can see. So the VR layer publishes the real aim point here and the placement code
+	// uses it directly. GlobalData is the one thing both layers can see.
+	Bool m_vrAimValid;
+	Coord3D m_vrAimPoint;
+
 	// GeneralsVR @feature Interpolate drawable motion between 30Hz sim ticks (-smoothmotion).
 	// Implied by -vr, where 30Hz stepping is nauseating. Render-only; the sim is untouched.
 	Bool m_smoothMotion;
