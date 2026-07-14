@@ -1642,8 +1642,21 @@ Bool OpenXRManager::captureUiFrame(UnsignedInt uiImageIndex)
 	if (src == VK_NULL_HANDLE)
 		src = getVulkanImage(m_uiCompositeTexture, &srcLayout);
 
+	static Bool saidWhichTexture = FALSE;
+	if (!saidWhichTexture)
+	{
+		saidWhichTexture = TRUE;
+		DEBUG_LOG(("OpenXR: ui capture: showing %s (composedImage=0x%llX uiImage=0x%llX)",
+			m_showFlatFrame ? "FLAT FRAME" : "composed panel",
+			(unsigned long long)src,
+			(unsigned long long)getVulkanImage(m_uiTexture, nullptr)));
+	}
+
 	if (src == VK_NULL_HANDLE)
+	{
+		DEBUG_LOG(("OpenXR: ui capture: NO source image - the panel is showing a stale frame"));
 		return FALSE;
+	}
 
 	VkImage dst = m_uiImages[uiImageIndex];
 

@@ -1988,14 +1988,21 @@ void W3DDisplay::dumpVRUiPixels()
 		{ "empty sky",   w / 2, (Int)(h * 0.20f) },
 	};
 
+	// The backbuffer is the control. It certainly holds a picture of the game, so if the probe
+	// reads the same flat nothing out of it as out of the other two, the probe is the thing that
+	// is broken - and everything it has said so far is worthless.
+	IDirect3DSurface8 *backbuffer = nullptr;
+	device->GetBackBuffer(0, D3DBACKBUFFER_TYPE_MONO, &backbuffer);
+
 	struct Target { const char *name; IDirect3DSurface8 *surface; };
 	const Target targets[] =
 	{
+		{ "BACKBUFFER(control)", backbuffer },
 		{ "interface", TheOpenXR->getUiSurface() },
 		{ "composed",  TheOpenXR->getUiCompositeSurface() },
 	};
 
-	for (Int t = 0; t < 2; ++t)
+	for (Int t = 0; t < 3; ++t)
 	{
 		if (targets[t].surface == nullptr)
 		{
@@ -2028,6 +2035,8 @@ void W3DDisplay::dumpVRUiPixels()
 		sysSurface->UnlockRect();
 	}
 
+	if (backbuffer != nullptr)
+		backbuffer->Release();
 	sysSurface->Release();
 }
 
