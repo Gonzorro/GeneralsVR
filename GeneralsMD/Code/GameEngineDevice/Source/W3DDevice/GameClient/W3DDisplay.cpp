@@ -1887,8 +1887,14 @@ void W3DDisplay::composeVRUiPanel()
 		device->SetRenderState(D3DRS_STENCILFAIL, D3DSTENCILOP_KEEP);
 		device->SetRenderState(D3DRS_STENCILZFAIL, D3DSTENCILOP_KEEP);
 
-		// ---- 1. THE BLACK COPY: solid black, fully opaque, in the interface's exact shape.
-		device->SetRenderState(D3DRS_TEXTUREFACTOR, 0xFF000000);
+		// ---- 1. THE BACKING. RED for this run, and this time the test means something: the pass
+		// that was erasing it (ONE/ZERO) is fixed, so if the backing is being written you will SEE
+		// it. Black is invisible behind a dark interface, which is why "no backing" and "a backing
+		// that works" have looked identical to us this whole time.
+		//
+		//   red behind the menu  -> the backing works; make it black and we are done
+		//   no red at all        -> this pass is still not writing, stencil or no stencil
+		device->SetRenderState(D3DRS_TEXTUREFACTOR, 0xFFFF0000);
 		device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
 		device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
 		device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TFACTOR);
