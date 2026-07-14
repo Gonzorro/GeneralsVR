@@ -2150,7 +2150,18 @@ void OpenXRManager::submitFrame(Bool worldRendered)
 		layers[layerCount++] = (const XrCompositionLayerBaseHeader*)&worldLayer;
 	}
 
-	if (recorded)
+	// THE PANELS ARE NOT LAYERS ANY MORE - except during the intro film.
+	//
+	// A compositor layer is painted flat over the finished image with no depth whatsoever, so it
+	// buries whatever is behind it in 3D. That is precisely what swallowed the laser: the beam was
+	// in front of the menu in the world and behind it on the screen, and no amount of aiming could
+	// change that. The renderer now draws the panels as real quads in the eye pass, where the depth
+	// buffer decides what is in front of what - and the beam wins, because it stops short of the
+	// panel it is pointing at.
+	//
+	// The film is the exception. It is painted straight to the backbuffer, there is no interface to
+	// hang on a quad, and there is no laser to bury - so it still rides on a layer.
+	if (recorded && m_showFlatFrame)
 	{
 		// Panels go on top of the world, in the order they were laid out.
 		for (Int i = 0; i < UI_PANEL_COUNT; ++i)

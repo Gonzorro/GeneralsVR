@@ -171,6 +171,13 @@ public:
 	IDirect3DSurface8* getUiCompositeSurface() const { return m_uiCompositeSurface; }
 	IDirect3DTexture8* getUiTexture() const { return m_uiTexture; }
 
+	/// The composed panel as a TEXTURE - what the renderer hangs on the quads in the eye pass.
+	IDirect3DTexture8* getUiCompositeTexture() const { return m_uiCompositeTexture; }
+
+	/// TRUE while the intro film is playing, when there is no interface to draw and the panel
+	/// falls back to a compositor layer showing the finished flat frame.
+	Bool isShowingFlatFrame() const { return m_showFlatFrame; }
+
 	/// While a movie plays there IS no interface to draw - the film is painted straight to the
 	/// backbuffer - so the VR screen shows the finished flat frame instead. Without this the
 	/// headset just holds the last thing it saw while the intro plays on the monitor.

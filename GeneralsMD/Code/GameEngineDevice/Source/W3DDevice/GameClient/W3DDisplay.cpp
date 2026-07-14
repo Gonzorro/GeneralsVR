@@ -88,6 +88,8 @@ static void drawFramerateBar();
 #ifdef RTS_HAS_OPENXR
 #include "WW3D2/dx8wrapper.h"
 #include "WW3D2/camera.h"
+#include "WW3D2/texture.h"
+#include "WW3D2/vertmaterial.h"
 #include "WWMath/quat.h"
 #include "VRDevice/OpenXRManager.h"
 #include "VRDevice/VRControls.h"
@@ -1939,15 +1941,26 @@ void W3DDisplay::composeVRUiPanel()
 
 }
 
+// The panel quad: textured, alpha-tested, and it WRITES DEPTH - which is the entire point of
+// drawing these as geometry. The depth it writes is what the laser is later tested against, so
+// the beam that stops short of a panel is drawn in front of it instead of being buried by it.
+// The alpha test throws away every pixel the interface never painted, before it can write any
+// depth at all - otherwise the panel's empty corners would carve an invisible hole in the world.
+#define SC_VR_PANEL ( SHADE_CNST(ShaderClass::PASS_LEQUAL, ShaderClass::DEPTH_WRITE_ENABLE, ShaderClass::COLOR_WRITE_ENABLE, ShaderClass::SRCBLEND_SRC_ALPHA, 	ShaderClass::DSTBLEND_ONE_MINUS_SRC_ALPHA, ShaderClass::FOG_DISABLE, ShaderClass::GRADIENT_MODULATE, ShaderClass::SECONDARY_GRADIENT_DISABLE, ShaderClass::TEXTURING_ENABLE, 	ShaderClass::ALPHATEST_ENABLE, ShaderClass::CULL_MODE_DISABLE, 	ShaderClass::DETAILCOLOR_DISABLE, ShaderClass::DETAILALPHA_DISABLE) )
+
 // W3DDisplay::drawVRPanels ===================================================
 /** GeneralsVR @feature Draw the interface panels as real quads in the world.
 	*
-	* They used to be OpenXR quad layers, which the compositor paints flat over the finished
-	* image with no depth at all. That had two consequences the player felt immediately: the
-	* laser aimed at a panel vanished *behind* it, and the panel read as a hard rectangle of
-	* screen pasted over the battlefield. As geometry they sort properly against the beam and
-	* the world, and an alpha test throws away everything the interface did not paint - so what
-	* floats in front of the player is the menu's own sprites, and nothing else.
+	* They were OpenXR quad layers, which the compositor paints flat over the finished image with
+	* no depth at all - so a panel buried the laser aimed at it no matter where the beam actually
+	* was in 3D. As geometry they sort against the beam and the world through the depth buffer,
+	* and the beam, which stops just short of the panel, is drawn in front of it.
+	*
+	* EVERY DRAW HERE GOES THROUGH DX8Wrapper. An earlier version of this function talked straight
+	* to the device, and that is what made ONE EYE RENDER FLAT: the wrapper caches the transforms
+	* and skips any set it believes is redundant, so the states we changed behind its back left it
+	* certain the second eye's camera was already applied when it was not. Nothing below touches
+	* IDirect3DDevice8. Keep it that way.
 	*/
 //=============================================================================
 void W3DDisplay::drawVRPanels( const Matrix3D &anchor, Real scale )
@@ -1955,14 +1968,30 @@ void W3DDisplay::drawVRPanels( const Matrix3D &anchor, Real scale )
 	if (TheOpenXR == nullptr)
 		return;
 
-	IDirect3DDevice8 *device = DX8Wrapper::_Get_D3D_Device8();
-	if (device == nullptr)
+	// During the film there is no interface to hang on a quad - it still rides a compositor layer.
+	if (TheOpenXR->isShowingFlatFrame())
 		return;
 
-	struct PanelVertex { Real x, y, z; Real u, v; };
-	const DWORD PANEL_FVF = D3DFVF_XYZ | D3DFVF_TEX1;
+	// Wrap our render targets so the engine's material system can sample them. Built once: the
+	// textures themselves live for the whole session.
+	static TextureClass *uiTexture = nullptr;
+	static TextureClass *groupTexture = nullptr;
+	static VertexMaterialClass *material = nullptr;
 
-	Bool stateSet = FALSE;
+	if (uiTexture == nullptr && TheOpenXR->getUiCompositeTexture() != nullptr)
+		uiTexture = NEW_REF(TextureClass, (TheOpenXR->getUiCompositeTexture()));
+	if (groupTexture == nullptr && TheOpenXR->getGroupBarTexture() != nullptr)
+		groupTexture = NEW_REF(TextureClass, (TheOpenXR->getGroupBarTexture()));
+	if (material == nullptr)
+		material = VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
+
+	if (uiTexture == nullptr)
+		return;
+
+	Matrix3D identity(1);
+	DX8Wrapper::Set_Transform(D3DTS_WORLD, identity);
+	DX8Wrapper::Set_Material(material);
+	DX8Wrapper::Set_Shader(ShaderClass(SC_VR_PANEL));
 
 	for (Int i = 0; i < TheOpenXR->getPanelCount(); ++i)
 	{
@@ -1970,13 +1999,13 @@ void W3DDisplay::drawVRPanels( const Matrix3D &anchor, Real scale )
 		if (!TheOpenXR->getPanelInfo(i, info))
 			continue;
 
-		IDirect3DTexture8 *texture = info.isGroupBar ? TheOpenXR->getGroupBarTexture()
-		                                             : TheOpenXR->getUiTexture();
+		TextureClass *texture = info.isGroupBar ? groupTexture : uiTexture;
 		if (texture == nullptr)
 			continue;
 
-		// The panel's pose is in VR space (metres); lift it into the world the same way the
-		// hands and eyes are, so it hangs exactly where the player sees their controller.
+		// The panel's pose is in VR space (metres); lift it into the world exactly as the hands and
+		// the eyes are, so it hangs where the player sees it and the ray maths agrees with the
+		// picture.
 		Quaternion q(info.quatX, info.quatY, info.quatZ, info.quatW);
 		Matrix3D panelPose;
 		Build_Matrix3D(q, panelPose);
@@ -1988,77 +2017,56 @@ void W3DDisplay::drawVRPanels( const Matrix3D &anchor, Real scale )
 		const Vector3 origin = panelWorld.Get_Translation();
 		const Vector3 right = panelWorld.Get_X_Vector() * (info.widthMeters * 0.5f * scale);
 		const Vector3 up = panelWorld.Get_Y_Vector() * (info.heightMeters * 0.5f * scale);
+		const Vector3 normal = panelWorld.Get_Z_Vector();
 
-		// Panel space is +X right and +Y up; the texture runs +V downwards.
-		const Vector3 topLeft = origin - right + up;
-		const Vector3 topRight = origin + right + up;
-		const Vector3 bottomRight = origin + right - up;
-		const Vector3 bottomLeft = origin - right - up;
-
-		PanelVertex verts[4] =
+		// Panel space is +X right and +Y up; the texture's V runs downwards.
+		const Vector3 corners[4] =
 		{
-			{ topLeft.X,     topLeft.Y,     topLeft.Z,     info.u0, info.v0 },
-			{ topRight.X,    topRight.Y,    topRight.Z,    info.u1, info.v0 },
-			{ bottomRight.X, bottomRight.Y, bottomRight.Z, info.u1, info.v1 },
-			{ bottomLeft.X,  bottomLeft.Y,  bottomLeft.Z,  info.u0, info.v1 },
+			origin - right + up,    // top left
+			origin + right + up,    // top right
+			origin + right - up,    // bottom right
+			origin - right - up,    // bottom left
 		};
+		const Real cornerU[4] = { info.u0, info.u1, info.u1, info.u0 };
+		const Real cornerV[4] = { info.v0, info.v0, info.v1, info.v1 };
 
-		if (!stateSet)
+		DynamicVBAccessClass vb_access(BUFFER_TYPE_DYNAMIC_DX8, DX8_FVF_XYZNDUV2, 4);
+		DynamicIBAccessClass ib_access(BUFFER_TYPE_DYNAMIC_DX8, 6);
 		{
-			stateSet = TRUE;
+			DynamicVBAccessClass::WriteLockClass lock(&vb_access);
+			VertexFormatXYZNDUV2 *vb = lock.Get_Formatted_Vertex_Array();
+			DynamicIBAccessClass::WriteLockClass lockib(&ib_access);
+			UnsignedShort *ib = lockib.Get_Index_Array();
+			if (vb == nullptr || ib == nullptr)
+				continue;
 
-			D3DMATRIX identity;
-			for (Int r = 0; r < 4; ++r)
-				for (Int c = 0; c < 4; ++c)
-					identity.m[r][c] = (r == c) ? 1.0f : 0.0f;
-			device->SetTransform(D3DTS_WORLD, &identity);
+			for (Int c = 0; c < 4; ++c)
+			{
+				vb->x = corners[c].X;
+				vb->y = corners[c].Y;
+				vb->z = corners[c].Z;
+				vb->nx = normal.X;
+				vb->ny = normal.Y;
+				vb->nz = normal.Z;
+				vb->diffuse = 0xFFFFFFFF;   // the interface brings its own colour; do not tint it
+				vb->u1 = cornerU[c];
+				vb->v1 = cornerV[c];
+				vb->u2 = 0.0f;
+				vb->v2 = 0.0f;
+				vb++;
+			}
 
-			device->SetVertexShader(PANEL_FVF);
-			device->SetPixelShader(0);
-			device->SetRenderState(D3DRS_LIGHTING, FALSE);
-			device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
-			device->SetRenderState(D3DRS_ZENABLE, TRUE);
-			device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
-			device->SetRenderState(D3DRS_FOGENABLE, FALSE);
-
-			// Blend on the interface's alpha, which the pass above has already driven to solid
-			// wherever it painted and left at zero everywhere else. So the sprites arrive opaque
-			// and the space between them is not drawn at all - no rectangle, no ghost.
-			//
-			// The alpha test throws away the untouched background BEFORE it can write depth,
-			// which matters: a panel that wrote depth across its whole quad would carve a hole in
-			// the battlefield behind it.
-			device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
-			device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
-			device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
-			device->SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
-			device->SetRenderState(D3DRS_ALPHAREF, 0x20);
-			device->SetRenderState(D3DRS_ALPHAFUNC, D3DCMP_GREATER);
-			device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
-
-			device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
-			device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
-			device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
-			device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
-			device->SetTextureStageState(0, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
-			device->SetTextureStageState(0, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
-			device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
-			device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+			ib[0] = 0; ib[1] = 1; ib[2] = 2;
+			ib[3] = 0; ib[4] = 2; ib[5] = 3;
 		}
 
-		device->SetTexture(0, texture);
-		device->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, verts, sizeof(PanelVertex));
+		DX8Wrapper::Set_Texture(0, texture);
+		DX8Wrapper::Set_Index_Buffer(ib_access, 0);
+		DX8Wrapper::Set_Vertex_Buffer(vb_access);
+		DX8Wrapper::Draw_Triangles(0, 2, 0, 4);
 	}
 
-	if (stateSet)
-	{
-		// Hand the device back the way we found it, or the next thing drawn inherits our states.
-		device->SetTexture(0, nullptr);
-		device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
-		device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-		device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
-		DX8Wrapper::Invalidate_Cached_Render_States();
-	}
+	DX8Wrapper::Set_Texture(0, nullptr);
 }
 
 // W3DDisplay::drawVRScene ====================================================
@@ -2173,6 +2181,11 @@ void W3DDisplay::drawVRScene( W3DView *view )
 
 			if (inGame)
 				WW3D::Render(m_3DScene, vrCamera);
+
+			// The interface panels, as real geometry with real depth. They MUST be drawn before the
+			// lasers: the beams are depth-tested against what is already there, and it is the depth
+			// written here that lets a beam stopping short of a panel be seen in front of it.
+			drawVRPanels(anchor, scale);
 
 			// The laser pointers go on top, in the same eye pass, so they land in the headset
 			// (and in the monitor mirror) with correct depth. In the menus they are all there is.
