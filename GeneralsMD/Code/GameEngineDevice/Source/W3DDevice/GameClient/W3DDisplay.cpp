@@ -1857,6 +1857,20 @@ void W3DDisplay::composeVRUiPanel()
 		device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
 		device->SetRenderState(D3DRS_FOGENABLE, FALSE);
 		device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+
+		// WRITE THE ALPHA CHANNEL. This one line is the whole bug.
+		//
+		// The red backing came through as a red TINT over the battlefield rather than a solid red
+		// slab - and a tint is what the compositor produces when the alpha is zero. So the colour
+		// writes were landing all along and the alpha writes were not, which is why a black backing
+		// was invisible (adding black to the world changes nothing) and a red one was a tint.
+		//
+		// The engine leaves COLORWRITEENABLE wherever its last draw left it, and the device honours
+		// that mask whether or not I remember to set it. Every backing I have built has had its
+		// alpha masked off in hardware before it could reach the target.
+		device->SetRenderState(D3DRS_COLORWRITEENABLE, D3DCOLORWRITEENABLE_RED
+			| D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE | D3DCOLORWRITEENABLE_ALPHA);
+
 		device->SetTextureStageState(0, D3DTSS_MINFILTER, D3DTEXF_POINT);
 		device->SetTextureStageState(0, D3DTSS_MAGFILTER, D3DTEXF_POINT);
 		device->SetTextureStageState(0, D3DTSS_ADDRESSU, D3DTADDRESS_CLAMP);
@@ -2200,6 +2214,11 @@ void W3DDisplay::drawVRScene( W3DView *view )
 			if (dev != nullptr)
 			{
 				dev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_STENCIL, 0x00000000, 1.0f, 0);
+
+				// The alpha channel must be writable here too, or the interface arrives with none
+				// and every later attempt to give it a solid backing is doomed before it starts.
+				dev->SetRenderState(D3DRS_COLORWRITEENABLE, D3DCOLORWRITEENABLE_RED
+					| D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE | D3DCOLORWRITEENABLE_ALPHA);
 
 				dev->SetRenderState(D3DRS_STENCILENABLE, TRUE);
 				dev->SetRenderState(D3DRS_STENCILFUNC, D3DCMP_ALWAYS);
