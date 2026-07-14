@@ -1875,15 +1875,11 @@ void W3DDisplay::composeVRUiPanel()
 		device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
 		device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
 
-		// TEMPORARY, and deliberately loud. The pixel probe lies about render-target textures, so
-		// the only instrument left that I trust is the headset itself. The backing below is RED and
-		// the stencil test is OFF, which makes the answer unmissable:
-		//   the whole panel turns red -> the headset IS showing this composite, and the stencil is
-		//                                what is failing
-		//   the panel is unchanged    -> the headset is NOT showing this composite, and no backing
-		//                                built here was ever going to reach it
-		device->SetRenderState(D3DRS_STENCILENABLE, FALSE);
-		device->SetRenderState(D3DRS_STENCILFUNC, D3DCMP_ALWAYS);
+		// Only where the interface actually painted. The stencil carries its silhouette, marked
+		// pixel by pixel as it was drawn - the one description of its shape that does not depend
+		// on an alpha channel it may never have written.
+		device->SetRenderState(D3DRS_STENCILENABLE, TRUE);
+		device->SetRenderState(D3DRS_STENCILFUNC, D3DCMP_EQUAL);
 		device->SetRenderState(D3DRS_STENCILREF, 1);
 		device->SetRenderState(D3DRS_STENCILMASK, 0xFF);
 		device->SetRenderState(D3DRS_STENCILWRITEMASK, 0x00);
@@ -1891,8 +1887,8 @@ void W3DDisplay::composeVRUiPanel()
 		device->SetRenderState(D3DRS_STENCILFAIL, D3DSTENCILOP_KEEP);
 		device->SetRenderState(D3DRS_STENCILZFAIL, D3DSTENCILOP_KEEP);
 
-		// ---- 1. THE BACKING - RED for this run, so it cannot be mistaken for anything else.
-		device->SetRenderState(D3DRS_TEXTUREFACTOR, 0xFFFF0000);
+		// ---- 1. THE BLACK COPY: solid black, fully opaque, in the interface's exact shape.
+		device->SetRenderState(D3DRS_TEXTUREFACTOR, 0xFF000000);
 		device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
 		device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
 		device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TFACTOR);
@@ -1900,12 +1896,19 @@ void W3DDisplay::composeVRUiPanel()
 		device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TFACTOR);
 		device->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, quad, sizeof(ScreenVertex));
 
-		// ---- 2. THE INTERFACE ITSELF, standing on its own black copy. Its colour is laid over the
-		// backing and the backing's opacity is kept: an interface with no alpha of its own cannot
-		// take any away.
+		// ---- 2. THE INTERFACE ITSELF, standing on its own black copy.
+		//
+		// THIS is what has been wrong the whole time. This pass used to be ONE/ZERO - which does
+		// not lay the interface ON the backing, it REPLACES everything under it. Pass 1 painted the
+		// backing and pass 2 wiped it straight back out, so the composite has been faithfully
+		// producing the plain interface, every time, no matter what I put behind it. The red test
+		// showed it in one look: the marker came through and the red did not.
+		//
+		// ONE/ONE adds instead. The backing is black, so adding the interface's colour to it gives
+		// the interface's colour - and the backing's opacity survives, which is the entire point.
 		device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
 		device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
-		device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ZERO);
+		device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
 		device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
 		device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
 		device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
@@ -2338,9 +2341,6 @@ void W3DDisplay::drawVRScene( W3DView *view )
 			{
 				DX8Wrapper::Clear(true, false, Vector3(0.0f, 0.0f, 0.0f), 0.0f);
 			}
-
-			// A known marker, drawn with the same 2D call the interface itself uses.
-			drawFillRect(100, 100, 200, 200, GameMakeColor(255, 0, 0, 255));
 
 			TheInGameUI->DRAW();	// this repaints the whole window system, menus included
 			if (TheMouse != nullptr)
