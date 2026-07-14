@@ -122,6 +122,11 @@ private:
 	Bool m_boxArmed;              ///< the trigger is down; we are watching to see if it becomes a sweep
 	Coord3D m_boxStart;
 	Coord3D m_boxEnd;
+	/// The box is drawn in the PLAYER's frame, not the world's: one pair of edges runs left-right
+	/// across your view. A box locked to the world's axes sits at a crooked angle to you the
+	/// moment you turn, and you find yourself dragging a diamond.
+	Vector3 m_boxRight;
+	Vector3 m_boxForward;
 	/// Where the ray lands: an object if it hits one, otherwise the ground.
 	Bool traceAim(const Vector3 &origin, const Vector3 &dir, Coord3D &outHit) const;
 	void updateLocomotion(W3DView *view);

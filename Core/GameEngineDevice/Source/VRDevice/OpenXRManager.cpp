@@ -1638,8 +1638,11 @@ Bool OpenXRManager::captureUiFrame(UnsignedInt uiImageIndex)
 		}
 	}
 
+	// The plain interface, as the engine drew it. The composed version - a black copy of the
+	// interface standing behind itself - is the right idea and is not working yet, and a backing
+	// that only half arrives is worse than no backing at all.
 	if (src == VK_NULL_HANDLE)
-		src = getVulkanImage(m_uiCompositeTexture, &srcLayout);
+		src = getVulkanImage(m_uiTexture, &srcLayout);
 
 	if (src == VK_NULL_HANDLE)
 		return FALSE;

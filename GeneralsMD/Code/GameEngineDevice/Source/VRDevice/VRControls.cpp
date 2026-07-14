@@ -175,6 +175,8 @@ VRControls::VRControls()
 	m_placeAngle = 0.0f;
 	m_boxStart.zero();
 	m_boxEnd.zero();
+	m_boxRight = Vector3(1.0f, 0.0f, 0.0f);
+	m_boxForward = Vector3(0.0f, 1.0f, 0.0f);
 }
 
 VRControls::~VRControls()
@@ -524,6 +526,10 @@ namespace
 	{
 		GameMessage *msg;
 		Int count;
+		Vector3 origin;             ///< the corner the sweep began at
+		Vector3 right, forward;     ///< the player's frame, which the box is drawn in
+		Real acrossLo, acrossHi;
+		Real awayLo, awayHi;
 	};
 
 	void addDrawableToSelection(Drawable *draw, void *userData)
@@ -544,6 +550,18 @@ namespace
 		if (obj->isKindOf(KINDOF_STRUCTURE))
 			return;
 
+		// Inside the TURNED box, not merely inside the world-aligned one we asked the engine for.
+		const Coord3D *pos = draw->getPosition();
+		if (pos == nullptr)
+			return;
+
+		const Vector3 offset(pos->x - ctx->origin.X, pos->y - ctx->origin.Y, 0.0f);
+		const Real across = Vector3::Dot_Product(offset, ctx->right);
+		const Real away = Vector3::Dot_Product(offset, ctx->forward);
+		if (across < ctx->acrossLo || across > ctx->acrossHi
+			|| away < ctx->awayLo || away > ctx->awayHi)
+			return;
+
 		TheInGameUI->selectDrawable(draw);
 		ctx->msg->appendObjectIDArgument(obj->getID());
 		++ctx->count;
@@ -555,11 +573,25 @@ void VRControls::selectInBox(const Coord3D &corner0, const Coord3D &corner1)
 	if (TheGameClient == nullptr || TheInGameUI == nullptr || TheMessageStream == nullptr)
 		return;
 
+	// The box the player drew is turned to face them, so the units it takes have to be found in
+	// that same turned frame - otherwise the rectangle on the ground and the rectangle doing the
+	// selecting are two different rectangles, and the wrong tanks come along.
+	const Vector3 start(corner0.x, corner0.y, 0.0f);
+	const Vector3 span(corner1.x - corner0.x, corner1.y - corner0.y, 0.0f);
+	const Real acrossExtent = Vector3::Dot_Product(span, m_boxRight);
+	const Real awayExtent = Vector3::Dot_Product(span, m_boxForward);
+
+	const Vector3 c0 = start;
+	const Vector3 c1 = start + m_boxRight * acrossExtent;
+	const Vector3 c2 = c1 + m_boxForward * awayExtent;
+	const Vector3 c3 = start + m_boxForward * awayExtent;
+
+	// A world-aligned box around the turned one, to ask the engine for candidates cheaply.
 	Region3D region;
-	region.lo.x = min(corner0.x, corner1.x);
-	region.hi.x = max(corner0.x, corner1.x);
-	region.lo.y = min(corner0.y, corner1.y);
-	region.hi.y = max(corner0.y, corner1.y);
+	region.lo.x = min(min(c0.X, c1.X), min(c2.X, c3.X));
+	region.hi.x = max(max(c0.X, c1.X), max(c2.X, c3.X));
+	region.lo.y = min(min(c0.Y, c1.Y), min(c2.Y, c3.Y));
+	region.hi.y = max(max(c0.Y, c1.Y), max(c2.Y, c3.Y));
 	// Tall on purpose: aircraft and the tops of buildings are inside a box drawn on the ground.
 	region.lo.z = min(corner0.z, corner1.z) - 500.0f;
 	region.hi.z = max(corner0.z, corner1.z) + 2000.0f;
@@ -570,6 +602,13 @@ void VRControls::selectInBox(const Coord3D &corner0, const Coord3D &corner1)
 	ctx.msg = TheMessageStream->appendMessage(GameMessage::MSG_CREATE_SELECTED_GROUP);
 	ctx.msg->appendBooleanArgument(TRUE);	// a fresh group
 	ctx.count = 0;
+	ctx.origin = start;
+	ctx.right = m_boxRight;
+	ctx.forward = m_boxForward;
+	ctx.acrossLo = min(0.0f, acrossExtent);
+	ctx.acrossHi = max(0.0f, acrossExtent);
+	ctx.awayLo = min(0.0f, awayExtent);
+	ctx.awayHi = max(0.0f, awayExtent);
 
 	TheGameClient->iterateDrawablesInRegion(&region, addDrawableToSelection, &ctx);
 
@@ -597,22 +636,34 @@ void VRControls::updateBoxVisual(Bool visible)
 	const Real width = 3.0f + 0.004f * TheOpenXR->getWorldUnitsPerMeter();
 	const Real lift = 4.0f;	// float it clear of the ground so it is not swallowed by the terrain
 
-	const Real x0 = min(m_boxStart.x, m_boxEnd.x);
-	const Real x1 = max(m_boxStart.x, m_boxEnd.x);
-	const Real y0 = min(m_boxStart.y, m_boxEnd.y);
-	const Real y1 = max(m_boxStart.y, m_boxEnd.y);
+	// The box lives in the player's frame: one pair of edges runs left-right across their view,
+	// the other away from them. Dragged in the world's frame it would sit at a crooked angle the
+	// moment they turned, and they would find themselves sweeping a diamond.
+	const Vector3 start(m_boxStart.x, m_boxStart.y, 0.0f);
+	const Vector3 end(m_boxEnd.x, m_boxEnd.y, 0.0f);
+	const Vector3 span = end - start;
 
-	// Follow the ground along each edge rather than cutting through hills.
-	const Real z00 = TheTerrainLogic->getGroundHeight(x0, y0) + lift;
-	const Real z10 = TheTerrainLogic->getGroundHeight(x1, y0) + lift;
-	const Real z11 = TheTerrainLogic->getGroundHeight(x1, y1) + lift;
-	const Real z01 = TheTerrainLogic->getGroundHeight(x0, y1) + lift;
+	const Real acrossExtent = Vector3::Dot_Product(span, m_boxRight);
+	const Real awayExtent = Vector3::Dot_Product(span, m_boxForward);
 
-	const Vector3 corners[4] =
+	const Vector3 across = m_boxRight * acrossExtent;
+	const Vector3 away = m_boxForward * awayExtent;
+
+	Vector3 flat[4] =
 	{
-		Vector3(x0, y0, z00), Vector3(x1, y0, z10),
-		Vector3(x1, y1, z11), Vector3(x0, y1, z01),
+		start,
+		start + across,
+		start + across + away,
+		start + away,
 	};
+
+	// Follow the ground at each corner rather than cutting through the hills.
+	Vector3 corners[4];
+	for (Int c = 0; c < 4; ++c)
+	{
+		corners[c] = Vector3(flat[c].X, flat[c].Y,
+			TheTerrainLogic->getGroundHeight(flat[c].X, flat[c].Y) + lift);
+	}
 
 	for (Int i = 0; i < 4; ++i)
 	{
@@ -640,6 +691,32 @@ void VRControls::updateBoxSelect(const Vector3 &origin, const Vector3 &dir)
 		m_boxing = FALSE;
 		m_boxStart = ground;
 		m_boxEnd = ground;
+
+		// Take the player's heading now and hold it for the whole sweep, so the box does not
+		// swivel under their hand if they turn their head mid-drag.
+		m_boxRight = Vector3(1.0f, 0.0f, 0.0f);
+		m_boxForward = Vector3(0.0f, 1.0f, 0.0f);
+
+		Matrix3D anchor;
+		if (getAnchor((W3DView *)TheTacticalView, anchor))
+		{
+			const VREyeView &head = TheOpenXR->getEyeView(0);
+			Quaternion headQuat(head.quatX, head.quatY, head.quatZ, head.quatW);
+			Matrix3D headRot;
+			Build_Matrix3D(headQuat, headRot);
+			Matrix3D headWorld;
+			Matrix3D::Multiply(anchor, headRot, &headWorld);
+
+			Vector3 gaze = -headWorld.Get_Z_Vector();
+			gaze.Z = 0.0f;
+			if (gaze.Length2() > 0.0001f)
+			{
+				gaze.Normalize();
+				m_boxForward = gaze;
+				Vector3::Cross_Product(gaze, Vector3(0.0f, 0.0f, 1.0f), &m_boxRight);
+				m_boxRight.Normalize();
+			}
+		}
 	}
 	else if (right.trigger && m_boxArmed && onGround)
 	{
