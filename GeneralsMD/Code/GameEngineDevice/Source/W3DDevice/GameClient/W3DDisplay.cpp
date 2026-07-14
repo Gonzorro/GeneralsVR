@@ -1860,43 +1860,47 @@ void W3DDisplay::composeVRUiPanel()
 		device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
 		device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
 
-		// ---- 1. THE BLACK COPY. Colour comes from the texture factor (pure black); the SHAPE
-		// comes from the interface's own alpha. Written straight in, replacing nothing.
+		// Everything below is done WITHOUT masking the colour channels.
+		//
+		// The first version of this leaned on COLORWRITEENABLE to touch alpha while leaving colour
+		// alone. If the driver quietly ignores that mask - and this one appears to - the alpha
+		// never gets built up and the panel stays exactly as see-through as it was, which is the
+		// symptom we had. The masks are gone. Every pass below is arranged so that what it writes
+		// to the colour channels is harmless on its own terms.
+
+		// ---- 1. THE BLACK COPY. Colour is pure black, taken from the texture factor. The SHAPE
+		// is the interface's own alpha, so the copy fits it exactly - to the pixel, because it is
+		// a copy of it.
 		device->SetRenderState(D3DRS_TEXTUREFACTOR, 0xFF000000);
 		device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-		device->SetRenderState(D3DRS_COLORWRITEENABLE, D3DCOLORWRITEENABLE_RED
-			| D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE | D3DCOLORWRITEENABLE_ALPHA);
 		device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
 		device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TFACTOR);
 		device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
 		device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
 		device->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, quad, sizeof(ScreenVertex));
 
-		// ---- 2. Make that copy SOLID. Its shape is right but it inherited the interface's thin
-		// alpha, so it would be as see-through as the thing it is meant to be backing. Add the
-		// alpha to itself a few times and anything the interface touched at all becomes opaque,
-		// while the empty space it never touched stays exactly zero.
-		device->SetRenderState(D3DRS_COLORWRITEENABLE, D3DCOLORWRITEENABLE_ALPHA);
+		// ---- 2. MAKE THE COPY SOLID. Its shape is right, but it inherited the interface's thin
+		// alpha, so it is as see-through as the thing it is meant to be backing. Drawn again,
+		// additively: the colour being added is BLACK, which adds nothing at all, while the alpha
+		// adds to itself. Four more passes and anything the interface touched is solid, while the
+		// space it never touched is still adding zero to zero.
 		device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
 		device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
 		device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
 		for (Int pass = 0; pass < 4; ++pass)
 			device->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, quad, sizeof(ScreenVertex));
 
-		// ---- 3. THE INTERFACE ITSELF, standing on its black copy. Colour only: the alpha
-		// underneath is already solid and must not be touched.
-		device->SetRenderState(D3DRS_COLORWRITEENABLE, D3DCOLORWRITEENABLE_RED
-			| D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE);
-		device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);          // the interface arrives
-		device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA); // premultiplied already
+		// ---- 3. THE INTERFACE ITSELF, standing on its black copy. Its colour arrives already
+		// multiplied by its own alpha (that is what came out of the draw), so it is laid over the
+		// backing as-is. The alpha underneath is solid, and this leaves it solid: a over 1 is 1.
+		device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
+		device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
 		device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
 		device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
 		device->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, quad, sizeof(ScreenVertex));
 
 		// Hand the device back the way we found it.
 		device->SetTexture(0, nullptr);
-		device->SetRenderState(D3DRS_COLORWRITEENABLE, D3DCOLORWRITEENABLE_RED
-			| D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE | D3DCOLORWRITEENABLE_ALPHA);
 		device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
 		device->SetRenderState(D3DRS_ZENABLE, TRUE);
 		device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
@@ -1908,154 +1912,6 @@ void W3DDisplay::composeVRUiPanel()
 	}
 
 	DX8Wrapper::Set_Render_Target((IDirect3DSurface8 *)nullptr);
-}
-
-// W3DDisplay::blackenVRUiBacking =============================================
-/** GeneralsVR @feature Put a black copy of the interface behind the interface.
-	*
-	* The sprites the game draws carry only a partial alpha, so in VR the battlefield shone right
-	* through the buttons. A rectangle of black behind the panel cures that and ruins everything
-	* else: the menu stops being a menu and becomes a screen hanging in the air.
-	*
-	* What is wanted is a backing shaped EXACTLY like the interface - and the interface is already
-	* sitting in the target. So darken what is there, in place, in proportion to how thin it is:
-	* solid sprites are left alone, and see-through ones are pulled towards black instead of
-	* towards the battlefield. It fits the sprites perfectly because it is made of them.
-	*/
-//=============================================================================
-void W3DDisplay::blackenVRUiBacking()
-{
-	IDirect3DDevice8 *device = DX8Wrapper::_Get_D3D_Device8();
-	if (device == nullptr)
-		return;
-
-	struct ScreenVertex { Real x, y, z, rhw; DWORD color; };
-	const DWORD SCREEN_FVF = D3DFVF_XYZRHW | D3DFVF_DIFFUSE;
-
-	const Real w = (Real)getWidth();
-	const Real h = (Real)getHeight();
-	const DWORD black = 0xFF000000;
-
-	ScreenVertex quad[4] =
-	{
-		{ 0.0f, 0.0f, 0.0f, 1.0f, black },
-		{ w,    0.0f, 0.0f, 1.0f, black },
-		{ w,    h,    0.0f, 1.0f, black },
-		{ 0.0f, h,    0.0f, 1.0f, black },
-	};
-
-	device->SetVertexShader(SCREEN_FVF);
-	device->SetPixelShader(0);
-	device->SetTexture(0, nullptr);
-
-	device->SetRenderState(D3DRS_LIGHTING, FALSE);
-	device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
-	device->SetRenderState(D3DRS_ZENABLE, FALSE);
-	device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
-	device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
-	device->SetRenderState(D3DRS_FOGENABLE, FALSE);
-
-	// Colour only. The alpha channel is the next pass's business.
-	device->SetRenderState(D3DRS_COLORWRITEENABLE, D3DCOLORWRITEENABLE_RED
-		| D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE);
-
-	// Weighted by how transparent the pixel already is: solid sprites keep their colour, thin
-	// ones get black mixed in behind them.
-	device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
-	device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_INVDESTALPHA);
-	device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
-
-	device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
-	device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
-	device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
-	device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
-	device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
-	device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
-
-	device->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, quad, sizeof(ScreenVertex));
-
-	device->SetRenderState(D3DRS_COLORWRITEENABLE, D3DCOLORWRITEENABLE_RED
-		| D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE | D3DCOLORWRITEENABLE_ALPHA);
-	device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-	device->SetRenderState(D3DRS_ZENABLE, TRUE);
-	device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
-	DX8Wrapper::Invalidate_Cached_Render_States();
-}
-
-// W3DDisplay::solidifyVRUiAlpha ==============================================
-/** GeneralsVR @feature Make the interface solid in VR.
-	*
-	* The VR panel is a compositor layer that blends on the alpha the engine left in the render
-	* target - and the engine leaves only a partial alpha behind, so the buttons and menus came
-	* out see-through, with the battlefield glowing faintly through them.
-	*
-	* Alpha cannot simply be cleared to full: the background must stay at zero, or the panel
-	* becomes a rectangle of screen rather than the menu's own sprites. What is needed is to raise
-	* alpha wherever the interface painted ANYTHING, and leave the untouched background alone.
-	*
-	* So: draw over the whole target with the colour channels masked off, blending alpha as
-	* dst = dst*src + dst = 2*dst. Zero stays zero. Anything the interface touched doubles, and
-	* three passes take even a faint 0.15 to fully solid. The colour is never read or written.
-	*/
-//=============================================================================
-void W3DDisplay::solidifyVRUiAlpha()
-{
-	IDirect3DDevice8 *device = DX8Wrapper::_Get_D3D_Device8();
-	if (device == nullptr)
-		return;
-
-	struct ScreenVertex { Real x, y, z, rhw; DWORD color; };
-	const DWORD SCREEN_FVF = D3DFVF_XYZRHW | D3DFVF_DIFFUSE;
-
-	const Real w = (Real)getWidth();
-	const Real h = (Real)getHeight();
-	const DWORD white = 0xFFFFFFFF;
-
-	// Screen-space, so no camera or transforms are involved at all.
-	ScreenVertex quad[4] =
-	{
-		{ 0.0f, 0.0f, 0.0f, 1.0f, white },
-		{ w,    0.0f, 0.0f, 1.0f, white },
-		{ w,    h,    0.0f, 1.0f, white },
-		{ 0.0f, h,    0.0f, 1.0f, white },
-	};
-
-	device->SetVertexShader(SCREEN_FVF);
-	device->SetPixelShader(0);
-	device->SetTexture(0, nullptr);
-
-	device->SetRenderState(D3DRS_LIGHTING, FALSE);
-	device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
-	device->SetRenderState(D3DRS_ZENABLE, FALSE);
-	device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
-	device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
-	device->SetRenderState(D3DRS_FOGENABLE, FALSE);
-
-	// Touch the alpha channel and nothing else.
-	device->SetRenderState(D3DRS_COLORWRITEENABLE, D3DCOLORWRITEENABLE_ALPHA);
-	device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
-	device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_DESTALPHA);
-	device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
-
-	device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
-	device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
-	device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
-	device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
-	device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
-	device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
-
-	// Five doublings: even a faint tenth of an alpha ends up solid, while a true zero - the
-	// background the interface never touched - stays exactly zero and shows no panel at all.
-	for (Int pass = 0; pass < 5; ++pass)
-		device->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, quad, sizeof(ScreenVertex));
-
-	// Give the device back exactly as we found it.
-	device->SetRenderState(D3DRS_COLORWRITEENABLE, D3DCOLORWRITEENABLE_RED
-		| D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE | D3DCOLORWRITEENABLE_ALPHA);
-	device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-	device->SetRenderState(D3DRS_ZENABLE, TRUE);
-	device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
-	DX8Wrapper::Invalidate_Cached_Render_States();
 }
 
 // W3DDisplay::drawVRPanels ===================================================

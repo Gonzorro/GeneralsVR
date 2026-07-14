@@ -94,13 +94,8 @@ public:
 	/// laser aimed at a panel disappeared behind it, and the panel became a hard rectangle
 	/// stamped over the battlefield.
 	void drawVRPanels( const Matrix3D &anchor, Real scale );
-	/// Raise the interface's alpha to solid wherever it painted, leaving the background at zero.
-	/// The VR panel blends on that alpha, and the engine only leaves a partial one behind - which
-	/// is why the menu came out see-through.
-	void solidifyVRUiAlpha();
-	/// Stand a black copy of the interface behind itself, shaped exactly like it.
-	void blackenVRUiBacking();
-	/// Duplicate the interface, blacken the copy, and stand the interface back on top of it.
+	/// Duplicate the interface, blacken the copy, and stand the interface back on top of it, so
+	/// the panel's backing is the menu's own silhouette rather than a box drawn around it.
 	void composeVRUiPanel();
 	Bool m_vrWorldRendered;  ///< did the eye pass run this frame?
 #endif
