@@ -1920,22 +1920,29 @@ void W3DDisplay::composeVRUiPanel()
 		// Three patches, three questions, one look.
 		// ------------------------------------------------------------------------------------
 		{
-			struct Patch { Real x0, y0, x1, y1; DWORD colour; Bool useStencil; Bool alphaFromUi; };
+			struct Patch { Real x0, y0, x1, y1; DWORD colour; Bool useStencil; Bool alphaFromUi;
+				DWORD stencilRef; };
 			const Patch patches[] =
 			{
-				// GREEN, over empty sky: can the composite write at all, and does it reach the
-				// headset? No stencil, no texture - just paint.
-				{ 0.30f * w, 0.10f * h, 0.45f * w, 0.25f * h, 0xFF00FF00, FALSE, FALSE },
+				// The last card's BLUE told us the stencil test PASSES over the control bar - but a
+				// stencil that is being ignored altogether would look exactly the same, because the
+				// interface painted there anyway. These two settle it, out in EMPTY SKY where the
+				// interface painted nothing at all:
 
-				// BLUE, over the control bar, drawn ONLY where the stencil says the interface
-				// painted. If this appears, the silhouette mask exists. If it does not, it never
-				// got written and the whole stencil approach is dead.
-				{ 0.35f * w, 0.80f * h, 0.50f * w, 0.97f * h, 0xFF0000FF, TRUE,  FALSE },
+				// CYAN, empty sky, drawn only where the stencil says the interface DID paint.
+				// Nothing painted there, so this must be INVISIBLE. If you can see it, the stencil
+				// test is being ignored and the whole silhouette approach is dead.
+				{ 0.30f * w, 0.10f * h, 0.45f * w, 0.25f * h, 0xFF00FFFF, TRUE, FALSE, 1 },
+
+				// YELLOW, empty sky, drawn only where the stencil says the interface did NOT paint.
+				// Nothing painted there, so this must be VISIBLE. If it is missing while cyan
+				// shows, the stencil is inverted or unwritten.
+				{ 0.50f * w, 0.10f * h, 0.65f * w, 0.25f * h, 0xFFFFFF00, TRUE, FALSE, 0 },
 
 				// MAGENTA, over the control bar, taking its ALPHA from the interface texture.
-				// Solid means the interface wrote a strong alpha; ghostly means weak; invisible
-				// means it wrote none at all - which decides how the backing must be built.
-				{ 0.55f * w, 0.80f * h, 0.70f * w, 0.97f * h, 0xFFFF00FF, FALSE, TRUE  },
+				// SOLID means the interface wrote a strong alpha; GHOSTLY means weak; ABSENT means
+				// none - and that decides how the backing has to be built.
+				{ 0.55f * w, 0.80f * h, 0.70f * w, 0.97f * h, 0xFFFF00FF, FALSE, TRUE, 1 },
 			};
 
 			for (Int i = 0; i < 3; ++i)
@@ -1952,7 +1959,7 @@ void W3DDisplay::composeVRUiPanel()
 
 				device->SetRenderState(D3DRS_STENCILENABLE, patch.useStencil ? TRUE : FALSE);
 				device->SetRenderState(D3DRS_STENCILFUNC, D3DCMP_EQUAL);
-				device->SetRenderState(D3DRS_STENCILREF, 1);
+				device->SetRenderState(D3DRS_STENCILREF, patch.stencilRef);
 
 				device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
 				device->SetRenderState(D3DRS_TEXTUREFACTOR, patch.colour);
