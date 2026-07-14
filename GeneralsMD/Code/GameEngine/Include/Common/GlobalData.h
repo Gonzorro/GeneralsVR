@@ -134,6 +134,12 @@ public:
 	Bool m_vrPlaceAngleValid;   ///< the player is turning a building on the spot
 	Real m_vrPlaceAngle;
 
+	// GeneralsVR @feature The slice of the screen the VR panel should show, as fractions. Normally
+	// the bottom strip - the control bar IS the in-game interface - but when a full-screen window
+	// opens over it (the Generals promotion screen) the panel has to grow to hold that too, or the
+	// player is shown half a menu.
+	Real m_vrUiCropTop;    ///< 0..1 down the screen
+
 	// GeneralsVR @feature Interpolate drawable motion between 30Hz sim ticks (-smoothmotion).
 	// Implied by -vr, where 30Hz stepping is nauseating. Render-only; the sim is untouched.
 	Bool m_smoothMotion;

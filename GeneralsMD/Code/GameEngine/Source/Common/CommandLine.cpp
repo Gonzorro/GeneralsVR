@@ -420,6 +420,14 @@ Int parseVR(char *args[], int num)
 	// nothing. The engine already has a switch for drawing all of it.
 	TheWritableGlobalData->m_drawEntireTerrain = TRUE;
 
+	// Shadows: DECALS, not stencil volumes. A volume shadow is built in the stencil buffer of the
+	// surface being drawn to, and in VR the scene is drawn into our own eye targets rather than
+	// the backbuffer the engine expects - which is why the shadows came and went with the angle
+	// you happened to be looking from. A projected decal is just a texture laid on the ground and
+	// does not care where the camera is or what surface it is drawing into.
+	TheWritableGlobalData->m_useShadowVolumes = FALSE;
+	TheWritableGlobalData->m_useShadowDecals = TRUE;
+
 	return 1;
 }
 

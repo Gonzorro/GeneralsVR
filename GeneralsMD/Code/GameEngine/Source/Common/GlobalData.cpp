@@ -642,6 +642,7 @@ GlobalData::GlobalData()
 	m_vrAimPoint.zero();
 	m_vrPlaceAngleValid = FALSE;
 	m_vrPlaceAngle = 0.0f;
+	m_vrUiCropTop = 0.66f;
 	m_vrWorldUnitsPerMeter = 500.0f;
 	m_vrResolutionScale = 1.0f;
 	m_windowed = 0;

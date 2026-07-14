@@ -99,6 +99,7 @@ private:
 	void updateSelectionMarkers();
 	void updatePlacement(const Vector3 &origin, const Vector3 &dir);
 	void jumpToSelection();
+	void updateUiCrop();
 	Bool m_placing;
 	UnsignedInt m_placePressTime;  ///< when the trigger went down; 0 when not placing
 	Bool m_placeTurning;           ///< held long enough that the building now turns with the beam

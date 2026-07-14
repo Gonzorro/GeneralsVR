@@ -435,6 +435,10 @@ public:  // ********************************************************************
 
 	// build interface
 	virtual void placeBuildAvailable( const ThingTemplate *build, Drawable *buildDrawable );				///< built thing being placed
+	/// GeneralsVR @feature The heading the placement ghost is actually standing at. A tap must
+	/// build what the player was SHOWN, and only the ghost knows what that is.
+	virtual Real getPlaceIconAngle() const;
+
 	virtual const ThingTemplate *getPendingPlaceType();					///< get item we're trying to place
 	virtual ObjectID getPendingPlaceSourceObjectID();			///< get producing object
 	virtual Bool getPreventLeftClickDeselectionInAlternateMouseModeForOneClick() const { return m_preventLeftClickDeselectionInAlternateMouseModeForOneClick; }

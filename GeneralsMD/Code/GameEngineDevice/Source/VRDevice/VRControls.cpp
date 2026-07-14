@@ -35,6 +35,8 @@
 #include "GameClient/GameClient.h"
 #include "GameClient/DrawableInfo.h"
 #include "GameClient/InGameUI.h"
+#include "GameClient/GameWindow.h"
+#include "GameClient/GameWindowManager.h"
 #include "GameClient/CommandXlat.h"
 #include "GameLogic/Object.h"
 #include "Common/ThingTemplate.h"
@@ -492,10 +494,10 @@ void VRControls::updatePlacement(const Vector3 &origin, const Vector3 &dir)
 	// turned it. A tap never entered the turn, so it takes the heading the player is facing.
 	const Coord3D where = (m_placePressTime != 0) ? m_placeAnchor : spot;
 
-	// A tap builds it exactly as the ghost was standing - which is the default heading, the one
-	// the game itself uses. Handing it the CAMERA's angle instead meant the building you got was
-	// never the building you were shown: it spun to some other heading the moment you let go.
-	const Real angle = m_placeTurning ? m_placeAngle : 0.0f;
+	// A tap builds it exactly as the ghost was standing. Only the ghost knows what heading that
+	// is - inventing one (the camera's angle, or a bare zero) means the building that lands is
+	// not the building the player was looking at.
+	const Real angle = m_placeTurning ? m_placeAngle : TheInGameUI->getPlaceIconAngle();
 
 	GameMessage *msg = TheMessageStream->appendMessage(GameMessage::MSG_DOZER_CONSTRUCT);
 	msg->appendIntegerArgument(build->getTemplateID());
@@ -1011,7 +1013,8 @@ void VRControls::updateLocomotion(W3DView *view)
 	{
 		if (turn != 0.0f)
 		{
-			const Real delta = turn * STICK_TURN_SPEED * dt;
+			// Push right, turn right.
+			const Real delta = -turn * STICK_TURN_SPEED * dt;
 
 			// Turn on the spot. The RTS camera orbits its look-at point, so turning swung the
 			// player around a pivot far out on the battlefield - you were on the end of a boom,
@@ -1418,7 +1421,10 @@ void VRControls::updateRays(W3DView *view)
 		Real panelDistance = 0.0f;
 		if (TheOpenXR->pickUiPanel(hand, px, py, &panelDistance) != OpenXRManager::VR_PICK_NONE)
 		{
-			length = panelDistance * scale;
+			// Stop a hair short. Ending the beam exactly ON the panel's surface leaves the two
+			// coplanar, and the depth test throws the beam away - which reads as a laser that
+			// cannot touch the menu at all.
+			length = panelDistance * scale * 0.97f;
 		}
 		else if (inGame)
 		{
@@ -1595,7 +1601,54 @@ void VRControls::update()
 		}
 	}
 
+	updateUiCrop();
+
 	// The beams are drawn everywhere, including the menus - that is the whole point of them.
 	updateRays(view);
 	updateSelectionMarkers();
+}
+
+//-------------------------------------------------------------------------------------------------
+/** How much of the screen the VR panel needs to show.
+	*
+	* The control bar along the bottom IS the in-game interface, so that strip is all the panel
+	* normally carries - showing the whole frame would hang a monitor-sized black slab in the air.
+	* But a full-screen window (the Generals promotion screen) opens ABOVE that strip, and cropping
+	* it away showed the player half a menu. So we ask the window system where its visible windows
+	* actually are, and let the panel grow just far enough to hold them.
+	*/
+//-------------------------------------------------------------------------------------------------
+void VRControls::updateUiCrop()
+{
+	if (TheWritableGlobalData == nullptr || TheDisplay == nullptr)
+		return;
+
+	const Real BOTTOM_STRIP = 0.66f;	// where the control bar begins
+	Real top = BOTTOM_STRIP;
+
+	if (TheWindowManager != nullptr)
+	{
+		const Real screenHeight = (Real)TheDisplay->getHeight();
+
+		for (GameWindow *win = TheWindowManager->winGetWindowList(); win != nullptr;
+			win = win->winGetNext())
+		{
+			if (win->winIsHidden())
+				continue;
+
+			Int x = 0, y = 0;
+			win->winGetPosition(&x, &y);
+			if (y < 0)
+				y = 0;
+
+			const Real winTop = (Real)y / screenHeight;
+			if (winTop < top)
+				top = winTop;
+		}
+	}
+
+	if (top < 0.0f) top = 0.0f;
+	if (top > BOTTOM_STRIP) top = BOTTOM_STRIP;
+
+	TheWritableGlobalData->m_vrUiCropTop = top;
 }

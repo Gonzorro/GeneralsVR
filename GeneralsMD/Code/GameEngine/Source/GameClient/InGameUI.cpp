@@ -3429,6 +3429,15 @@ void InGameUI::placeBuildAvailable( const ThingTemplate *build, Drawable *buildD
 //-------------------------------------------------------------------------------------------------
 /** Return the thing we're attempting to place */
 //-------------------------------------------------------------------------------------------------
+Real InGameUI::getPlaceIconAngle() const
+{
+	// GeneralsVR: the ghost's own heading. Handing the placement anything else - the camera's
+	// angle, say - means the building that lands is not the one the player was looking at.
+	if( m_placeIcon && m_placeIcon[ 0 ] )
+		return m_placeIcon[ 0 ]->getOrientation();
+	return 0.0f;
+}
+
 const ThingTemplate *InGameUI::getPendingPlaceType()
 {
 	return m_pendingPlaceType;

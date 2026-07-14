@@ -1439,7 +1439,7 @@ void OpenXRManager::layoutUiPanels()
 		p.isGroupBar = FALSE;
 		p.ownerHand = hand;
 		p.cropX = 0;
-		p.cropY = (Int)(0.66f * m_uiHeight);
+		p.cropY = (Int)(TheGlobalData->m_vrUiCropTop * m_uiHeight);
 		p.cropW = m_uiWidth;
 		p.cropH = m_uiHeight - p.cropY;
 		p.widthMeters = 0.55f * 0.75f;	// three quarters of what it was
@@ -1456,7 +1456,7 @@ void OpenXRManager::layoutUiPanels()
 		p.active = TRUE;
 
 		// The control-group bar sits directly under it.
-		if (m_groupBarReady)
+		if (FALSE && m_groupBarReady)	// off: it read as an unexplained black slab under the menu
 		{
 			UiPanel& g = m_uiPanels[groupPanelIds[hand]];
 			g.isGroupBar = TRUE;
