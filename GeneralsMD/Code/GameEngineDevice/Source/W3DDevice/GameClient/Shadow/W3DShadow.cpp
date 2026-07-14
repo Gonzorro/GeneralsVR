@@ -191,15 +191,24 @@ Shadow *W3DShadowManager::addShadow( RenderObjClass *robj, Shadow::ShadowTypeInf
 	// apart when the camera wanders somewhere the original game never let it go - low, close, or
 	// inside the volume itself. On a monitor the camera hangs high above the battlefield and the
 	// trick always holds. In VR the player can put their head anywhere, which is why the shadows
-	// have been blinking in and out with the angle of their head.
+	// were blinking in and out with the angle of their head.
 	//
-	// A projected shadow is just the object's silhouette rendered from above and laid on the ground.
-	// It does not care where you are looking from, so it is there at every angle - which is the
-	// whole point. This is a TYPE change, made when the shadow is created: switching the global
-	// 'use volumes' flag could never have worked, because the type comes from the object's INI and
-	// the flag only decides whether the volume that already exists gets drawn.
+	// A projected shadow is the object's silhouette rendered from above and laid on the ground. It
+	// does not care where you are looking from, so it is there at every angle - which is the whole
+	// point.
+	//
+	// The shadow info is deliberately NOT passed on. The projected manager decides what to build by
+	// reading shadowInfo->m_type, and these objects say SHADOW_VOLUME - a type it has no branch for,
+	// so it would fall through with a null shadow texture and read a float straight off the null
+	// pointer. (It did. That was the skirmish crash.) Handing it nothing takes its documented path:
+	// 'no shadow info, assume user wants a projected shadow', which builds the silhouette from the
+	// render object itself. Which is exactly the thing we are asking for.
 	if (TheGlobalData != nullptr && TheGlobalData->m_vrMode && type == SHADOW_VOLUME)
-		type = SHADOW_PROJECTION;
+	{
+		if (TheW3DProjectedShadowManager)
+			return (Shadow *)TheW3DProjectedShadowManager->addShadow(robj, nullptr, draw);
+		return nullptr;
+	}
 
 	switch(type)
 	{
