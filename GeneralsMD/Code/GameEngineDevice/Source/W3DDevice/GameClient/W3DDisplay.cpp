@@ -2135,10 +2135,12 @@ void W3DDisplay::drawVRScene( W3DView *view )
 
 		if (WW3D::Begin_Render(false, false, Vector3(0.0f, 0.0f, 0.0f)) == WW3D_ERROR_OK)
 		{
-			// Transparent background: only the interface's own sprites should exist in VR, never
-			// a rectangle of screen. The panel quad alpha-tests this, so what the UI did not
-			// paint is simply not drawn - no black square, and the sprites stay solid.
-			DX8Wrapper::Clear(true, false, Vector3(0.0f, 0.0f, 0.0f), 0.0f);
+			// The panel needs a BACKING, or the interface's own partial alpha lets the
+			// battlefield glow through the buttons however hard we push the alpha afterwards.
+			// So the target is cleared to solid black: every pixel the panel shows now has
+			// something opaque behind it, and the menu reads like a physical screen rather than a
+			// ghost. The panel is what the player summoned - it is allowed to be a real object.
+			DX8Wrapper::Clear(true, false, Vector3(0.0f, 0.0f, 0.0f), 1.0f);
 
 			TheInGameUI->DRAW();	// this repaints the whole window system, menus included
 			if (TheMouse != nullptr)

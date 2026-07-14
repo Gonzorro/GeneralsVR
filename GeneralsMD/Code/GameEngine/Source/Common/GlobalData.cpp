@@ -640,6 +640,8 @@ GlobalData::GlobalData()
 	m_smoothMotion = FALSE;
 	m_vrAimValid = FALSE;
 	m_vrAimPoint.zero();
+	m_vrPlaceAngleValid = FALSE;
+	m_vrPlaceAngle = 0.0f;
 	m_vrWorldUnitsPerMeter = 500.0f;
 	m_vrResolutionScale = 1.0f;
 	m_windowed = 0;

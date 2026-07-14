@@ -131,6 +131,8 @@ public:
 	// uses it directly. GlobalData is the one thing both layers can see.
 	Bool m_vrAimValid;
 	Coord3D m_vrAimPoint;
+	Bool m_vrPlaceAngleValid;   ///< the player is turning a building on the spot
+	Real m_vrPlaceAngle;
 
 	// GeneralsVR @feature Interpolate drawable motion between 30Hz sim ticks (-smoothmotion).
 	// Implied by -vr, where 30Hz stepping is nauseating. Render-only; the sim is untouched.

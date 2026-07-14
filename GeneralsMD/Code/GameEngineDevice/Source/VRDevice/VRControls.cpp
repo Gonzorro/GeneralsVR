@@ -85,6 +85,11 @@ namespace
 	const Real SLIDE_MAX_SPEED     = 2.5f;   ///< table-metres per second; hard ceiling on a throw
 	const Real SLIDE_SMOOTHING     = 0.25f;  ///< how much of each frame's velocity we believe
 
+	// Flying up and down over the battlefield.
+	const Real STICK_HEIGHT_SPEED  = 1.6f;    ///< fraction of the current height, per second
+	const Real MIN_HEIGHT          = 30.0f;   ///< low enough to stand among the tanks
+	const Real MAX_HEIGHT          = 6000.0f; ///< high enough to hold the whole map
+
 	const Real RAY_WIDTH_METERS    = 0.004f;
 	const Real RAY_MAX_METERS      = 6.0f;   ///< how far a laser reaches when it hits nothing
 
@@ -162,6 +167,10 @@ VRControls::VRControls()
 	m_boxing = FALSE;
 	m_boxArmed = FALSE;
 	m_placing = FALSE;
+	m_placePressTime = 0;
+	m_placeTurning = FALSE;
+	m_placeAnchor.zero();
+	m_placeAngle = 0.0f;
 	m_boxStart.zero();
 	m_boxEnd.zero();
 }
@@ -436,28 +445,69 @@ void VRControls::updatePlacement(const Vector3 &origin, const Vector3 &dir)
 		return;
 
 	// The building itself is the preview: the engine's own ghost, with its own legality tint,
-	// now follows the laser because the aim point is published where the placement code reads it
+	// follows the laser because the aim point is published where the placement code reads it
 	// (see GlobalData::m_vrAimPoint). No stand-in footprint required - you see the building.
 
 	const VRControllerState &right = TheOpenXR->getController(VR_HAND_RIGHT);
-	if (!right.triggerPressed && !right.primaryPressed)
+	const UnsignedInt now = GetTickCount();
+
+	// TAP to drop it as it stands. HOLD, and the building pins itself where you first pointed and
+	// turns to follow the laser - sweep the beam around it like a compass needle, release to
+	// commit. The threshold is what separates the two, and it costs a tap nothing.
+	const UnsignedInt HOLD_TO_TURN_MS = 500;
+
+	if (right.triggerPressed)
+	{
+		m_placePressTime = now;
+		m_placeAnchor = spot;
+		m_placeTurning = FALSE;
+		return;
+	}
+
+	if (right.trigger && m_placePressTime != 0)
+	{
+		if (!m_placeTurning && (now - m_placePressTime) >= HOLD_TO_TURN_MS)
+			m_placeTurning = TRUE;
+
+		if (m_placeTurning)
+		{
+			// The angle from where the building sits to where the beam now points.
+			const Real dx = spot.x - m_placeAnchor.x;
+			const Real dy = spot.y - m_placeAnchor.y;
+			if ((dx * dx + dy * dy) > 1.0f)
+				m_placeAngle = atan2f(dy, dx);
+
+			TheWritableGlobalData->m_vrPlaceAngleValid = TRUE;
+			TheWritableGlobalData->m_vrPlaceAngle = m_placeAngle;
+			TheWritableGlobalData->m_vrAimPoint = m_placeAnchor;	// it stays put while it turns
+		}
+		return;
+	}
+
+	const Bool releasedAfterHold = (!right.trigger && m_placePressTime != 0);
+	if (!releasedAfterHold && !right.primaryPressed)
 		return;
 
-	// Face it the way the player is facing.
-	Real angle = 0.0f;
-	if (TheTacticalView != nullptr)
-		angle = TheTacticalView->getAngle();
+	// Where and how it lands: where the beam was when it was pinned, turned however the player
+	// turned it. A tap never entered the turn, so it takes the heading the player is facing.
+	const Coord3D where = (m_placePressTime != 0) ? m_placeAnchor : spot;
+	Real angle = m_placeTurning ? m_placeAngle
+		: ((TheTacticalView != nullptr) ? TheTacticalView->getAngle() : 0.0f);
 
 	GameMessage *msg = TheMessageStream->appendMessage(GameMessage::MSG_DOZER_CONSTRUCT);
 	msg->appendIntegerArgument(build->getTemplateID());
-	msg->appendLocationArgument(spot);
+	msg->appendLocationArgument(where);
 	msg->appendRealArgument(angle);
 
 	// Leave placement mode, exactly as the mouse path does once it has placed.
 	TheInGameUI->placeBuildAvailable(nullptr, nullptr);
 	m_placing = FALSE;
+	m_placeTurning = FALSE;
+	m_placePressTime = 0;
+	TheWritableGlobalData->m_vrPlaceAngleValid = FALSE;
 
-	DEBUG_LOG(("OpenXR: placed building at (%.0f %.0f)", spot.x, spot.y));
+	DEBUG_LOG(("OpenXR: placed building at (%.0f %.0f) angle %.0f",
+		where.x, where.y, angle * 57.2958f));
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -482,6 +532,12 @@ namespace
 		Object *obj = draw->getObject();
 		if (obj == nullptr || !obj->isLocallyControlled())
 			return;	// a box drag takes YOUR units, never the enemy's
+
+		// And never your BUILDINGS. Sweeping up a barracks along with the tanks standing next to
+		// it means the group can no longer be told to do anything a tank does - the order gets
+		// refused because half the selection cannot move. A box is for units.
+		if (obj->isKindOf(KINDOF_STRUCTURE))
+			return;
 
 		TheInGameUI->selectDrawable(draw);
 		ctx->msg->appendObjectIDArgument(obj->getID());
@@ -965,13 +1021,25 @@ void VRControls::updateLocomotion(W3DView *view)
 	}
 	else if (grow != 0.0f)
 	{
-		// Up makes YOU bigger: a metre of you covers more world, so the map shrinks away below
-		// and you take in the whole battle. Down shrinks you into it, until the tanks are the
-		// size of tanks. (The scale is world units per metre of player, hence up = larger.)
-		Real newScale = TheOpenXR->getWorldUnitsPerMeter() * (1.0f + grow * STICK_ZOOM_SPEED * dt);
-		if (newScale < MIN_SCALE) newScale = MIN_SCALE;
-		if (newScale > MAX_SCALE) newScale = MAX_SCALE;
-		TheOpenXR->setWorldUnitsPerMeter(newScale);
+		// Up and down now simply FLY YOU, straight up and straight down over the battlefield -
+		// no resizing, no change of scale, just altitude. Rising to look over the whole map and
+		// dropping back down among the tanks is the movement people actually reach for; changing
+		// how big you are was a stranger idea than it sounded.
+		//
+		// The step grows with the height you are already at, so it is fine at both ends: gentle
+		// when you are down among the units, brisk when you are up looking at the whole map.
+		view->setZoomLimited(FALSE);	// the RTS height clamp has no business up here
+
+		const Real currentHeight = view->getHeightAboveGround();
+		Real newHeight = currentHeight * (1.0f + grow * STICK_HEIGHT_SPEED * dt);
+		if (newHeight < MIN_HEIGHT) newHeight = MIN_HEIGHT;
+		if (newHeight > MAX_HEIGHT) newHeight = MAX_HEIGHT;
+		view->setHeightAboveGround(newHeight);
+
+		// The camera is only rebuilt when the view is marked dirty, and setHeightAboveGround does
+		// not mark it - the same trap the rotation fell into.
+		const Coord3D here = view->getPosition();
+		view->lookAt(&here);
 	}
 }
 

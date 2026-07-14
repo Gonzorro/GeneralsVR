@@ -100,6 +100,10 @@ private:
 	void updatePlacement(const Vector3 &origin, const Vector3 &dir);
 	void jumpToSelection();
 	Bool m_placing;
+	UnsignedInt m_placePressTime;  ///< when the trigger went down; 0 when not placing
+	Bool m_placeTurning;           ///< held long enough that the building now turns with the beam
+	Coord3D m_placeAnchor;         ///< where it pinned itself when the trigger went down
+	Real m_placeAngle;
 	/// What the game would do if the trigger went now - the beam wears this as its colour, since
 	/// a mouse cursor cannot follow a laser out into the world.
 	void getReticleColor(const Vector3 &origin, const Vector3 &dir,

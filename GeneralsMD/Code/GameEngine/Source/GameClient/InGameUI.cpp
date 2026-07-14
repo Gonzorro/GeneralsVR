@@ -1689,6 +1689,11 @@ void InGameUI::handleBuildPlacements()
 		{
 			world = TheGlobalData->m_vrAimPoint;
 			haveWorld = TRUE;
+
+			// Holding the trigger pins the building where it stands and turns it instead, so the
+			// aim point stops moving it and the angle takes over.
+			if( TheGlobalData->m_vrPlaceAngleValid )
+				angle = TheGlobalData->m_vrPlaceAngle;
 		}
 		else
 		{
