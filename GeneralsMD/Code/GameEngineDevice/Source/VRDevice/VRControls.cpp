@@ -1166,10 +1166,33 @@ void VRControls::updatePointer(W3DView *view)
 					? TheInGameUI->getAllSelectedDrawables() : nullptr;
 				const Bool haveSelection = (selected != nullptr && !selected->empty());
 
-				if (isOwn)
-					selectUnderRay(origin, dir);	// your own unit: take it
+				// Does what is selected have something USEFUL to do with what is under the beam?
+				// A worker and a half-built barracks means "go and finish it"; a worker and a
+				// damaged one means "go and fix it". Selecting the building instead - which is
+				// what a plain is-it-mine test does - throws the worker away and answers a
+				// question nobody asked. So ask the engine what the pair would do, and if it has
+				// an answer, do that; only fall back to selecting when it does not.
+				Bool actionable = FALSE;
+				if (haveSelection && underRay != nullptr && TheGameClient != nullptr)
+				{
+					Coord3D spot;
+					const Coord3D *pos = traceTerrain(origin, dir, spot) ? &spot
+						: underRay->getPosition();
+					if (pos != nullptr)
+					{
+						const GameMessage::Type ctx = TheGameClient->evaluateContextCommand(
+							underRay, pos, CommandTranslator::EVALUATE_ONLY);
+						actionable = (ctx != GameMessage::MSG_INVALID)
+							&& (ctx != GameMessage::MSG_DO_MOVETO);
+					}
+				}
+
+				if (actionable)
+					commandUnderRay(origin, dir);	// finish it, repair it, enter it, attack it
+				else if (isOwn)
+					selectUnderRay(origin, dir);	// your own unit, and nothing to do with it: take it
 				else if (haveSelection)
-					commandUnderRay(origin, dir);	// something of yours is waiting for an order
+					commandUnderRay(origin, dir);	// bare ground, or theirs: an order
 				else
 					selectUnderRay(origin, dir);	// nothing selected: a click on nothing clears
 			}
@@ -1530,7 +1553,10 @@ void VRControls::update()
 	// Publish where the laser meets the ground. The engine's building placement reads this: its
 	// ghost used to be derived from the mouse cursor, which only exists where the flat camera can
 	// see, and so the building would never go where the player was pointing.
-	if (TheWritableGlobalData != nullptr)
+	// While a building is being TURNED it stays pinned where it was put down, so the aim point
+	// must not be republished - doing so dragged the building along behind the beam, which is
+	// exactly what the pin was for.
+	if (TheWritableGlobalData != nullptr && !m_placeTurning)
 	{
 		Vector3 origin, dir;
 		Coord3D ground;

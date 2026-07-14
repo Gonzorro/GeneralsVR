@@ -1432,13 +1432,16 @@ void OpenXRManager::layoutUiPanels()
 		// engine draws it for us on a transparent background, the battlefield shows through
 		// everywhere the UI is not - and a full-screen menu (the Generals promotion screen, say)
 		// appears in full instead of being sliced in half.
+		// Only the bottom strip - the control bar, the minimap, the money. That IS the in-game
+		// interface; the rest of the screen is battlefield. Showing the whole frame meant the
+		// panel's backing became a black rectangle the size of a monitor hanging in the air.
 		UiPanel& p = m_uiPanels[wristPanelIds[hand]];
 		p.isGroupBar = FALSE;
 		p.ownerHand = hand;
 		p.cropX = 0;
-		p.cropY = 0;
+		p.cropY = (Int)(0.66f * m_uiHeight);
 		p.cropW = m_uiWidth;
-		p.cropH = m_uiHeight;
+		p.cropH = m_uiHeight - p.cropY;
 		p.widthMeters = 0.55f * 0.75f;	// three quarters of what it was
 		p.heightMeters = p.widthMeters * (Real)p.cropH / (Real)p.cropW;
 		p.pose.orientation = panelQuat;
