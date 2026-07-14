@@ -1956,11 +1956,19 @@ void W3DDisplay::drawVRPanels( const Matrix3D &anchor, Real scale )
 			device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
 			device->SetRenderState(D3DRS_FOGENABLE, FALSE);
 
-			// Plain and opaque. The panel has a solid backing now, so there is no alpha to fuss
-			// over - and no alpha test to accidentally throw the entire menu away, which is what
-			// happened the last time these were geometry.
-			device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-			device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+			// Blend on the interface's alpha, which the pass above has already driven to solid
+			// wherever it painted and left at zero everywhere else. So the sprites arrive opaque
+			// and the space between them is not drawn at all - no rectangle, no ghost.
+			//
+			// The alpha test throws away the untouched background BEFORE it can write depth,
+			// which matters: a panel that wrote depth across its whole quad would carve a hole in
+			// the battlefield behind it.
+			device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+			device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+			device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+			device->SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
+			device->SetRenderState(D3DRS_ALPHAREF, 0x20);
+			device->SetRenderState(D3DRS_ALPHAFUNC, D3DCMP_GREATER);
 			device->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
 
 			device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
@@ -2103,12 +2111,14 @@ void W3DDisplay::drawVRScene( W3DView *view )
 
 			// The laser pointers go on top, in the same eye pass, so they land in the headset
 			// (and in the monitor mirror) with correct depth. In the menus they are all there is.
+			// The panels go down BEFORE the beams. They are solid geometry and write depth; the
+			// beams are alpha-blended lines, which do not. Drawn the other way round, the panel
+			// passed the depth test over the top of the laser and simply painted it out - which
+			// is precisely what "the ray does not reach the menu" looked like.
+			drawVRPanels(anchor, scale);
+
 			if (TheVRControls != nullptr && TheVRControls->getRayScene() != nullptr)
 				WW3D::Render(TheVRControls->getRayScene(), vrCamera);
-
-			// The panels are geometry, so a beam pointing at one lands ON it - a compositor layer
-			// has no depth and swallowed the laser whole.
-			drawVRPanels(anchor, scale);
 
 			WW3D::End_Render(false);  // no present: the image belongs to the headset
 		}
@@ -2131,12 +2141,13 @@ void W3DDisplay::drawVRScene( W3DView *view )
 
 		if (WW3D::Begin_Render(false, false, Vector3(0.0f, 0.0f, 0.0f)) == WW3D_ERROR_OK)
 		{
-			// The panel needs a BACKING, or the interface's own partial alpha lets the
-			// battlefield glow through the buttons however hard we push the alpha afterwards.
-			// So the target is cleared to solid black: every pixel the panel shows now has
-			// something opaque behind it, and the menu reads like a physical screen rather than a
-			// ghost. The panel is what the player summoned - it is allowed to be a real object.
-			DX8Wrapper::Clear(true, false, Vector3(0.0f, 0.0f, 0.0f), 1.0f);
+			// Black, but TRANSPARENT. What makes the sprites solid is the alpha pass below, not
+			// the clear: it raises the alpha wherever the interface painted and leaves the rest at
+			// zero. Clearing to opaque instead gave every pixel a backing - including the millions
+			// the interface never touched - and the menu became a rectangle of screen hanging in
+			// the air. Black is still the right colour, because the sprites end up composited over
+			// it, and that is exactly the black backing they need.
+			DX8Wrapper::Clear(true, false, Vector3(0.0f, 0.0f, 0.0f), 0.0f);
 
 			TheInGameUI->DRAW();	// this repaints the whole window system, menus included
 			if (TheMouse != nullptr)

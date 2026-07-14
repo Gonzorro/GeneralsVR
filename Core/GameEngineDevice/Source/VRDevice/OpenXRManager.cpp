@@ -1439,9 +1439,13 @@ void OpenXRManager::layoutUiPanels()
 		p.isGroupBar = FALSE;
 		p.ownerHand = hand;
 		p.cropX = 0;
-		p.cropY = (Int)(TheGlobalData->m_vrUiCropTop * m_uiHeight);
+		// The whole frame. That used to mean a monitor-sized slab of black, but the background is
+		// transparent now and only what the interface painted survives - so the panel is the
+		// control bar's own shape, and a full-screen menu simply appears where it opens. No crop
+		// to guess at, and nothing to detect.
+		p.cropY = 0;
 		p.cropW = m_uiWidth;
-		p.cropH = m_uiHeight - p.cropY;
+		p.cropH = m_uiHeight;
 		p.widthMeters = 0.55f * 0.75f;	// three quarters of what it was
 		p.heightMeters = p.widthMeters * (Real)p.cropH / (Real)p.cropW;
 		p.pose.orientation = panelQuat;
