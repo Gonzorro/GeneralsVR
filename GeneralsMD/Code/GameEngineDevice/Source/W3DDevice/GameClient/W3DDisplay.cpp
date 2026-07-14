@@ -1915,65 +1915,6 @@ void W3DDisplay::composeVRUiPanel()
 		device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TFACTOR);	// stay opaque
 		device->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, quad, sizeof(ScreenVertex));
 
-		// ------------------------------------------------------------------------------------
-		// TEST CARD. My instruments lie about these textures, so the headset is the instrument.
-		// Three patches, three questions, one look.
-		// ------------------------------------------------------------------------------------
-		{
-			struct Patch { Real x0, y0, x1, y1; DWORD colour; Bool useStencil; Bool alphaFromUi;
-				DWORD stencilRef; };
-			const Patch patches[] =
-			{
-				// The last card's BLUE told us the stencil test PASSES over the control bar - but a
-				// stencil that is being ignored altogether would look exactly the same, because the
-				// interface painted there anyway. These two settle it, out in EMPTY SKY where the
-				// interface painted nothing at all:
-
-				// CYAN, empty sky, drawn only where the stencil says the interface DID paint.
-				// Nothing painted there, so this must be INVISIBLE. If you can see it, the stencil
-				// test is being ignored and the whole silhouette approach is dead.
-				{ 0.30f * w, 0.10f * h, 0.45f * w, 0.25f * h, 0xFF00FFFF, TRUE, FALSE, 1 },
-
-				// YELLOW, empty sky, drawn only where the stencil says the interface did NOT paint.
-				// Nothing painted there, so this must be VISIBLE. If it is missing while cyan
-				// shows, the stencil is inverted or unwritten.
-				{ 0.50f * w, 0.10f * h, 0.65f * w, 0.25f * h, 0xFFFFFF00, TRUE, FALSE, 0 },
-
-				// MAGENTA, over the control bar, taking its ALPHA from the interface texture.
-				// SOLID means the interface wrote a strong alpha; GHOSTLY means weak; ABSENT means
-				// none - and that decides how the backing has to be built.
-				{ 0.55f * w, 0.80f * h, 0.70f * w, 0.97f * h, 0xFFFF00FF, FALSE, TRUE, 1 },
-			};
-
-			for (Int i = 0; i < 3; ++i)
-			{
-				const Patch &patch = patches[i];
-
-				ScreenVertex box[4] =
-				{
-					{ patch.x0, patch.y0, 0.0f, 1.0f, 0.0f, 0.0f },
-					{ patch.x1, patch.y0, 0.0f, 1.0f, 1.0f, 0.0f },
-					{ patch.x1, patch.y1, 0.0f, 1.0f, 1.0f, 1.0f },
-					{ patch.x0, patch.y1, 0.0f, 1.0f, 0.0f, 1.0f },
-				};
-
-				device->SetRenderState(D3DRS_STENCILENABLE, patch.useStencil ? TRUE : FALSE);
-				device->SetRenderState(D3DRS_STENCILFUNC, D3DCMP_EQUAL);
-				device->SetRenderState(D3DRS_STENCILREF, patch.stencilRef);
-
-				device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-				device->SetRenderState(D3DRS_TEXTUREFACTOR, patch.colour);
-
-				device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
-				device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TFACTOR);
-				device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
-				device->SetTextureStageState(0, D3DTSS_ALPHAARG1,
-					patch.alphaFromUi ? D3DTA_TEXTURE : D3DTA_TFACTOR);
-
-				device->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, box, sizeof(ScreenVertex));
-			}
-		}
-
 		// Hand the device back the way we found it.
 		device->SetTexture(0, nullptr);
 		device->SetRenderState(D3DRS_STENCILENABLE, FALSE);
@@ -2400,10 +2341,6 @@ void W3DDisplay::drawVRScene( W3DView *view )
 			{
 				DX8Wrapper::Clear(true, false, Vector3(0.0f, 0.0f, 0.0f), 0.0f);
 			}
-
-			// TEST CARD, patch 1 of 4. RED, drawn into the INTERFACE target with the same 2D call
-			// the interface uses. Seeing it proves the headset is shown this target's contents.
-			drawFillRect(100, 100, 200, 200, GameMakeColor(255, 0, 0, 255));
 
 			TheInGameUI->DRAW();	// this repaints the whole window system, menus included
 			if (TheMouse != nullptr)
