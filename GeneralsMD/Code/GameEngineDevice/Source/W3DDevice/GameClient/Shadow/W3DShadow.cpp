@@ -197,17 +197,33 @@ Shadow *W3DShadowManager::addShadow( RenderObjClass *robj, Shadow::ShadowTypeInf
 	// does not care where you are looking from, so it is there at every angle - which is the whole
 	// point.
 	//
-	// The shadow info is deliberately NOT passed on. The projected manager decides what to build by
-	// reading shadowInfo->m_type, and these objects say SHADOW_VOLUME - a type it has no branch for,
-	// so it would fall through with a null shadow texture and read a float straight off the null
-	// pointer. (It did. That was the skirmish crash.) Handing it nothing takes its documented path:
-	// 'no shadow info, assume user wants a projected shadow', which builds the silhouette from the
-	// render object itself. Which is exactly the thing we are asking for.
-	if (TheGlobalData != nullptr && TheGlobalData->m_vrMode && type == SHADOW_VOLUME)
+	// A DECAL, specifically - not a SHADOW_PROJECTION. Projection looks like the right answer and it
+	// is a trap: its texture initialiser in this engine is
+	//
+	//     Int W3DShadowTexture::init(RenderObjClass *robj)  { ///@todo: implement this function
+	//
+	// which hands back an EMPTY texture. The shadows were faithfully created, enabled, and drawn -
+	// 168 of them - and every one was blank. That is abandoned code, and no amount of work on this
+	// side of it would have produced a shadow.
+	//
+	// A decal is what the engine actually ships and exercises: the silhouette texture laid on the
+	// terrain beneath the object, conforming to the ground, sized from the object's own bounding
+	// box. It costs nothing per frame (the image never changes) and it is drawn by the same path
+	// the game's existing decals already use.
+	if (TheGlobalData != nullptr && TheGlobalData->m_vrMode && type == SHADOW_VOLUME
+		&& TheW3DProjectedShadowManager != nullptr)
 	{
-		if (TheW3DProjectedShadowManager)
-			return (Shadow *)TheW3DProjectedShadowManager->addShadow(robj, nullptr, draw);
-		return nullptr;
+		Shadow::ShadowTypeInfo vrInfo;
+		vrInfo.m_type = SHADOW_DECAL;
+		vrInfo.m_ShadowName[0] = '\0';   // empty: the manager falls back to its own default decal
+		vrInfo.allowUpdates = FALSE;     // the image never changes, so it is never re-rendered
+		vrInfo.allowWorldAlign = TRUE;   // let it wrap over the ground it lands on
+		vrInfo.m_sizeX = 0.0f;           // zero: take the size from the object's bounding box
+		vrInfo.m_sizeY = 0.0f;
+		vrInfo.m_offsetX = 0.0f;
+		vrInfo.m_offsetY = 0.0f;
+
+		return (Shadow *)TheW3DProjectedShadowManager->addShadow(robj, &vrInfo, draw);
 	}
 
 	switch(type)

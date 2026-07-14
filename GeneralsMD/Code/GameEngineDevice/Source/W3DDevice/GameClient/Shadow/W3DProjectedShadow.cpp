@@ -1458,8 +1458,8 @@ Int W3DProjectedShadowManager::renderShadows(RenderInfoClass & rinfo)
 			if ((dbgFrame++ % 240) == 0)
 			{
 				DEBUG_LOG(("VR shadows: total=%d enabled=%d decalType=%d cameraSaysVisible=%d "
-					"| useDecals=%d useVolumes=%d | terrainWindow x[%d..%d] y[%d..%d]",
-					dbgTotal, dbgEnabled, dbgDecalType, dbgVisible,
+					"| DRAWN=%d | useDecals=%d useVolumes=%d | terrainWindow x[%d..%d] y[%d..%d]",
+					dbgTotal, dbgEnabled, dbgDecalType, dbgVisible, projectionCount,
 					(int)TheGlobalData->m_useShadowDecals, (int)TheGlobalData->m_useShadowVolumes,
 					m_drawStartX, m_drawEdgeX, m_drawStartY, m_drawEdgeY));
 			}
