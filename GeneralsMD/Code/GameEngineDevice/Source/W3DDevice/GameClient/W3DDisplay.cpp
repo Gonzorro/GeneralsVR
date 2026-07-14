@@ -1922,6 +1922,113 @@ void W3DDisplay::composeVRUiPanel()
 	}
 
 	DX8Wrapper::Set_Render_Target((IDirect3DSurface8 *)nullptr);
+
+	dumpVRUiPixels();
+}
+
+// W3DDisplay::dumpVRUiPixels =================================================
+/** GeneralsVR @feature Say what is ACTUALLY in these targets.
+	*
+	* Three rewrites of this panel have now looked correct on paper and done nothing on screen,
+	* and each time I have reasoned about what the pixels ought to be instead of looking at them.
+	* This looks at them. It reads back the interface target and the composed target, and prints
+	* the depth-stencil format - because if that format carries no stencil bits, the silhouette
+	* mask the composite depends on was never written and every conclusion drawn from it is void.
+	*/
+//=============================================================================
+void W3DDisplay::dumpVRUiPixels()
+{
+	static Bool done = FALSE;
+	if (done || TheOpenXR == nullptr || !TheOpenXR->hasUiSurface())
+		return;
+
+	// Wait for the interface to actually exist before reading it.
+	if (TheGameLogic == nullptr || !TheGameLogic->isInGame())
+		return;
+
+	IDirect3DDevice8 *device = DX8Wrapper::_Get_D3D_Device8();
+	if (device == nullptr)
+		return;
+
+	done = TRUE;
+
+	// What depth-stencil are we actually rendering against? No stencil bits, no mask.
+	IDirect3DSurface8 *ds = nullptr;
+	if (SUCCEEDED(device->GetDepthStencilSurface(&ds)) && ds != nullptr)
+	{
+		D3DSURFACE_DESC dsDesc;
+		if (SUCCEEDED(ds->GetDesc(&dsDesc)))
+		{
+			DEBUG_LOG(("OpenXR: ui diag: depth-stencil format %d (D3DFMT_D24S8=%d, D3DFMT_D24X8=%d)",
+				(int)dsDesc.Format, (int)D3DFMT_D24S8, (int)D3DFMT_D24X8));
+		}
+		ds->Release();
+	}
+	else
+	{
+		DEBUG_LOG(("OpenXR: ui diag: NO depth-stencil surface bound"));
+	}
+
+	const Int w = getWidth();
+	const Int h = getHeight();
+
+	IDirect3DSurface8 *sysSurface = nullptr;
+	if (FAILED(device->CreateImageSurface(w, h, D3DFMT_A8R8G8B8, &sysSurface)) || sysSurface == nullptr)
+	{
+		DEBUG_LOG(("OpenXR: ui diag: CreateImageSurface failed"));
+		return;
+	}
+
+	// A point that should be INSIDE the control bar, and one that should be empty sky.
+	struct Probe { const char *what; Int x, y; };
+	const Probe probes[] =
+	{
+		{ "control bar", w / 2, (Int)(h * 0.93f) },
+		{ "minimap",     (Int)(w * 0.08f), (Int)(h * 0.90f) },
+		{ "empty sky",   w / 2, (Int)(h * 0.20f) },
+	};
+
+	struct Target { const char *name; IDirect3DSurface8 *surface; };
+	const Target targets[] =
+	{
+		{ "interface", TheOpenXR->getUiSurface() },
+		{ "composed",  TheOpenXR->getUiCompositeSurface() },
+	};
+
+	for (Int t = 0; t < 2; ++t)
+	{
+		if (targets[t].surface == nullptr)
+		{
+			DEBUG_LOG(("OpenXR: ui diag: %s target is NULL", targets[t].name));
+			continue;
+		}
+
+		if (FAILED(device->CopyRects(targets[t].surface, nullptr, 0, sysSurface, nullptr)))
+		{
+			DEBUG_LOG(("OpenXR: ui diag: CopyRects failed for %s", targets[t].name));
+			continue;
+		}
+
+		D3DLOCKED_RECT locked;
+		if (FAILED(sysSurface->LockRect(&locked, nullptr, D3DLOCK_READONLY)))
+		{
+			DEBUG_LOG(("OpenXR: ui diag: LockRect failed for %s", targets[t].name));
+			continue;
+		}
+
+		for (Int i = 0; i < 3; ++i)
+		{
+			const UnsignedByte *row = (const UnsignedByte *)locked.pBits + probes[i].y * locked.Pitch;
+			const UnsignedInt pixel = ((const UnsignedInt *)row)[probes[i].x];
+			DEBUG_LOG(("OpenXR: ui diag: %s @ %s (%d,%d) = A%3u R%3u G%3u B%3u",
+				targets[t].name, probes[i].what, probes[i].x, probes[i].y,
+				(pixel >> 24) & 0xFF, (pixel >> 16) & 0xFF, (pixel >> 8) & 0xFF, pixel & 0xFF));
+		}
+
+		sysSurface->UnlockRect();
+	}
+
+	sysSurface->Release();
 }
 
 // W3DDisplay::drawVRPanels ===================================================
