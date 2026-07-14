@@ -184,6 +184,23 @@ Shadow *W3DShadowManager::addShadow( RenderObjClass *robj, Shadow::ShadowTypeInf
 	if (shadowInfo)
 		type = shadowInfo->m_type;
 
+	// GeneralsVR @feature In VR every shadow is PROJECTED, whatever the INI asked for.
+	//
+	// Almost everything in this game casts a stencil shadow VOLUME, and a stencil volume is a
+	// view-dependent trick: it is built from the silhouette as seen from the camera, and it falls
+	// apart when the camera wanders somewhere the original game never let it go - low, close, or
+	// inside the volume itself. On a monitor the camera hangs high above the battlefield and the
+	// trick always holds. In VR the player can put their head anywhere, which is why the shadows
+	// have been blinking in and out with the angle of their head.
+	//
+	// A projected shadow is just the object's silhouette rendered from above and laid on the ground.
+	// It does not care where you are looking from, so it is there at every angle - which is the
+	// whole point. This is a TYPE change, made when the shadow is created: switching the global
+	// 'use volumes' flag could never have worked, because the type comes from the object's INI and
+	// the flag only decides whether the volume that already exists gets drawn.
+	if (TheGlobalData != nullptr && TheGlobalData->m_vrMode && type == SHADOW_VOLUME)
+		type = SHADOW_PROJECTION;
+
 	switch(type)
 	{
 		case	SHADOW_VOLUME:

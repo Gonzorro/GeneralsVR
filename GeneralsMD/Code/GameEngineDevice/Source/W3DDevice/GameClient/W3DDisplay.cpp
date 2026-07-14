@@ -2092,6 +2092,22 @@ void W3DDisplay::drawVRScene( W3DView *view )
 	const Bool inGame = (TheGameLogic != nullptr && TheGameLogic->isInGame());
 	TheOpenXR->setUiInGame(inGame);
 
+	// Hold the shadow settings where VR needs them, every frame.
+	//
+	// The command line asks for decals and no volumes; the LOD system then reads the player's
+	// Options.ini and puts both flags straight back. The log said it plainly - useVolumes=1 in a
+	// build that had set it to 0 at startup - and a setting that is quietly overwritten later is
+	// the same as a setting that was never applied. So it is re-asserted here, in the frame loop,
+	// where nothing can get in after it.
+	//
+	// Decals MUST stay on: the projected-shadow manager refuses to take a shadow at all while that
+	// flag is off, so turning it off does not just hide the shadows, it stops them existing.
+	if (TheWritableGlobalData != nullptr)
+	{
+		TheWritableGlobalData->m_useShadowVolumes = FALSE;
+		TheWritableGlobalData->m_useShadowDecals = TRUE;
+	}
+
 	// The ground is drawn in a window around the camera, and that window is re-sized every frame
 	// from the camera's pitch - so setting the map's draw width once at load was quietly undone.
 	// oversizeTerrain is the engine's own hook for widening it (missions use it for cinematics)

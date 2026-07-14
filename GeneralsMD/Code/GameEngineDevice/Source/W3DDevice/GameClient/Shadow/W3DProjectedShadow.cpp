@@ -1298,11 +1298,33 @@ Int W3DProjectedShadowManager::renderShadows(RenderInfoClass & rinfo)
 {
 	Int projectionCount=0;
 
+	// GeneralsVR @diagnostic The shadows come and go with the camera angle, and no amount of reading
+	// this code has explained why. So count every gate a shadow must pass and say the numbers out
+	// loud: how many exist, how many are switched on, how many are decals, how many the camera
+	// believes are visible, and how wide the terrain window they get clipped to is. Whichever number
+	// collapses when the shadows vanish IS the bug, and then I stop guessing at it from the outside.
+	Int dbgTotal = 0, dbgEnabled = 0, dbgDecalType = 0, dbgVisible = 0;
+	const Bool dbgVR = (TheGlobalData != nullptr && TheGlobalData->m_vrMode);
+
 	if (!TheTerrainRenderObject)
 		return projectionCount;
 
 	if (!m_shadowList && !m_decalList)
 		return	projectionCount;	//there are no shadows to render.
+
+	if (dbgVR)
+	{
+		for (W3DProjectedShadow *dbg = m_shadowList; dbg; dbg = dbg->m_next)
+		{
+			++dbgTotal;
+			if (dbg->m_isEnabled && !dbg->m_isInvisibleEnabled)
+				++dbgEnabled;
+			if (dbg->m_type & SHADOW_DECAL)
+				++dbgDecalType;
+			if (dbg->m_robj != nullptr && dbg->m_robj->Is_Really_Visible())
+				++dbgVisible;
+		}
+	}
 
 	W3DProjectedShadow *shadow;
 	static AABoxClass aaBox;
@@ -1429,6 +1451,19 @@ Int W3DProjectedShadowManager::renderShadows(RenderInfoClass & rinfo)
 
 		flushDecals(lastShadowDecalTexture,lastShadowType);	//make sure there are not any unrendered decals left over.
 		TheDX8MeshRenderer.Flush();	//draw all the shadow receiving objects
+
+		if (dbgVR)
+		{
+			static Int dbgFrame = 0;
+			if ((dbgFrame++ % 240) == 0)
+			{
+				DEBUG_LOG(("VR shadows: total=%d enabled=%d decalType=%d cameraSaysVisible=%d "
+					"| useDecals=%d useVolumes=%d | terrainWindow x[%d..%d] y[%d..%d]",
+					dbgTotal, dbgEnabled, dbgDecalType, dbgVisible,
+					(int)TheGlobalData->m_useShadowDecals, (int)TheGlobalData->m_useShadowVolumes,
+					m_drawStartX, m_drawEdgeX, m_drawStartY, m_drawEdgeY));
+			}
+		}
 	}
 	if (m_decalList)
 	{
