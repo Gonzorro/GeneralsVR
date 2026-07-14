@@ -1915,6 +1915,58 @@ void W3DDisplay::composeVRUiPanel()
 		device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TFACTOR);	// stay opaque
 		device->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, quad, sizeof(ScreenVertex));
 
+		// ------------------------------------------------------------------------------------
+		// TEST CARD. My instruments lie about these textures, so the headset is the instrument.
+		// Three patches, three questions, one look.
+		// ------------------------------------------------------------------------------------
+		{
+			struct Patch { Real x0, y0, x1, y1; DWORD colour; Bool useStencil; Bool alphaFromUi; };
+			const Patch patches[] =
+			{
+				// GREEN, over empty sky: can the composite write at all, and does it reach the
+				// headset? No stencil, no texture - just paint.
+				{ 0.30f * w, 0.10f * h, 0.45f * w, 0.25f * h, 0xFF00FF00, FALSE, FALSE },
+
+				// BLUE, over the control bar, drawn ONLY where the stencil says the interface
+				// painted. If this appears, the silhouette mask exists. If it does not, it never
+				// got written and the whole stencil approach is dead.
+				{ 0.35f * w, 0.80f * h, 0.50f * w, 0.97f * h, 0xFF0000FF, TRUE,  FALSE },
+
+				// MAGENTA, over the control bar, taking its ALPHA from the interface texture.
+				// Solid means the interface wrote a strong alpha; ghostly means weak; invisible
+				// means it wrote none at all - which decides how the backing must be built.
+				{ 0.55f * w, 0.80f * h, 0.70f * w, 0.97f * h, 0xFFFF00FF, FALSE, TRUE  },
+			};
+
+			for (Int i = 0; i < 3; ++i)
+			{
+				const Patch &patch = patches[i];
+
+				ScreenVertex box[4] =
+				{
+					{ patch.x0, patch.y0, 0.0f, 1.0f, 0.0f, 0.0f },
+					{ patch.x1, patch.y0, 0.0f, 1.0f, 1.0f, 0.0f },
+					{ patch.x1, patch.y1, 0.0f, 1.0f, 1.0f, 1.0f },
+					{ patch.x0, patch.y1, 0.0f, 1.0f, 0.0f, 1.0f },
+				};
+
+				device->SetRenderState(D3DRS_STENCILENABLE, patch.useStencil ? TRUE : FALSE);
+				device->SetRenderState(D3DRS_STENCILFUNC, D3DCMP_EQUAL);
+				device->SetRenderState(D3DRS_STENCILREF, 1);
+
+				device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+				device->SetRenderState(D3DRS_TEXTUREFACTOR, patch.colour);
+
+				device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+				device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TFACTOR);
+				device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+				device->SetTextureStageState(0, D3DTSS_ALPHAARG1,
+					patch.alphaFromUi ? D3DTA_TEXTURE : D3DTA_TFACTOR);
+
+				device->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, box, sizeof(ScreenVertex));
+			}
+		}
+
 		// Hand the device back the way we found it.
 		device->SetTexture(0, nullptr);
 		device->SetRenderState(D3DRS_STENCILENABLE, FALSE);
@@ -2341,6 +2393,10 @@ void W3DDisplay::drawVRScene( W3DView *view )
 			{
 				DX8Wrapper::Clear(true, false, Vector3(0.0f, 0.0f, 0.0f), 0.0f);
 			}
+
+			// TEST CARD, patch 1 of 4. RED, drawn into the INTERFACE target with the same 2D call
+			// the interface uses. Seeing it proves the headset is shown this target's contents.
+			drawFillRect(100, 100, 200, 200, GameMakeColor(255, 0, 0, 255));
 
 			TheInGameUI->DRAW();	// this repaints the whole window system, menus included
 			if (TheMouse != nullptr)
