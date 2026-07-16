@@ -1692,7 +1692,17 @@ void W3DView::update()
 
 	// render all of the visible Drawables
 	/// @todo this needs to use a real region partition or something
-	TheGameClient->iterateDrawablesInRegion( &axisAlignedRegion, drawDrawable, nullptr );
+	Region3D *drawRegion = &axisAlignedRegion;
+#if RTS_ZEROHOUR
+	// GeneralsVR @feature This iteration runs each unit's per-frame client draw - turret aim, muzzle
+	// flash, skeletal animation. Restricting it to the flat camera's view region freezes every unit
+	// off the monitor; harmless on a flat screen, but glaring in VR where the player can look
+	// anywhere on the battlefield. Pass no region so EVERY drawable stays live wherever the headset
+	// looks. A 2003-era game on any VR-capable PC can afford drawing them all.
+	if (TheGlobalData && TheGlobalData->m_vrMode)
+		drawRegion = nullptr;
+#endif
+	TheGameClient->iterateDrawablesInRegion( drawRegion, drawDrawable, nullptr );
 }
 
 //-------------------------------------------------------------------------------------------------
