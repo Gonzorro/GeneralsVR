@@ -8,7 +8,7 @@ point a laser to select your units, give orders with the motion controllers, bui
 and resize yourself from "the whole war on a table" down to "standing among the tanks".
 
 > **Early alpha — looking for testers.** It's playable end to end (skirmish), but expect rough
-> edges. Found a bug? [Open an issue](../../issues/new/choose).
+> edges. Found a bug? [Open an issue](https://github.com/Gonzorro/GeneralsVR/issues/new/choose).
 
 ## What you need
 
@@ -26,7 +26,7 @@ the active OpenXR runtime (Quest Link app → Settings → General).
 
 Then:
 
-1. Download **`GeneralsVR-v*.zip`** from the [latest release](../../releases/latest).
+1. Download **`GeneralsVR-v*.zip`** from the [latest release](https://github.com/Gonzorro/GeneralsVR/releases/latest).
 2. **Extract it into its own folder** (right-click → Extract All, or drag it out of the zip).
    Anywhere is fine — your Desktop or Downloads.
 3. Open that folder and double-click **`START-GeneralsVR`**.
