@@ -20,21 +20,40 @@ and resize yourself from "the whole war on a table" down to "standing among the 
 
 ## Install
 
-1. Install Zero Hour from Steam.
-2. Install the [Meta Quest Link app](https://www.meta.com/quest/setup/), connect the headset,
-   and set Meta as the active OpenXR runtime (Quest Link app → Settings → General).
-3. Download **`GeneralsVR-Setup.cmd`** from the [latest release](../../releases/latest) and run
-   it. Windows SmartScreen will warn about an unrecognized app — normal for an unsigned
-   community mod; click **More info → Run anyway**.
-4. Play from the **GeneralsVR** shortcut it puts on your desktop.
+**Before you start:** install Zero Hour from Steam and launch it once, then install the
+[Meta Quest Link app](https://www.meta.com/quest/setup/), connect the headset, and set Meta as
+the active OpenXR runtime (Quest Link app → Settings → General).
 
-Everything installs into its own folder (`%LOCALAPPDATA%\GeneralsVR`) — **nothing is copied
-into your game folder and no original file is touched**. Uninstalling = deleting that folder
-and the shortcut (or run the launcher script with `-Uninstall`).
+Then:
 
-The launcher auto-updates to my newest build every time you play. If an update breaks something
-for you, press **V** in the launcher and pick the previous version — you stay pinned to it until
-you unpin.
+1. Download **`GeneralsVR-v*.zip`** from the [latest release](../../releases/latest).
+2. **Extract it into its own folder** (right-click → Extract All, or drag it out of the zip).
+   Anywhere is fine — your Desktop or Downloads.
+3. Open that folder and double-click **`START-GeneralsVR`**.
+   - Windows SmartScreen may warn about an unrecognized app — that's normal for an unsigned
+     community mod; click **More info → Run anyway**.
+   - It'll ask for administrator permission once (to write the registry entries the game
+     needs) and put a **GeneralsVR** shortcut on your desktop.
+4. Put the headset on, press **Enter** in the launcher, start a **Skirmish**, and look around.
+
+From then on just use the **GeneralsVR** desktop shortcut.
+
+> **Tip:** the headset only shows the battlefield — it stays dark in the menus. You won't see
+> anything until you're actually in a skirmish.
+
+**Your Zero Hour install is never touched.** Everything lives in its own folder
+(`%LOCALAPPDATA%\GeneralsVR`) — no game files are copied or changed. To uninstall, delete that
+folder and the desktop shortcut (or run `GeneralsVR.ps1 -Uninstall`).
+
+The launcher auto-updates to my newest build every time you play. If an update ever breaks
+something for you, press **V** in the launcher and pick the previous version — you stay on it
+until you switch back.
+
+### Prefer one click? (optional)
+
+Instead of the zip, you can download **`GeneralsVR-Setup.cmd`** from the release and run it — it
+downloads and sets everything up for you, no extracting. The zip above is the manual route and
+does exactly the same thing.
 
 ## Controls
 
