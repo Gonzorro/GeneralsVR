@@ -508,6 +508,23 @@ private:
 	Bool													m_pauseAnimation;
 	Int														m_animationMode;
 
+#if RTS_ZEROHOUR
+	// GeneralsVR @feature Smooth-motion (-vr/-smoothmotion) interpolates the hull transform
+	// between 30Hz sim ticks, but a turret is driven by a live per-tick logic angle. Drawn on
+	// the smoothed/trailing hull the un-smoothed turret lags and reads as stuck - "the tank
+	// fires without the cannon turning". Mirror the hull's interpolation for the turret: keep
+	// the previous and current sim-tick angle/pitch and blend them by the same alpha, so the
+	// gun tracks the body smoothly and on the same one-tick-trailing cadence.
+	struct TurretSmooth
+	{
+		Real					m_prevAngle, m_currAngle;
+		Real					m_prevPitch, m_currPitch;
+		UnsignedInt		m_lastLogicFrame;
+		Bool					m_hasHistory;
+	};
+	TurretSmooth									m_turretSmooth[MAX_TURRETS];
+#endif
+
 	void adjustAnimation(const ModelConditionInfo* prevState, Real prevAnimFraction);
 	Real getCurrentAnimFraction() const;
 	void applyCorrectModelStateAnimation();

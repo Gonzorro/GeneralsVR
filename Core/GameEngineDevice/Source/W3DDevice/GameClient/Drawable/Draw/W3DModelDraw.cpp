@@ -40,6 +40,7 @@
 #include "Common/CRCDebug.h"
 #include "Common/GameState.h"
 #include "Common/GlobalData.h"
+#include "Common/GameEngine.h"		// GeneralsVR: getLogicTimeAlpha() for turret motion smoothing
 #include "Common/PerfTimer.h"
 #include "Common/RandomValue.h"
 #include "Common/ThingTemplate.h"
@@ -1740,6 +1741,15 @@ W3DModelDraw::W3DModelDraw(Thing *thing, const ModuleData* moduleData) : DrawMod
 	{
 		m_weaponRecoilInfoVec[i].clear();
 	}
+#if RTS_ZEROHOUR
+	for (i = 0; i < MAX_TURRETS; ++i)
+	{
+		m_turretSmooth[i].m_prevAngle = m_turretSmooth[i].m_currAngle = 0.0f;
+		m_turretSmooth[i].m_prevPitch = m_turretSmooth[i].m_currPitch = 0.0f;
+		m_turretSmooth[i].m_lastLogicFrame = 0;
+		m_turretSmooth[i].m_hasHistory = FALSE;
+	}
+#endif
 	m_needRecalcBoneParticleSystems = false;
 	m_fullyObscuredByShroud = false;
 
@@ -2060,7 +2070,7 @@ void W3DModelDraw::doDrawModule(const Matrix3D* transformMtx)
 	{
 		if (m_curState != nullptr && m_nextState != nullptr)
 		{
-			//DEBUG_LOG(("transition %s is complete",m_curState->m_description.str()));
+			//DEBUG_LOG(("transition %s is complete",m_curState->m_modelName.str()));
 			const ModelConditionInfo* nextState = m_nextState;
 			UnsignedInt nextDuration = m_nextStateAnimLoopDuration;
 			m_nextState = nullptr;
@@ -2417,6 +2427,19 @@ void W3DModelDraw::stopClientParticleSystems()
 	DANGER WARNING READ ME
 	DANGER WARNING READ ME
 */
+#if RTS_ZEROHOUR
+// GeneralsVR @feature Shortest-arc blend of a turret angle (radians), so a gun crossing the
+// +/-PI seam takes the short way round instead of spinning the long way over one tick.
+static Real smoothLerpTurretAngle(Real prev, Real curr, Real alpha)
+{
+	const Real pi = 3.14159265358979323846f;
+	Real d = curr - prev;
+	while (d >  pi) d -= 2.0f * pi;
+	while (d < -pi) d += 2.0f * pi;
+	return prev + d * alpha;
+}
+#endif
+
 void W3DModelDraw::handleClientTurretPositioning()
 {
 	if (!m_curState || !(m_curState->m_validStuff & ModelConditionInfo::TURRETS_VALID))
@@ -2436,6 +2459,33 @@ void W3DModelDraw::handleClientTurretPositioning()
 				if (ai)
 					ai->getTurretRotAndPitch((WhichTurretType)tslot, &turretAngle, &turretPitch);
 			}
+
+#if RTS_ZEROHOUR
+			// GeneralsVR @feature Interpolate the turret exactly as the hull is interpolated in
+			// Drawable::draw, so the gun and the body share one cadence. Without this the hull
+			// glides between sim ticks while the turret jumps at 30Hz aimed from the body's old
+			// orientation - the turret visibly lags or looks frozen while the tank fires.
+			if (TheGlobalData && TheGlobalData->m_smoothMotion && TheGameLogic && TheGameEngine)
+			{
+				TurretSmooth& sm = m_turretSmooth[tslot];
+				const UnsignedInt logicFrame = TheGameLogic->getFrame();
+				if (logicFrame != sm.m_lastLogicFrame)
+				{
+					sm.m_prevAngle = sm.m_hasHistory ? sm.m_currAngle : turretAngle;
+					sm.m_prevPitch = sm.m_hasHistory ? sm.m_currPitch : turretPitch;
+					sm.m_currAngle = turretAngle;
+					sm.m_currPitch = turretPitch;
+					sm.m_lastLogicFrame = logicFrame;
+					sm.m_hasHistory = TRUE;
+				}
+				if (sm.m_hasHistory)
+				{
+					const Real alpha = TheGameEngine->getLogicTimeAlpha();
+					turretAngle = smoothLerpTurretAngle(sm.m_prevAngle, sm.m_currAngle, alpha);
+					turretPitch = sm.m_prevPitch + (sm.m_currPitch - sm.m_prevPitch) * alpha;
+				}
+			}
+#endif
 
 			// do turret, if any
 			if (tur.m_turretAngleBone != 0)
@@ -2518,7 +2568,7 @@ void W3DModelDraw::handleClientRecoil()
 			if (barrels[i].m_muzzleFlashBone != 0)
 			{
 				Bool hidden = recoils[i].m_state != WeaponRecoilInfo::RECOIL_START;
-				//DEBUG_LOG(("adjust muzzleflash %08lx for Draw %08lx state %s to %d at frame %d",subObjToHide,this,m_curState->m_description.str(),hidden?1:0,TheGameLogic->getFrame()));
+				//DEBUG_LOG(("adjust muzzleflash %08lx for Draw %08lx state %s to %d at frame %d",subObjToHide,this,m_curState->m_modelName.str(),hidden?1:0,TheGameLogic->getFrame()));
 				barrels[i].setMuzzleFlashHidden(m_renderObject, hidden);
 			}
 
@@ -2908,7 +2958,7 @@ void W3DModelDraw::setModelState(const ModelConditionInfo* newState)
 #ifdef DEBUG_OBJECT_ID_EXISTS
 	if (getDrawable() && getDrawable()->getObject() && getDrawable()->getObject()->getID() == TheObjectIDToDebug)
 	{
-		DEBUG_LOG(("REQUEST switching to state %s for obj %s %d",newState->m_description.str(),getDrawable()->getObject()->getTemplate()->getName().str(),getDrawable()->getObject()->getID()));
+		DEBUG_LOG(("REQUEST switching to state %s for obj %s %d",newState->m_modelName.str(),getDrawable()->getObject()->getTemplate()->getName().str(),getDrawable()->getObject()->getID()));
 	}
 #endif
 	const ModelConditionInfo* nextState = nullptr;
@@ -2939,7 +2989,7 @@ void W3DModelDraw::setModelState(const ModelConditionInfo* newState)
 #ifdef DEBUG_OBJECT_ID_EXISTS
 			if (getDrawable() && getDrawable()->getObject() && getDrawable()->getObject()->getID() == TheObjectIDToDebug)
 			{
-				DEBUG_LOG(("IGNORE duplicate state %s for obj %s %d",newState->m_description.str(),getDrawable()->getObject()->getTemplate()->getName().str(),getDrawable()->getObject()->getID()));
+				DEBUG_LOG(("IGNORE duplicate state %s for obj %s %d",newState->m_modelName.str(),getDrawable()->getObject()->getTemplate()->getName().str(),getDrawable()->getObject()->getID()));
 			}
 #endif
 			// I don't think he'll be interested...
@@ -2956,7 +3006,7 @@ void W3DModelDraw::setModelState(const ModelConditionInfo* newState)
 #ifdef DEBUG_OBJECT_ID_EXISTS
 			if (getDrawable() && getDrawable()->getObject() && getDrawable()->getObject()->getID() == TheObjectIDToDebug)
 			{
-				DEBUG_LOG(("ALLOW_TO_FINISH state %s for obj %s %d",newState->m_description.str(),getDrawable()->getObject()->getTemplate()->getName().str(),getDrawable()->getObject()->getID()));
+				DEBUG_LOG(("ALLOW_TO_FINISH state %s for obj %s %d",newState->m_modelName.str(),getDrawable()->getObject()->getTemplate()->getName().str(),getDrawable()->getObject()->getID()));
 			}
 #endif
 			m_nextState = newState;
@@ -2975,7 +3025,7 @@ void W3DModelDraw::setModelState(const ModelConditionInfo* newState)
 #ifdef DEBUG_OBJECT_ID_EXISTS
 				if (getDrawable() && getDrawable()->getObject() && getDrawable()->getObject()->getID() == TheObjectIDToDebug)
 				{
-					DEBUG_LOG(("using TRANSITION state %s before requested state %s for obj %s %d",transState->m_description.str(),newState->m_description.str(),getDrawable()->getObject()->getTemplate()->getName().str(),getDrawable()->getObject()->getID()));
+					DEBUG_LOG(("using TRANSITION state %s before requested state %s for obj %s %d",transState->m_modelName.str(),newState->m_modelName.str(),getDrawable()->getObject()->getTemplate()->getName().str(),getDrawable()->getObject()->getID()));
 				}
 #endif
 				nextState = newState;
@@ -3753,7 +3803,7 @@ Bool W3DModelDraw::handleWeaponFireFX(WeaponSlotType wslot, Int specificBarrelTo
 
 	if (info.m_recoilBone || info.m_muzzleFlashBone)
 	{
-		//DEBUG_LOG(("START muzzleflash %08lx for Draw %08lx state %s at frame %d",info.m_muzzleFlashBone,this,m_curState->m_description.str(),TheGameLogic->getFrame()));
+		//DEBUG_LOG(("START muzzleflash %08lx for Draw %08lx state %s at frame %d",info.m_muzzleFlashBone,this,m_curState->m_modelName.str(),TheGameLogic->getFrame()));
 		WeaponRecoilInfo& recoil = m_weaponRecoilInfoVec[wslot][specificBarrelToUse];
 		recoil.m_state = WeaponRecoilInfo::RECOIL_START;
 		recoil.m_recoilRate = getW3DModelDrawModuleData()->m_initialRecoil;
