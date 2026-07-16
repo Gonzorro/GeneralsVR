@@ -76,6 +76,17 @@ Yes. EA released this game's source code under the GPL v3 in 2025, and GeneralsV
 modification of that source, published under the same license. No EA assets, art, audio or data
 are distributed — all of that stays inside your own Steam installation.
 
+## Support the project
+
+I build this as a solo developer, and I fund the time for it between freelance gigs. If you're
+enjoying GeneralsVR and you're able to, [**sponsoring me**](https://github.com/sponsors/Gonzorro)
+makes a real difference: the more support this gets, the more freelance work I can turn down and
+the more time goes straight into VR.
+
+And the bigger plan — once Zero Hour is solid, I want to bring the **other Command & Conquer
+games into VR** too. Every sponsor gets me closer to making that the main thing I do. No pressure
+at all if you can't; starring the repo and sending bug reports helps just as much. 🫡
+
 ## License
 
 GPL v3 — see [LICENSE.md](LICENSE.md).
