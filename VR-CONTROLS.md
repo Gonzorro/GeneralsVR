@@ -11,8 +11,9 @@ Mouse and keyboard still work at all times — the monitor mirrors everything.
 
 ## In a battle
 
-Both hands cast a **laser**. The right one is also your **reticle**: it takes the colour of
-whatever the game would do if you pulled the trigger now.
+The **right hand** casts a **laser**, and it is your **reticle**: it takes the colour of whatever
+the game would do if you pulled the trigger now. The left hand has no beam — it moves you, gives
+orders, and holds the HUD.
 
 | Beam colour | Meaning |
 |---|---|

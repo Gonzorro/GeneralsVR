@@ -1495,6 +1495,15 @@ void VRControls::updateRays(W3DView *view)
 		if (line == nullptr)
 			continue;
 
+		// GeneralsVR @feature Only the right hand points and clicks; the left hand holds the HUD and
+		// never casts a usable beam, so its laser was just visual noise. Keep it permanently hidden.
+		if (hand == VR_HAND_LEFT)
+		{
+			line->Set_Hidden(true);
+			m_rayVisible[hand] = FALSE;
+			continue;
+		}
+
 		const VRControllerState &c = TheOpenXR->getController(hand);
 
 		// The hand holding the menu does not also carry a laser: the beam starts inside the panel
