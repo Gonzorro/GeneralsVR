@@ -1,0 +1,48 @@
+name: Bug report
+description: Something broke, crashed, or looked wrong in GeneralsVR
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: GeneralsVR version
+      description: Shown at the top of the launcher window (e.g. v0.1.0-alpha)
+    validations:
+      required: true
+  - type: input
+    id: headset
+    attributes:
+      label: Headset and connection
+      placeholder: Quest 3 + Link cable / Air Link, other headset...
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU
+      placeholder: RTX 3060, RX 6700 XT...
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you see, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How can we make it happen again?
+      placeholder: |
+        1. Start a skirmish on map ...
+        2. ...
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log file
+      description: >
+        Please drag & drop `DebugLogFile.txt` from your Zero Hour game folder
+        (e.g. `C:\Program Files (x86)\Steam\steamapps\common\Command & Conquer Generals - Zero Hour`)
+        into this box. If the game crashed, also attach `ReleaseCrashInfo.txt` from
+        `Documents\Command and Conquer Generals Zero Hour Data` if it exists.
