@@ -12,9 +12,11 @@ and resize yourself from "the whole war on a table" down to "standing among the 
 
 ## What you need
 
-- **Your own copy of Zero Hour** from Steam
-  ([C&C Ultimate Collection](https://store.steampowered.com/bundle/39394/)). This project
-  contains **none of the game's assets** — it does not work without a real installation.
+- **Your own copy of Zero Hour** — Steam
+  ([C&C Ultimate Collection](https://store.steampowered.com/bundle/39394/)), EA app, Origin, GOG,
+  or a retail disc all work. This project contains **none of the game's assets** — it does not
+  work without a real installation. (The launcher finds Steam/EA/GOG automatically; for anything
+  else it asks you to point it at your game folder once.)
 - **Meta Quest 3 with Quest Link** (cable or Air Link). Other PC VR headsets are untested.
 - A Vulkan-capable gaming PC.
 

@@ -1,0 +1,54 @@
+GeneralsVR - Command & Conquer: Generals Zero Hour in VR
+=========================================================
+
+Your Zero Hour installation is NEVER modified. GeneralsVR lives entirely in
+its own folder (%LOCALAPPDATA%\GeneralsVR) and just points the game engine at
+your Steam install. Uninstalling = deleting that folder and the shortcut.
+
+EASY WAY (recommended)
+----------------------
+You don't need this zip. Download GeneralsVR-Setup.cmd from the release page
+and run it - it finds your Steam install, downloads the newest build, sets
+everything up and puts a GeneralsVR shortcut on your desktop.
+
+Windows SmartScreen will warn about an unrecognized app: click
+"More info" -> "Run anyway". That's normal for an unsigned community mod.
+
+MANUAL WAY (this zip)
+---------------------
+1. Extract this zip anywhere (Downloads is fine).
+2. Double-click START-GeneralsVR.
+   It copies everything to %LOCALAPPDATA%\GeneralsVR, finds your Zero Hour,
+   does the same one-time setup as the easy way (one admin prompt for
+   registry entries the game requires) and opens the launcher.
+
+Do NOT start generalszhv.exe directly - it only works when the launcher
+starts it pointed at your game.
+
+GOT THE GAME FROM GOG / EA / A DISC (not Steam)?
+------------------------------------------------
+The launcher tries to find those too. If it can't, it will pop open a file
+called "game-path.txt" - just paste the full path to your Zero Hour folder
+(the folder that contains INIZH.big), save it, and start GeneralsVR again.
+You can edit that file any time to point at a different copy of the game.
+
+REQUIREMENTS
+------------
+- Your own Zero Hour installation (Steam, EA app, Origin, GOG, or retail disc).
+  This mod ships NO game assets and is useless without it.
+- Meta Quest 3 with Quest Link (cable or Air Link), Meta set as the
+  active OpenXR runtime in the Quest Link app settings.
+- A Vulkan-capable GPU.
+
+IN THE HEADSET
+--------------
+Only the battlefield reaches the headset - it stays blue/dark in the menus.
+Start a SKIRMISH, then look around. Controls: see VR-CONTROLS.md.
+
+SOURCE CODE & LICENSE
+---------------------
+GeneralsVR is free software under the GPL v3. Full source code:
+https://github.com/Gonzorro/GeneralsVR
+Third-party licenses are in the LICENSES folder (DXVK, OpenXR SDK).
+
+Bugs / feedback: https://github.com/Gonzorro/GeneralsVR/issues

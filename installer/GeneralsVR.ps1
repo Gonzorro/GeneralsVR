@@ -31,6 +31,7 @@ $ApiBase    = "https://api.github.com/repos/$Repo"
 $ExeName    = 'generalszhv.exe'
 $InstallDir = Join-Path $env:LOCALAPPDATA 'GeneralsVR'
 $ConfigPath = Join-Path $InstallDir 'generalsvr.json'
+$PathFile   = Join-Path $InstallDir 'game-path.txt'
 $Headers    = @{ 'User-Agent' = 'GeneralsVR-Launcher' }
 
 # ---------------------------------------------------------------- game folder
@@ -39,36 +40,80 @@ function Test-GameDir([string]$dir) {
     return ($dir) -and (Test-Path (Join-Path $dir 'INIZH.big'))
 }
 
+# The player can point us at any copy of the game (Steam, GOG, retail, a weird
+# path) by writing the folder into game-path.txt. This is the manual override.
+function Get-GamePathFile {
+    if (-not (Test-Path $PathFile)) { return $null }
+    foreach ($line in (Get-Content $PathFile)) {
+        $t = $line.Trim()
+        if ($t -and -not $t.StartsWith('#')) { return $t.Trim('"').TrimEnd('\') }
+    }
+    return $null
+}
+
+function Write-GamePathTemplate {
+    @'
+# GeneralsVR - where is your Zero Hour game folder?
+#
+# The launcher normally finds the game on its own (Steam, EA app, Origin, GOG).
+# If it can't - or you want to point it at a specific copy - type the FULL PATH
+# to your Zero Hour folder on a line of its own below (the folder that contains
+# INIZH.big), then save this file and start GeneralsVR again.
+#
+# Examples (delete the leading # and use YOUR real path):
+#   C:\Program Files (x86)\Steam\steamapps\common\Command & Conquer Generals - Zero Hour
+#   D:\GOG Games\Command and Conquer Generals Zero Hour
+#   C:\Program Files (x86)\EA Games\Command and Conquer Generals Zero Hour
+
+'@ | Set-Content $PathFile -Encoding utf8
+}
+
+# Auto-detect across Steam / EA / Origin / GOG. Returns $null if nothing found.
 function Find-GameDir {
-    $roots = @()
+    $candidates = @()
+
+    # Steam: main install plus every extra library folder
     foreach ($k in 'HKLM:\SOFTWARE\WOW6432Node\Valve\Steam', 'HKLM:\SOFTWARE\Valve\Steam') {
         try {
             $steam = (Get-ItemProperty -Path $k -ErrorAction Stop).InstallPath
             if ($steam) {
-                $roots += $steam
+                $candidates += (Join-Path $steam 'steamapps\common\Command & Conquer Generals - Zero Hour')
                 $vdf = Join-Path $steam 'steamapps\libraryfolders.vdf'
                 if (Test-Path $vdf) {
                     foreach ($m in (Select-String -Path $vdf -Pattern '"path"\s+"([^"]+)"' -AllMatches).Matches) {
-                        $roots += ($m.Groups[1].Value -replace '\\\\', '\')
+                        $lib = $m.Groups[1].Value -replace '\\\\', '\'
+                        $candidates += (Join-Path $lib 'steamapps\common\Command & Conquer Generals - Zero Hour')
                     }
                 }
             }
         } catch {}
     }
-    foreach ($root in ($roots | Sort-Object -Unique)) {
-        $dir = Join-Path $root 'steamapps\common\Command & Conquer Generals - Zero Hour'
-        if (Test-GameDir $dir) { return $dir }
-    }
-    try {
-        $p = (Get-ItemProperty 'HKLM:\SOFTWARE\WOW6432Node\Electronic Arts\EA Games\Command and Conquer Generals Zero Hour' -ErrorAction Stop).InstallPath
-        if (Test-GameDir $p) { return $p }
-    } catch {}
 
-    while ($true) {
-        $p = (Read-Host 'Could not find Zero Hour automatically. Paste the full path of the game folder').Trim('"').TrimEnd('\')
-        if (Test-GameDir $p) { return $p }
-        Write-Host 'That folder does not look like a Zero Hour install (INIZH.big not found).' -ForegroundColor Yellow
+    # EA app / Origin / retail - the game's own installer writes these keys
+    foreach ($k in
+        'HKLM:\SOFTWARE\WOW6432Node\Electronic Arts\EA Games\Command and Conquer Generals Zero Hour',
+        'HKLM:\SOFTWARE\Electronic Arts\EA Games\Command and Conquer Generals Zero Hour') {
+        try { $candidates += (Get-ItemProperty -Path $k -ErrorAction Stop).InstallPath } catch {}
     }
+
+    # GOG - each installed game gets a numbered key carrying a "path" value
+    foreach ($base in 'HKLM:\SOFTWARE\WOW6432Node\GOG.com\Games', 'HKLM:\SOFTWARE\GOG.com\Games') {
+        if (Test-Path $base) {
+            foreach ($sub in (Get-ChildItem $base -ErrorAction SilentlyContinue)) {
+                try { $candidates += (Get-ItemProperty -Path $sub.PSPath -ErrorAction Stop).path } catch {}
+            }
+        }
+    }
+
+    # last-resort fixed locations
+    $candidates += 'C:\Program Files (x86)\Origin Games\Command and Conquer Generals Zero Hour'
+    $candidates += 'C:\Program Files (x86)\EA Games\Command and Conquer Generals Zero Hour'
+
+    foreach ($c in ($candidates | Where-Object { $_ } | Sort-Object -Unique)) {
+        $c = $c.Trim().TrimEnd('\')
+        if (Test-GameDir $c) { return $c }
+    }
+    return $null
 }
 
 # ------------------------------------------------------------ config, releases
@@ -88,13 +133,19 @@ function Save-Config($cfg) {
     $cfg | ConvertTo-Json | Set-Content $ConfigPath -Encoding utf8
 }
 
+# Returns an array of published releases (possibly empty = GitHub reached, none
+# published). Returns $null when GitHub could not be reached at all (offline or
+# rate-limited) - callers tell the two apart so the error message is honest.
 function Get-Releases {
-    try {
-        $rel = Invoke-RestMethod -Uri "$ApiBase/releases" -Headers $Headers -UseBasicParsing
-        return @($rel | Where-Object { -not $_.draft })
-    } catch {
-        return @()
+    for ($i = 0; $i -lt 3; $i++) {
+        try {
+            $rel = Invoke-RestMethod -Uri "$ApiBase/releases" -Headers $Headers -UseBasicParsing
+            return ,@($rel | Where-Object { -not $_.draft })
+        } catch {
+            if ($i -lt 2) { Start-Sleep -Seconds ($i + 1) }
+        }
     }
+    return $null
 }
 
 function Install-Build($release) {
@@ -123,7 +174,7 @@ function Copy-LocalFiles {
     if (-not (Test-Path (Join-Path $here $ExeName))) { return }
     $script:CopiedFromZip = $true
     Write-Host "Copying files into $InstallDir..." -ForegroundColor Cyan
-    Copy-Item (Join-Path $here '*') $InstallDir -Recurse -Force -Exclude 'generalsvr.json'
+    Copy-Item (Join-Path $here '*') $InstallDir -Recurse -Force -Exclude 'generalsvr.json', 'game-path.txt'
     $cfg = Get-Config
     if (-not $cfg.installed) {
         $cfg.installed = 'local-zip'
@@ -158,8 +209,6 @@ function Set-MachineKeys([string]$gameDir) {
         @{ Path = "$ea\ZeroHour"; Values = [ordered]@{
             InstallPath = "$gameDir\ZH_Generals"; language = 'english'
             MapPackVersion = 65536; version = 65544 } }
-        @{ Path = "$ea\Generals"; Values = [ordered]@{
-            InstallPath = "$gameDir\ZH_Generals\" } }
     )
     foreach ($k in $keys) {
         if (-not (Test-Path $k.Path)) { New-Item -Path $k.Path -Force | Out-Null }
@@ -169,6 +218,20 @@ function Set-MachineKeys([string]$gameDir) {
             if ($v -is [int]) { $type = 'DWord' }
             New-ItemProperty -Path $k.Path -Name $name -Value $v -PropertyType $type -Force | Out-Null
         }
+    }
+
+    # Base Generals assets. Zero Hour needs the original Generals .big files; on
+    # the Steam "Ultimate Collection" they sit in the ZH_Generals subfolder. A
+    # retail or GOG copy may keep Generals somewhere else and its own installer
+    # already wrote this key - so only set it when it is missing or points at a
+    # folder that no longer exists. Never clobber a valid one.
+    $gen = "$ea\Generals"
+    $existing = $null
+    try { $existing = (Get-ItemProperty -Path $gen -ErrorAction Stop).InstallPath } catch {}
+    if (-not $existing -or -not (Test-Path $existing)) {
+        if (-not (Test-Path $gen)) { New-Item -Path $gen -Force | Out-Null }
+        $genPath = if (Test-Path (Join-Path $gameDir 'ZH_Generals')) { "$gameDir\ZH_Generals\" } else { "$gameDir\" }
+        New-ItemProperty -Path $gen -Name InstallPath -Value $genPath -PropertyType String -Force | Out-Null
     }
 }
 
@@ -302,6 +365,10 @@ function Show-VersionPicker($releases) {
 
 function Show-Menu([string]$gameDir) {
     $releases = Get-Releases
+    if ($null -eq $releases) {
+        Write-Host "(Couldn't reach GitHub - playing your installed version. Updates paused.)" -ForegroundColor DarkYellow
+        $releases = @()
+    }
     $cfg = Get-Config
 
     # resolve what should be installed right now
@@ -362,8 +429,18 @@ try {
 
     $cfg = Get-Config
     $gameDir = $GamePath
+    if (-not (Test-GameDir $gameDir)) { $gameDir = Get-GamePathFile }   # manual override wins over the cache
     if (-not (Test-GameDir $gameDir)) { $gameDir = $cfg.gamePath }
     if (-not (Test-GameDir $gameDir)) { $gameDir = Find-GameDir }
+    if (-not (Test-GameDir $gameDir)) {
+        Write-GamePathTemplate
+        Write-Host ''
+        Write-Host "I couldn't find your Command & Conquer: Generals Zero Hour install." -ForegroundColor Yellow
+        Write-Host "I've opened a file called game-path.txt - paste the path to your game" -ForegroundColor Yellow
+        Write-Host "folder into it, save, then start GeneralsVR again." -ForegroundColor Yellow
+        try { Start-Process notepad.exe $PathFile } catch {}
+        throw "Waiting for your game folder in game-path.txt ($PathFile)."
+    }
     if ($cfg.gamePath -ne $gameDir) {
         $cfg.gamePath = $gameDir
         Save-Config $cfg
@@ -376,10 +453,16 @@ try {
         Write-Host "Zero Hour found: $gameDir"
         Write-Host "Installing to:   $InstallDir  (your game folder is not touched)"
         $releases = Get-Releases
-        if ($releases.Count -gt 0) {
+        $haveExe = Test-Path (Join-Path $InstallDir $ExeName)
+        if ($null -eq $releases) {
+            if (-not $haveExe) {
+                throw "Couldn't reach GitHub to download the game - this is usually a network hiccup or GitHub's rate limit. Check your connection and run the setup again in a minute."
+            }
+            Write-Host "Couldn't reach GitHub - keeping the version already installed." -ForegroundColor DarkYellow
+        } elseif ($releases.Count -gt 0) {
             Install-Build $releases[0]
-        } elseif (-not (Test-Path (Join-Path $InstallDir $ExeName))) {
-            throw 'No releases are published yet (or GitHub is unreachable). Try again later.'
+        } elseif (-not $haveExe) {
+            throw 'No published builds were found yet. Check back soon.'
         }
         Confirm-MachineKeys $gameDir
         Set-VulkanKeys
