@@ -57,8 +57,8 @@ hold the **left hand's button** while triggering to save the current selection i
 
 ## Tuning
 
-The launcher stores its settings in `generalsvr.json` inside the game folder — edit the `flags`
-line:
+The launcher stores its settings in `generalsvr.json` inside `%LOCALAPPDATA%\GeneralsVR` — edit
+the `flags` line:
 
 - `-vrscale 500` — starting size (world units per real metre). Bigger = you are bigger and the map
   looks smaller. The sticks and grips change this live, between 80 and 4000.

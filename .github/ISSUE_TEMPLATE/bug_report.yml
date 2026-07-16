@@ -42,7 +42,7 @@ body:
     attributes:
       label: Log file
       description: >
-        Please drag & drop `DebugLogFile.txt` from your Zero Hour game folder
-        (e.g. `C:\Program Files (x86)\Steam\steamapps\common\Command & Conquer Generals - Zero Hour`)
-        into this box. If the game crashed, also attach `ReleaseCrashInfo.txt` from
-        `Documents\Command and Conquer Generals Zero Hour Data` if it exists.
+        Please drag & drop `DebugLogFile.txt` from the GeneralsVR folder
+        (paste `%LOCALAPPDATA%\GeneralsVR` into the File Explorer address bar)
+        into this box. If the game crashed, also attach the newest files from
+        `Documents\Command and Conquer Generals Zero Hour Data\CrashDumps` if any exist.

@@ -28,6 +28,10 @@ and resize yourself from "the whole war on a table" down to "standing among the 
    community mod; click **More info → Run anyway**.
 4. Play from the **GeneralsVR** shortcut it puts on your desktop.
 
+Everything installs into its own folder (`%LOCALAPPDATA%\GeneralsVR`) — **nothing is copied
+into your game folder and no original file is touched**. Uninstalling = deleting that folder
+and the shortcut (or run the launcher script with `-Uninstall`).
+
 The launcher auto-updates to my newest build every time you play. If an update breaks something
 for you, press **V** in the launcher and pick the previous version — you stay pinned to it until
 you unpin.

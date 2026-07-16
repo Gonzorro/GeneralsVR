@@ -2,16 +2,24 @@
 # Run with -Install for first-time setup (GeneralsVR-Setup.cmd does this for you);
 # afterwards the desktop shortcut runs this same script as the launcher.
 #
+# Everything lives in %LOCALAPPDATA%\GeneralsVR - NOTHING is written into the
+# Zero Hour game folder. The game finds its assets because the launcher starts
+# the exe with the game folder as working directory (Zero Hour data) and via
+# the EA registry keys (base Generals data).
+#
 # What it manages:
 #   - downloads the newest release from GitHub (or the version you pin with [V])
 #   - the EA registry keys a Steam install never gets (one-time, asks for admin)
 #   - the HKCU\Software\Wine\VR keys DXVK needs to enable the Vulkan extensions
 #     OpenXR requires, written for YOUR GPU (detected automatically)
 #   - Options.ini (missing = known startup crash), desktop shortcut, launch flags
+#
+# -Uninstall removes the install folder and shortcut (your game is untouched).
 
 param(
     [switch]$Install,
     [switch]$RegistryOnly,
+    [switch]$Uninstall,
     [string]$GamePath
 )
 
@@ -21,7 +29,8 @@ $ErrorActionPreference = 'Stop'
 $Repo       = 'Gonzorro/GeneralsVR'
 $ApiBase    = "https://api.github.com/repos/$Repo"
 $ExeName    = 'generalszhv.exe'
-$ConfigName = 'generalsvr.json'
+$InstallDir = Join-Path $env:LOCALAPPDATA 'GeneralsVR'
+$ConfigPath = Join-Path $InstallDir 'generalsvr.json'
 $Headers    = @{ 'User-Agent' = 'GeneralsVR-Launcher' }
 
 # ---------------------------------------------------------------- game folder
@@ -31,9 +40,6 @@ function Test-GameDir([string]$dir) {
 }
 
 function Find-GameDir {
-    $here = Split-Path -Parent $PSCommandPath
-    if (Test-GameDir $here) { return $here }
-
     $roots = @()
     foreach ($k in 'HKLM:\SOFTWARE\WOW6432Node\Valve\Steam', 'HKLM:\SOFTWARE\Valve\Steam') {
         try {
@@ -67,19 +73,19 @@ function Find-GameDir {
 
 # ------------------------------------------------------------ config, releases
 
-function Get-Config([string]$gameDir) {
-    $p = Join-Path $gameDir $ConfigName
-    if (Test-Path $p) { return (Get-Content $p -Raw | ConvertFrom-Json) }
+function Get-Config {
+    if (Test-Path $ConfigPath) { return (Get-Content $ConfigPath -Raw | ConvertFrom-Json) }
     return [PSCustomObject]@{
         installed  = ''
         pin        = ''
         autoUpdate = $true
+        gamePath   = ''
         flags      = '-vr -win -noshellmap -vrscale 500 -vrres 1.0'
     }
 }
 
-function Save-Config($cfg, [string]$gameDir) {
-    $cfg | ConvertTo-Json | Set-Content (Join-Path $gameDir $ConfigName) -Encoding utf8
+function Save-Config($cfg) {
+    $cfg | ConvertTo-Json | Set-Content $ConfigPath -Encoding utf8
 }
 
 function Get-Releases {
@@ -91,7 +97,7 @@ function Get-Releases {
     }
 }
 
-function Install-Build($release, [string]$gameDir) {
+function Install-Build($release) {
     $asset = $release.assets | Where-Object { $_.name -like 'GeneralsVR-*.zip' } | Select-Object -First 1
     if (-not $asset) { throw "Release $($release.tag_name) has no GeneralsVR-*.zip asset." }
     Write-Host ("Downloading {0} ({1:n1} MB)..." -f $release.tag_name, ($asset.size / 1MB)) -ForegroundColor Cyan
@@ -100,13 +106,29 @@ function Install-Build($release, [string]$gameDir) {
     Invoke-WebRequest -Uri $asset.browser_download_url -Headers $Headers -OutFile $tmpZip -UseBasicParsing
     if (Test-Path $tmpDir) { Remove-Item $tmpDir -Recurse -Force }
     Expand-Archive $tmpZip -DestinationPath $tmpDir -Force
-    Copy-Item (Join-Path $tmpDir '*') $gameDir -Recurse -Force
+    Copy-Item (Join-Path $tmpDir '*') $InstallDir -Recurse -Force
     Remove-Item $tmpZip -Force
     Remove-Item $tmpDir -Recurse -Force
-    $cfg = Get-Config $gameDir
+    $cfg = Get-Config
     $cfg.installed = $release.tag_name
-    Save-Config $cfg $gameDir
+    Save-Config $cfg
     Write-Host "Installed $($release.tag_name)." -ForegroundColor Green
+}
+
+function Copy-LocalFiles {
+    # Running from an extracted zip (not from the install folder): copy everything
+    # that came with this script into the install folder and continue from there.
+    $here = Split-Path -Parent $PSCommandPath
+    if ($here -eq $InstallDir) { return }
+    if (-not (Test-Path (Join-Path $here $ExeName))) { return }
+    $script:CopiedFromZip = $true
+    Write-Host "Copying files into $InstallDir..." -ForegroundColor Cyan
+    Copy-Item (Join-Path $here '*') $InstallDir -Recurse -Force -Exclude 'generalsvr.json'
+    $cfg = Get-Config
+    if (-not $cfg.installed) {
+        $cfg.installed = 'local-zip'
+        Save-Config $cfg
+    }
 }
 
 # ---------------------------------------------------------------- registry etc
@@ -124,7 +146,9 @@ function Test-MachineKeys {
 
 function Set-MachineKeys([string]$gameDir) {
     # Mirrors the game's installScript.vdf, plus the EA Games\Generals key the engine
-    # hard-requires but Steam's script never writes.
+    # hard-requires but Steam's script never writes (it points at the base Generals
+    # assets inside the Zero Hour folder - that is also how the exe finds the game's
+    # data without living in its folder).
     $ea = 'HKLM:\SOFTWARE\WOW6432Node\Electronic Arts\EA Games'
     $keys = @(
         @{ Path = "$ea\Command and Conquer Generals Zero Hour"; Values = [ordered]@{
@@ -224,8 +248,8 @@ function Confirm-Shortcut([string]$gameDir) {
     $ws = New-Object -ComObject WScript.Shell
     $s = $ws.CreateShortcut($lnk)
     $s.TargetPath = 'powershell.exe'
-    $s.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $gameDir 'GeneralsVR.ps1')`""
-    $s.WorkingDirectory = $gameDir
+    $s.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $InstallDir 'GeneralsVR.ps1')`""
+    $s.WorkingDirectory = $InstallDir
     $ico = Join-Path $gameDir 'GeneralsZH.ico'
     if (Test-Path $ico) { $s.IconLocation = $ico }
     $s.Save()
@@ -234,7 +258,9 @@ function Confirm-Shortcut([string]$gameDir) {
 # --------------------------------------------------------------------- launch
 
 function Start-Game([string]$gameDir) {
-    $cfg = Get-Config $gameDir
+    $exe = Join-Path $InstallDir $ExeName
+    if (-not (Test-Path $exe)) { throw "No game build installed yet ($exe is missing) - update first." }
+    $cfg = Get-Config
     Confirm-MachineKeys $gameDir
     Set-VulkanKeys
     Confirm-OptionsIni
@@ -243,13 +269,12 @@ function Start-Game([string]$gameDir) {
     Write-Host '  BATTLEFIELD - it stays blue/dark until you are in a battle.' -ForegroundColor Yellow
     Write-Host '  Click SKIRMISH, pick a map, hit START, then look around.' -ForegroundColor Yellow
     Write-Host ''
-    Start-Process -FilePath (Join-Path $gameDir $ExeName) -WorkingDirectory $gameDir `
-        -ArgumentList ($cfg.flags -split ' ') -Wait
+    Start-Process -FilePath $exe -WorkingDirectory $gameDir -ArgumentList ($cfg.flags -split ' ') -Wait
 }
 
 # ----------------------------------------------------------------------- menu
 
-function Show-VersionPicker([string]$gameDir, $releases) {
+function Show-VersionPicker($releases) {
     if ($releases.Count -eq 0) { Write-Host 'No releases reachable (offline?).' -ForegroundColor Yellow; return }
     Write-Host ''
     Write-Host 'Available versions (0 = newest, auto-update):'
@@ -258,10 +283,10 @@ function Show-VersionPicker([string]$gameDir, $releases) {
         Write-Host ("  {0,2}. {1,-16} {2}  ({3:yyyy-MM-dd})" -f ($i + 1), $r.tag_name, $r.name, [datetime]$r.published_at)
     }
     $pick = Read-Host 'Version number'
-    $cfg = Get-Config $gameDir
+    $cfg = Get-Config
     if ($pick -eq '0') {
         $cfg.pin = ''
-        Save-Config $cfg $gameDir
+        Save-Config $cfg
         Write-Host 'Unpinned - the launcher follows the newest release again.' -ForegroundColor Green
         return
     }
@@ -270,14 +295,14 @@ function Show-VersionPicker([string]$gameDir, $releases) {
     if ($n -lt 1 -or $n -gt $releases.Count) { return }
     $r = $releases[$n - 1]
     $cfg.pin = $r.tag_name
-    Save-Config $cfg $gameDir
-    if ((Get-Config $gameDir).installed -ne $r.tag_name) { Install-Build $r $gameDir }
+    Save-Config $cfg
+    if ((Get-Config).installed -ne $r.tag_name) { Install-Build $r }
     Write-Host "Pinned to $($r.tag_name). Press V again and pick 0 to go back to auto." -ForegroundColor Green
 }
 
 function Show-Menu([string]$gameDir) {
     $releases = Get-Releases
-    $cfg = Get-Config $gameDir
+    $cfg = Get-Config
 
     # resolve what should be installed right now
     $target = $null
@@ -287,8 +312,8 @@ function Show-Menu([string]$gameDir) {
         $target = $releases[0]
     }
     if ($target -and $target.tag_name -ne $cfg.installed) {
-        Install-Build $target $gameDir
-        $cfg = Get-Config $gameDir
+        Install-Build $target
+        $cfg = Get-Config
     }
 
     while ($true) {
@@ -305,10 +330,10 @@ function Show-Menu([string]$gameDir) {
         Write-Host '  [A] Toggle auto-update      [Q] Quit'
         $k = Read-Host 'Choice'
         if ($k -eq '') { Start-Game $gameDir; return }
-        elseif ($k -match '^[Vv]$') { Show-VersionPicker $gameDir $releases; $cfg = Get-Config $gameDir }
+        elseif ($k -match '^[Vv]$') { Show-VersionPicker $releases; $cfg = Get-Config }
         elseif ($k -match '^[Aa]$') {
             $cfg.autoUpdate = -not $cfg.autoUpdate
-            Save-Config $cfg $gameDir
+            Save-Config $cfg
         }
         elseif ($k -match '^[Qq]$') { return }
     }
@@ -323,18 +348,39 @@ try {
         exit 0
     }
 
+    if ($Uninstall) {
+        $lnk = Join-Path ([Environment]::GetFolderPath('Desktop')) 'GeneralsVR.lnk'
+        if (Test-Path $lnk) { Remove-Item $lnk -Force }
+        if (Test-Path $InstallDir) { Remove-Item $InstallDir -Recurse -Force }
+        Write-Host 'GeneralsVR removed. Your Zero Hour installation was never touched.' -ForegroundColor Green
+        exit 0
+    }
+
+    New-Item -ItemType Directory -Force $InstallDir | Out-Null
+    $script:CopiedFromZip = $false
+    Copy-LocalFiles
+
+    $cfg = Get-Config
     $gameDir = $GamePath
+    if (-not (Test-GameDir $gameDir)) { $gameDir = $cfg.gamePath }
     if (-not (Test-GameDir $gameDir)) { $gameDir = Find-GameDir }
+    if ($cfg.gamePath -ne $gameDir) {
+        $cfg.gamePath = $gameDir
+        Save-Config $cfg
+    }
+    if ($script:CopiedFromZip) { Confirm-Shortcut $gameDir }
 
     if ($Install) {
         Write-Host ''
         Write-Host 'GeneralsVR setup' -ForegroundColor Green
         Write-Host "Zero Hour found: $gameDir"
+        Write-Host "Installing to:   $InstallDir  (your game folder is not touched)"
         $releases = Get-Releases
-        if ($releases.Count -eq 0) {
+        if ($releases.Count -gt 0) {
+            Install-Build $releases[0]
+        } elseif (-not (Test-Path (Join-Path $InstallDir $ExeName))) {
             throw 'No releases are published yet (or GitHub is unreachable). Try again later.'
         }
-        Install-Build $releases[0] $gameDir
         Confirm-MachineKeys $gameDir
         Set-VulkanKeys
         Confirm-OptionsIni
