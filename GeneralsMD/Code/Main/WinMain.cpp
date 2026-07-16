@@ -833,6 +833,31 @@ Int APIENTRY WinMain( HINSTANCE hInstance, HINSTANCE hPrevInstance,
 		}
 		::SetCurrentDirectory(buffer);
 
+		// GeneralsVR @feature The exe may live outside the game folder (the VR
+		// launcher keeps the Steam install untouched). When the game's archives
+		// are not next to the exe, the working directory becomes the install
+		// folder from the registry instead - the same key the engine already
+		// trusts for its data. Everything downstream (bigs, loose Data files)
+		// resolves against the working directory.
+		if (GetFileAttributes("INIZH.big") == INVALID_FILE_ATTRIBUTES)
+		{
+			HKEY zhKey;
+			if (RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+					"SOFTWARE\\Electronic Arts\\EA Games\\Command and Conquer Generals Zero Hour",
+					0, KEY_READ, &zhKey) == ERROR_SUCCESS)
+			{
+				Char installPath[_MAX_PATH];
+				DWORD size = sizeof(installPath) - 1;
+				DWORD type = 0;
+				if (RegQueryValueExA(zhKey, "InstallPath", nullptr, &type, (LPBYTE)installPath, &size) == ERROR_SUCCESS
+						&& type == REG_SZ && size > 0)
+				{
+					installPath[size] = 0;
+					::SetCurrentDirectory(installPath);
+				}
+				RegCloseKey(zhKey);
+			}
+		}
 
 		#ifdef RTS_DEBUG
 			// Turn on Memory heap tracking
