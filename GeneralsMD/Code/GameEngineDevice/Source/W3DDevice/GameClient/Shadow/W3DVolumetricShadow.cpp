@@ -86,6 +86,15 @@ const Real cosAngleToCare = cos ((0.2 * PI) / 180.0);	//1.5 degree difference
 #define SHADOW_SAMPLING_INTERVAL (MAP_XY_FACTOR * 2.0f)				//stepsize along ray used to find lowest point on terrain within shadow's reach.
 #define OVERHANGING_OBJECT_CLAMP_ANGLE	(80.0f/180.0f*PI)				//for objects that are right on a cliff edge, clamp light angle to cast a nearly vertical shadow.
 
+// GeneralsVR @feature Capped z-fail was added to survive the camera entering a shadow volume, but the
+// volumes here are ground-clamped thin slabs the VR head hovers ABOVE, so the camera is never inside
+// them and z-fail was never needed. Its caps hurt: the front cap is coplanar with the model surface,
+// so z-fighting miscounts the model's own pixels and darkens the whole mesh, and imperfect cap winding
+// leaks the darkening onto the ground. Set to 0 to use the original, proven z-pass (no caps). The
+// full-eye shadow-fill fix (renderStencilShadows) is what actually made shadows show at every head
+// angle, and it is independent of this. Flip to 1 only if a real camera-inside-volume case appears.
+#define VR_USE_CAPPED_ZFAIL 0
+
 //#define SV_DEBUG
 //#define SV_DEBUG_BOUNDS
 
@@ -2766,6 +2775,45 @@ void W3DVolumetricShadow::constructVolume( Vector3 *lightPosObject,Real shadowEx
 #endif
 	}
 
+	// GeneralsVR @feature Cap the volume so z-fail is watertight and the shadow does not break when
+	// the camera enters it. Front cap = the light-facing (POLY_VISIBLE) faces at the object surface;
+	// back cap = the same faces extruded to the far end, wound in reverse. Bounded by the allocation.
+	if (VR_USE_CAPPED_ZFAIL && TheGlobalData != nullptr && TheGlobalData->m_vrMode)
+	{
+		const Int maxVerts = shadowVolume->GetNumVertex();
+		const Int maxPolys = shadowVolume->GetNumPolygon();
+		const Int numMeshPolys = geomMesh->GetNumPolygon();
+		for (Int p = 0; p < numMeshPolys; ++p)
+		{
+			if (!(geomMesh->GetPolyNeighbor(p)->status & POLY_VISIBLE))
+				continue;
+			if (vertexCount + 6 > maxVerts || polygonCount + 2 > maxPolys)
+				break;	// never write past the allocation
+			Short capPoly[3];
+			geomMesh->GetPolygonIndex(p, capPoly);
+			Vector3 cv0 = geomMesh->GetVertex(capPoly[0]);
+			Vector3 cv1 = geomMesh->GetVertex(capPoly[1]);
+			Vector3 cv2 = geomMesh->GetVertex(capPoly[2]);
+			Vector3 ce0 = cv0 - *lightPosObject; ce0 *= shadowExtrudeDistance; ce0 += cv0;
+			Vector3 ce1 = cv1 - *lightPosObject; ce1 *= shadowExtrudeDistance; ce1 += cv1;
+			Vector3 ce2 = cv2 - *lightPosObject; ce2 *= shadowExtrudeDistance; ce2 += cv2;
+			// front cap (object surface, original winding)
+			shadowVolume->SetVertex(vertexCount + 0, &cv0);
+			shadowVolume->SetVertex(vertexCount + 1, &cv1);
+			shadowVolume->SetVertex(vertexCount + 2, &cv2);
+			Short frontTri[3] = { (Short)(vertexCount + 0), (Short)(vertexCount + 1), (Short)(vertexCount + 2) };
+			shadowVolume->SetPolygonIndex(polygonCount, frontTri);
+			// back cap (extruded, reversed winding)
+			shadowVolume->SetVertex(vertexCount + 3, &ce0);
+			shadowVolume->SetVertex(vertexCount + 4, &ce1);
+			shadowVolume->SetVertex(vertexCount + 5, &ce2);
+			Short backTri[3] = { (Short)(vertexCount + 3), (Short)(vertexCount + 5), (Short)(vertexCount + 4) };
+			shadowVolume->SetPolygonIndex(polygonCount + 1, backTri);
+			vertexCount += 6;
+			polygonCount += 2;
+		}
+	}
+
 	shadowVolume->SetNumActivePolygon(polygonCount);
 	shadowVolume->SetNumActiveVertex(vertexCount);
 }
@@ -2929,6 +2977,18 @@ void W3DVolumetricShadow::constructVolumeVB( Vector3 *lightPosObject,Real shadow
 		}
 	}
 	//***********************************************************************************************
+
+	// GeneralsVR @feature Reserve cap space (front+back tris per light-facing poly) so the static
+	// vertex/index buffers are allocated big enough for a watertight z-fail volume.
+	const Bool vrCap = (VR_USE_CAPPED_ZFAIL && TheGlobalData != nullptr && TheGlobalData->m_vrMode && m_geometry != nullptr);
+	if (vrCap)
+	{
+		W3DShadowGeometryMesh *capMesh = m_geometry->getMesh(meshIndex);
+		const Int nCapPolys = capMesh->GetNumPolygon();
+		for (Int p = 0; p < nCapPolys; ++p)
+			if (capMesh->GetPolyNeighbor(p)->status & POLY_VISIBLE)
+			{	polygonCount += 2; vertexCount += 6; }
+	}
 
 	DEBUG_ASSERTCRASH(m_shadowVolumeVB[ volumeIndex ][meshIndex] == nullptr,("Updating Existing Static Vertex Buffer Shadow"));
 	vbSlot=m_shadowVolumeVB[ volumeIndex ][meshIndex] = TheW3DBufferManager->getSlot(W3DBufferManager::VBM_FVF_XYZ,
@@ -3108,6 +3168,38 @@ void W3DVolumetricShadow::constructVolumeVB( Vector3 *lightPosObject,Real shadow
 		}
 	}
 
+	// GeneralsVR @feature Emit the cap triangles into the static vertex/index buffers (front cap at
+	// the object surface, back cap extruded and reversed) - matching the space reserved above.
+	if (vrCap)
+	{
+		const Int nCapPolys = geomMesh->GetNumPolygon();
+		for (Int p = 0; p < nCapPolys; ++p)
+		{
+			if (!(geomMesh->GetPolyNeighbor(p)->status & POLY_VISIBLE))
+				continue;
+			Short capPoly[3];
+			geomMesh->GetPolygonIndex(p, capPoly);
+			Vector3 cv0 = geomMesh->GetVertex(capPoly[0]);
+			Vector3 cv1 = geomMesh->GetVertex(capPoly[1]);
+			Vector3 cv2 = geomMesh->GetVertex(capPoly[2]);
+			Vector3 ce0 = cv0 - *lightPosObject; ce0 *= shadowExtrudeDistance; ce0 += cv0;
+			Vector3 ce1 = cv1 - *lightPosObject; ce1 *= shadowExtrudeDistance; ce1 += cv1;
+			Vector3 ce2 = cv2 - *lightPosObject; ce2 *= shadowExtrudeDistance; ce2 += cv2;
+			// front cap (original winding)
+			*vb++ = *(VertexFormatXYZ *)&cv0;
+			*vb++ = *(VertexFormatXYZ *)&cv1;
+			*vb++ = *(VertexFormatXYZ *)&cv2;
+			ib[0] = vertexCount; ib[1] = vertexCount + 1; ib[2] = vertexCount + 2;
+			ib += 3; vertexCount += 3; polygonCount++;
+			// back cap (extruded, reversed winding)
+			*vb++ = *(VertexFormatXYZ *)&ce0;
+			*vb++ = *(VertexFormatXYZ *)&ce1;
+			*vb++ = *(VertexFormatXYZ *)&ce2;
+			ib[0] = vertexCount; ib[1] = vertexCount + 2; ib[2] = vertexCount + 1;
+			ib += 3; vertexCount += 3; polygonCount++;
+		}
+	}
+
 //	DEBUG_ASSERTLOG(polygonCount == vertexCount, ("WARNING***Shadow volume mesh not optimal: %s",m_geometry->Get_Name()));
 }
 
@@ -3169,6 +3261,24 @@ Bool W3DVolumetricShadow::allocateShadowVolume( Int volumeIndex, Int meshIndex )
 	// optimization may not be worth it
 	//
 	numVertices = m_maxSilhouetteEntries[meshIndex] * 2;
+
+	// GeneralsVR @feature Reserve room for the front+back caps (2 tris * 3 verts per light-facing
+	// poly) so z-fail has a watertight volume. Bounded by the mesh polygon count; skip if it would
+	// exceed MAX_SHADOW_VOLUME_VERTS so nothing overflows the buffers.
+	if (VR_USE_CAPPED_ZFAIL && TheGlobalData != nullptr && TheGlobalData->m_vrMode && m_geometry != nullptr)
+	{
+		W3DShadowGeometryMesh *capMesh = m_geometry->getMesh(meshIndex);
+		if (capMesh != nullptr)
+		{
+			const Int capPolys = 2 * capMesh->GetNumPolygon();
+			const Int capVerts = capPolys * 3;
+			if ((numVertices + capVerts) <= MAX_SHADOW_VOLUME_VERTS)
+			{
+				numPolygons += capPolys;
+				numVertices += capVerts;
+			}
+		}
+	}
 
 	//Only allocate space here for dynamic shadows.  Shadows for static/non-animated
 	//models will be stored in vertex buffers which are allocated once exact size
@@ -3348,6 +3458,26 @@ void W3DVolumetricShadowManager::renderStencilShadows()
 	width=TheTacticalView->getWidth();
 	height=TheTacticalView->getHeight();
 
+	// GeneralsVR @feature The shadow-darkening quad is drawn in screen pixels of the TACTICAL VIEW
+	// (the flat monitor's rectangle). In VR the stencil is filled into the eye render target, which
+	// is a different size - so that rectangle is only a box inside the eye and the shadows get
+	// clipped to it, vanishing as the head turns. Cover the WHOLE current render target instead.
+	// The stencil test below still restricts the darkening to real shadow pixels, so this is safe.
+	if (TheGlobalData != nullptr && TheGlobalData->m_vrMode)
+	{
+		IDirect3DSurface8 *curRT = nullptr;
+		if (SUCCEEDED(m_pDev->GetRenderTarget(&curRT)) && curRT != nullptr)
+		{
+			D3DSURFACE_DESC rtDesc;
+			curRT->GetDesc(&rtDesc);
+			xpos = 0;
+			ypos = 0;
+			width = (Int)rtDesc.Width;
+			height = (Int)rtDesc.Height;
+			curRT->Release();
+		}
+	}
+
     v[0].p = D3DXVECTOR4( xpos+width, ypos+height, 0.0f, 1.0f );
     v[1].p = D3DXVECTOR4( xpos+width, 0, 0.0f, 1.0f );
     v[2].p = D3DXVECTOR4(  xpos, ypos+height, 0.0f, 1.0f );
@@ -3497,13 +3627,18 @@ void W3DVolumetricShadowManager::renderShadows( Bool forceStencilFill )
 		m_pDev->SetRenderState( D3DRS_STENCILREF,      0x80808080 );			//isolate MSB, it's used to indicate pixels containing potential occluders.
 		m_pDev->SetRenderState( D3DRS_STENCILMASK,     TheW3DShadowManager->getStencilShadowMask());	//isolate upper bits containing PotentialOccluderBit|PlayerColorBits
 		m_pDev->SetRenderState( D3DRS_STENCILWRITEMASK,0xffffffff );
-		m_pDev->SetRenderState( D3DRS_STENCILZFAIL, D3DSTENCILOP_KEEP );
+		// GeneralsVR @feature Use z-fail (Carmack's reverse) in VR so shadows survive the camera
+		// entering a volume: count on the depth-FAIL of the swapped-cull pass, STENCILPASS stays KEEP.
+		// The volumes are capped in VR (constructVolume/constructVolumeVB add front+back caps), which
+		// z-fail requires. Flat (non-VR) play keeps the original z-pass exactly.
+		const Bool vrZFail = (VR_USE_CAPPED_ZFAIL && TheGlobalData != nullptr && TheGlobalData->m_vrMode);
+		m_pDev->SetRenderState( D3DRS_STENCILZFAIL, vrZFail ? D3DSTENCILOP_INCR : D3DSTENCILOP_KEEP );
 		m_pDev->SetRenderState( D3DRS_STENCILFAIL,  D3DSTENCILOP_KEEP );
-		m_pDev->SetRenderState( D3DRS_STENCILPASS,  D3DSTENCILOP_INCR );
+		m_pDev->SetRenderState( D3DRS_STENCILPASS,  vrZFail ? D3DSTENCILOP_KEEP : D3DSTENCILOP_INCR );
 
 		m_pDev->SetVertexShader(SHADOW_DYNAMIC_VOLUME_FVF);
 
-		m_pDev->SetRenderState(D3DRS_CULLMODE,D3DCULL_CW);
+		m_pDev->SetRenderState(D3DRS_CULLMODE, vrZFail ? D3DCULL_CCW : D3DCULL_CW);
 //		m_pDev->SetRenderState(D3DRS_ZBIAS,1);	///@todo: See if this helps or makes things worse.
 		//m_pDev->SetRenderState(D3DRS_FILLMODE,D3DFILL_WIREFRAME);
 
@@ -3551,15 +3686,16 @@ void W3DVolumetricShadowManager::renderShadows( Bool forceStencilFill )
 			}
 		}
 
-		// change the stencil op to decrement
-		m_pDev->SetRenderState( D3DRS_STENCILPASS,  D3DSTENCILOP_DECRSAT);
+		// change the stencil op to decrement (z-fail slot in VR, z-pass slot otherwise)
+		m_pDev->SetRenderState( D3DRS_STENCILZFAIL, vrZFail ? D3DSTENCILOP_DECRSAT : D3DSTENCILOP_KEEP );
+		m_pDev->SetRenderState( D3DRS_STENCILPASS,  vrZFail ? D3DSTENCILOP_KEEP : D3DSTENCILOP_DECRSAT);
 
 		//
 		// invert normals of shadow volumes so we can decrement in the
 		// stencil buffer and render
 		//
 
-		m_pDev->SetRenderState(D3DRS_CULLMODE,D3DCULL_CCW);
+		m_pDev->SetRenderState(D3DRS_CULLMODE, vrZFail ? D3DCULL_CW : D3DCULL_CCW);
 
 		for (nextVb=TheW3DBufferManager->getNextVertexBuffer(nullptr,W3DBufferManager::VBM_FVF_XYZ);nextVb != nullptr; nextVb=TheW3DBufferManager->getNextVertexBuffer(nextVb,W3DBufferManager::VBM_FVF_XYZ))
 		{

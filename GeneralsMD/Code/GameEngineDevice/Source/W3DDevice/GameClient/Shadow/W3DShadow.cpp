@@ -184,56 +184,10 @@ Shadow *W3DShadowManager::addShadow( RenderObjClass *robj, Shadow::ShadowTypeInf
 	if (shadowInfo)
 		type = shadowInfo->m_type;
 
-	// GeneralsVR @feature In VR every shadow is PROJECTED, whatever the INI asked for.
-	//
-	// Almost everything in this game casts a stencil shadow VOLUME, and a stencil volume is a
-	// view-dependent trick: it is built from the silhouette as seen from the camera, and it falls
-	// apart when the camera wanders somewhere the original game never let it go - low, close, or
-	// inside the volume itself. On a monitor the camera hangs high above the battlefield and the
-	// trick always holds. In VR the player can put their head anywhere, which is why the shadows
-	// were blinking in and out with the angle of their head.
-	//
-	// A projected shadow is the object's silhouette rendered from above and laid on the ground. It
-	// does not care where you are looking from, so it is there at every angle - which is the whole
-	// point.
-	//
-	// A DECAL, specifically - not a SHADOW_PROJECTION. Projection looks like the right answer and it
-	// is a trap: its texture initialiser in this engine is
-	//
-	//     Int W3DShadowTexture::init(RenderObjClass *robj)  { ///@todo: implement this function
-	//
-	// which hands back an EMPTY texture. The shadows were faithfully created, enabled, and drawn -
-	// 168 of them - and every one was blank. That is abandoned code, and no amount of work on this
-	// side of it would have produced a shadow.
-	//
-	// A decal is what the engine actually ships and exercises: the silhouette texture laid on the
-	// terrain beneath the object, conforming to the ground, sized from the object's own bounding
-	// box. It costs nothing per frame (the image never changes) and it is drawn by the same path
-	// the game's existing decals already use.
-	if (TheGlobalData != nullptr && TheGlobalData->m_vrMode && type == SHADOW_VOLUME
-		&& TheW3DProjectedShadowManager != nullptr)
-	{
-		// "shadows" -> shadows.tga -> Art\Textures\shadows.dds, a file the game actually ships.
-		//
-		// The obvious move was to leave the name empty and let the manager reach for its own default.
-		// Its default is "shadow.tga", and THERE IS NO SUCH FILE in Zero Hour - the only shadow
-		// textures shipped are shadows.dds and shadowd.dds. A missing texture comes back white, and
-		// white through a modulate blend is perfectly invisible. So the decals were created, enabled
-		// and drawn - the log said DRAWN=8 - and not one pixel of them could ever have appeared.
-		// Name a file that is really there.
-		Shadow::ShadowTypeInfo vrInfo;
-		vrInfo.m_type = SHADOW_DECAL;
-		strlcpy(vrInfo.m_ShadowName, "shadows", ARRAY_SIZE(vrInfo.m_ShadowName));
-		vrInfo.allowUpdates = FALSE;     // the image never changes, so it is never re-rendered
-		vrInfo.allowWorldAlign = TRUE;   // let it wrap over the ground it lands on
-		vrInfo.m_sizeX = 0.0f;           // zero: take the size from the object's bounding box
-		vrInfo.m_sizeY = 0.0f;
-		vrInfo.m_offsetX = 0.0f;
-		vrInfo.m_offsetY = 0.0f;
-
-		return (Shadow *)TheW3DProjectedShadowManager->addShadow(robj, &vrInfo, draw);
-	}
-
+	// GeneralsVR @feature Shadows use the original stencil shadow VOLUMES, same as the flat game.
+	// They are view-dependent (built from the camera's silhouette) so they can blink at some head
+	// angles in VR, but when they render they are the game's real crisp shadows - which beats the
+	// projected-decal experiments that came out as blocks. Kept intentionally as-is.
 	switch(type)
 	{
 		case	SHADOW_VOLUME:

@@ -2094,17 +2094,15 @@ void W3DDisplay::drawVRScene( W3DView *view )
 
 	// Hold the shadow settings where VR needs them, every frame.
 	//
-	// The command line asks for decals and no volumes; the LOD system then reads the player's
-	// Options.ini and puts both flags straight back. The log said it plainly - useVolumes=1 in a
-	// build that had set it to 0 at startup - and a setting that is quietly overwritten later is
-	// the same as a setting that was never applied. So it is re-asserted here, in the frame loop,
-	// where nothing can get in after it.
-	//
-	// Decals MUST stay on: the projected-shadow manager refuses to take a shadow at all while that
-	// flag is off, so turning it off does not just hide the shadows, it stops them existing.
+	// GeneralsVR We use the game's ORIGINAL stencil shadow VOLUMES in VR (the projected-decal
+	// experiments came out as blocks). The eye depth surface is D24S8, so the stencil pass works.
+	// The LOD system re-reads the player's Options.ini and can flip these flags back mid-frame, so
+	// we re-assert them here in the frame loop, where nothing can get in after. Volumes ON gives
+	// the real crisp shadows (view-dependent - they can blink at some head angles, which is
+	// accepted); decals stay ON for the game's other ground decals (tank tracks etc.).
 	if (TheWritableGlobalData != nullptr)
 	{
-		TheWritableGlobalData->m_useShadowVolumes = FALSE;
+		TheWritableGlobalData->m_useShadowVolumes = TRUE;
 		TheWritableGlobalData->m_useShadowDecals = TRUE;
 	}
 
