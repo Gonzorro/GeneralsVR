@@ -119,6 +119,12 @@ OpenXRManager::OpenXRManager()
 	, m_uiWidth(0)
 	, m_uiHeight(0)
 	, m_uiInGame(FALSE)
+	, m_showFixedHud(FALSE)
+	, m_fixedHudDrop(1.0f)
+	, m_fixedHudWidth(2.4f)
+	, m_fixedHudForward(1.2f)
+	, m_fixedHudAlpha(1.0f)
+	, m_fixedHudFullScreen(FALSE)
 	, m_uiReady(FALSE)
 	, m_showFlatFrame(FALSE)
 	, m_groupBarTexture(nullptr)
@@ -1392,7 +1398,11 @@ void OpenXRManager::toggleWristPanel(Int hand)
 void OpenXRManager::layoutUiPanels()
 {
 	for (Int i = 0; i < UI_PANEL_COUNT; ++i)
+	{
 		m_uiPanels[i].active = FALSE;
+		m_uiPanels[i].alpha = 1.0f;
+		m_uiPanels[i].onTop = FALSE;
+	}
 
 	if (!m_uiReady)
 		return;
@@ -1416,6 +1426,68 @@ void OpenXRManager::layoutUiPanels()
 		p.cropY = 0;
 		p.cropW = m_uiWidth;
 		p.cropH = m_uiHeight;
+		return;
+	}
+
+	// Mouse+keyboard mode: no controllers to summon a wrist panel, so hang the HUD as a FIXED panel
+	// low in front of the player, like a control console. It shows only the control-bar strip (the
+	// crop the game already computes, which grows upward when a dialog opens), so the battlefield
+	// above stays clear. The mouse clicks it through the ordinary screen-pixel path, and because the
+	// crop cuts off the battlefield-area cursor, only the control bar carries the pointer.
+	if (m_showFixedHud)
+	{
+		const Real CONTROL_BAR_TOP = 0.66f;	// the control bar occupies the screen below this line
+
+		// (1) The control-bar STRIP, ALWAYS in the same place regardless of what menu is open, so
+		// nothing ever drags it. Laid flat with its top edge at the near edge of the limits, running
+		// back toward the player. Drawn on top so terrain rises cannot hide it.
+		{
+			UiPanel& p = m_uiPanels[UI_PANEL_SCREEN];
+			p.active = TRUE;
+			p.ownerHand = -1;
+			p.isGroupBar = FALSE;
+			p.onTop = TRUE;
+			p.alpha = m_fixedHudAlpha;
+			p.cropX = 0;
+			p.cropY = (Int)(CONTROL_BAR_TOP * (Real)m_uiHeight);
+			p.cropW = m_uiWidth;
+			p.cropH = m_uiHeight - p.cropY;
+			p.widthMeters = (m_fixedHudWidth > 0.1f) ? m_fixedHudWidth : 2.4f;
+			p.heightMeters = p.widthMeters * (Real)p.cropH / (Real)p.cropW;
+			p.pose.orientation = quatFromAxisAngle(1.0f, 0.0f, 0.0f, -1.5708f);
+			Real drop = m_fixedHudDrop; if (drop < 0.2f) drop = 0.2f; if (drop > 40.0f) drop = 40.0f;
+			Real fwd = m_fixedHudForward; if (fwd < 0.0f) fwd = 0.0f; if (fwd > 60.0f) fwd = 60.0f;
+			p.pose.position.x = 0.0f;
+			p.pose.position.y = -(drop - 0.02f);
+			p.pose.position.z = -(fwd - 0.5f * p.heightMeters);	// top of the bar at the near edge
+		}
+
+		// (2) A full-screen menu (options, generals promotion) - on its OWN upright screen over the
+		// play scene, cropped to the area ABOVE the control bar so it shows fully without touching or
+		// duplicating the bar. (Reuses an unused panel slot; the wrist panels are idle in this mode.)
+		if (m_fixedHudFullScreen)
+		{
+			UiPanel& m = m_uiPanels[UI_PANEL_LEFT_WRIST];
+			m.active = TRUE;
+			m.ownerHand = -1;
+			m.isGroupBar = FALSE;
+			m.onTop = TRUE;	// flat on the floor - draw over the terrain so it is not hidden
+			m.alpha = 1.0f;
+			m.cropX = 0;
+			m.cropY = 0;
+			m.cropW = m_uiWidth;
+			m.cropH = (Int)(CONTROL_BAR_TOP * (Real)m_uiHeight);
+			// FLAT on the floor, the SAME plane as the control bar and the limits, continuing FORWARD
+			// from the control-bar line over the play scene (not standing up perpendicular to it).
+			m.pose.orientation = quatFromAxisAngle(1.0f, 0.0f, 0.0f, -1.5708f);
+			m.widthMeters = (m_fixedHudWidth > 0.1f) ? m_fixedHudWidth : 2.4f;
+			m.heightMeters = m.widthMeters * (Real)m.cropH / (Real)m.cropW;
+			Real drop = m_fixedHudDrop; if (drop < 0.2f) drop = 0.2f; if (drop > 40.0f) drop = 40.0f;
+			Real fwd = m_fixedHudForward; if (fwd < 0.0f) fwd = 0.0f; if (fwd > 60.0f) fwd = 60.0f;
+			m.pose.position.x = 0.0f;
+			m.pose.position.y = -(drop - 0.02f);
+			m.pose.position.z = -(fwd + 0.5f * m.heightMeters);	// control-bar line at near edge, menu forward
+		}
 		return;
 	}
 
@@ -1523,6 +1595,8 @@ Bool OpenXRManager::getPanelInfo(Int index, VRPanelInfo &out) const
 	out.widthMeters = p.widthMeters;
 	out.heightMeters = p.heightMeters;
 	out.isGroupBar = p.isGroupBar;
+	out.alpha = p.alpha;
+	out.onTop = p.onTop;
 
 	const Real texW = (Real)(p.isGroupBar ? m_groupBarWidth : m_uiWidth);
 	const Real texH = (Real)(p.isGroupBar ? m_groupBarHeight : m_uiHeight);

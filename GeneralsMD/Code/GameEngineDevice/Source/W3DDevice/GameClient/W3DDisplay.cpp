@@ -1947,6 +1947,9 @@ void W3DDisplay::composeVRUiPanel()
 // The alpha test throws away every pixel the interface never painted, before it can write any
 // depth at all - otherwise the panel's empty corners would carve an invisible hole in the world.
 #define SC_VR_PANEL ( SHADE_CNST(ShaderClass::PASS_LEQUAL, ShaderClass::DEPTH_WRITE_ENABLE, ShaderClass::COLOR_WRITE_ENABLE, ShaderClass::SRCBLEND_SRC_ALPHA, 	ShaderClass::DSTBLEND_ONE_MINUS_SRC_ALPHA, ShaderClass::FOG_DISABLE, ShaderClass::GRADIENT_MODULATE, ShaderClass::SECONDARY_GRADIENT_DISABLE, ShaderClass::TEXTURING_ENABLE, 	ShaderClass::ALPHATEST_ENABLE, ShaderClass::CULL_MODE_DISABLE, 	ShaderClass::DETAILCOLOR_DISABLE, ShaderClass::DETAILALPHA_DISABLE) )
+// GeneralsVR Same as SC_VR_PANEL but ignores depth (PASS_ALWAYS, no depth write): the flat HUD sits
+// on the ground and would otherwise be hidden by any rise in the terrain.
+#define SC_VR_PANEL_ONTOP ( SHADE_CNST(ShaderClass::PASS_ALWAYS, ShaderClass::DEPTH_WRITE_DISABLE, ShaderClass::COLOR_WRITE_ENABLE, ShaderClass::SRCBLEND_SRC_ALPHA, 	ShaderClass::DSTBLEND_ONE_MINUS_SRC_ALPHA, ShaderClass::FOG_DISABLE, ShaderClass::GRADIENT_MODULATE, ShaderClass::SECONDARY_GRADIENT_DISABLE, ShaderClass::TEXTURING_ENABLE, 	ShaderClass::ALPHATEST_ENABLE, ShaderClass::CULL_MODE_DISABLE, 	ShaderClass::DETAILCOLOR_DISABLE, ShaderClass::DETAILALPHA_DISABLE) )
 
 // W3DDisplay::drawVRPanels ===================================================
 /** GeneralsVR @feature Draw the interface panels as real quads in the world.
@@ -1991,7 +1994,6 @@ void W3DDisplay::drawVRPanels( const Matrix3D &anchor, Real scale )
 	Matrix3D identity(1);
 	DX8Wrapper::Set_Transform(D3DTS_WORLD, identity);
 	DX8Wrapper::Set_Material(material);
-	DX8Wrapper::Set_Shader(ShaderClass(SC_VR_PANEL));
 
 	for (Int i = 0; i < TheOpenXR->getPanelCount(); ++i)
 	{
@@ -2002,6 +2004,10 @@ void W3DDisplay::drawVRPanels( const Matrix3D &anchor, Real scale )
 		TextureClass *texture = info.isGroupBar ? groupTexture : uiTexture;
 		if (texture == nullptr)
 			continue;
+
+		// The flat HUD lies on the battlefield, so draw it with depth-always/no-write - otherwise a
+		// rise in the terrain hides it. Other panels keep the normal depth-tested shader.
+		DX8Wrapper::Set_Shader(ShaderClass(info.onTop ? SC_VR_PANEL_ONTOP : SC_VR_PANEL));
 
 		// The panel's pose is in VR space (metres); lift it into the world exactly as the hands and
 		// the eyes are, so it hangs where the player sees it and the ray maths agrees with the
@@ -2030,6 +2036,12 @@ void W3DDisplay::drawVRPanels( const Matrix3D &anchor, Real scale )
 		const Real cornerU[4] = { info.u0, info.u1, info.u1, info.u0 };
 		const Real cornerV[4] = { info.v0, info.v0, info.v1, info.v1 };
 
+		// Opacity multiplier in the vertex alpha, so the fixed HUD can fade out when the mouse is
+		// not on it (the shader modulates the interface colour by the diffuse).
+		Real panelAlpha = info.alpha; if (panelAlpha < 0.0f) panelAlpha = 0.0f; if (panelAlpha > 1.0f) panelAlpha = 1.0f;
+		const UnsignedInt alphaByte = (UnsignedInt)(panelAlpha * 255.0f + 0.5f);
+		const UnsignedInt panelDiffuse = (alphaByte << 24) | 0x00FFFFFF;
+
 		DynamicVBAccessClass vb_access(BUFFER_TYPE_DYNAMIC_DX8, DX8_FVF_XYZNDUV2, 4);
 		DynamicIBAccessClass ib_access(BUFFER_TYPE_DYNAMIC_DX8, 6);
 		{
@@ -2048,7 +2060,7 @@ void W3DDisplay::drawVRPanels( const Matrix3D &anchor, Real scale )
 				vb->nx = normal.X;
 				vb->ny = normal.Y;
 				vb->nz = normal.Z;
-				vb->diffuse = 0xFFFFFFFF;   // the interface brings its own colour; do not tint it
+				vb->diffuse = panelDiffuse;   // white RGB (no tint), alpha = the panel's fade
 				vb->u1 = cornerU[c];
 				vb->v1 = cornerV[c];
 				vb->u2 = 0.0f;
@@ -2263,8 +2275,39 @@ void W3DDisplay::drawVRScene( W3DView *view )
 			}
 
 			TheInGameUI->DRAW();	// this repaints the whole window system, menus included
-			if (TheMouse != nullptr)
-				TheMouse->DRAW();
+			// GeneralsVR The game cursor is a DX8 HARDWARE cursor: the GPU composites it onto the
+			// monitor, so it never lands in this off-screen panel surface - the headset would show
+			// no pointer. So draw our own: a small outlined crosshair at the mouse pixel, straight
+			// into the surface. Only while the cursor is in use (mouse or ray moved recently), and
+			// inside the stencil-marked region above so it becomes part of the panel silhouette.
+			// In-game mouse+keyboard mode, the ONE world crosshair (VRControls) already slides onto
+			// this panel, so skip the 2D cursor here or the player would see two. In the menus (no
+			// world scene behind the panel) the 2D cursor is the only pointer, so it stays.
+			const Bool worldCursorOwnsIt = inGame && TheVRControls != nullptr && TheVRControls->isMouseKbMode();
+			if (TheMouse != nullptr && !worldCursorOwnsIt
+				&& (TheVRControls == nullptr || TheVRControls->isCursorActive()))
+			{
+				const ICoord2D &mp = TheMouse->getMouseStatus()->pos;
+				// Yellow, matching the battlefield world crosshair, so the pointer looks the SAME on
+				// the HUD as on the ground - no jarring change to a different cursor when you cross onto it.
+				const UnsignedInt white = GameMakeColor(255, 217, 38, 255);
+				const UnsignedInt dark  = GameMakeColor(0, 0, 0, 210);
+				// Big enough that it reads at the SAME size as the battlefield crosshair once the
+				// panel is scaled into the headset - the small 11px version shrank to a dot on the HUD.
+				const Int arm = 30, gap = 10;
+				// dark outline first (thicker), then yellow on top, so it reads on any background
+				for (Int pass = 0; pass < 2; ++pass)
+				{
+					const Real lw = (pass == 0) ? 8.0f : 4.0f;
+					const UnsignedInt col = (pass == 0) ? dark : white;
+					TheDisplay->drawLine(mp.x - arm, mp.y, mp.x - gap, mp.y, lw, col);
+					TheDisplay->drawLine(mp.x + gap, mp.y, mp.x + arm, mp.y, lw, col);
+					TheDisplay->drawLine(mp.x, mp.y - arm, mp.x, mp.y - gap, lw, col);
+					TheDisplay->drawLine(mp.x, mp.y + gap, mp.x, mp.y + arm, lw, col);
+				}
+				TheDisplay->drawFillRect(mp.x - 7, mp.y - 7, 14, 14, dark);
+				TheDisplay->drawFillRect(mp.x - 5, mp.y - 5, 10, 10, white);
+			}
 
 			if (dev != nullptr)
 			{

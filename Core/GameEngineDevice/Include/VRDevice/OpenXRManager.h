@@ -143,6 +143,24 @@ public:
 	/// Menus get one big screen in front of the player; a battle gets the HUD on the wrists.
 	void setUiInGame(Bool inGame) { m_uiInGame = inGame; }
 
+	/// In mouse+keyboard mode there are no controllers to summon a wrist panel, so hang the in-game
+	/// HUD as a fixed panel low in front of the player instead. Set each frame by VRControls.
+	void setShowFixedHud(Bool show) { m_showFixedHud = show; }
+
+	/// Where to lay the fixed HUD, measured by VRControls from the monitor frame each frame so the
+	/// panel matches the "limits": drop = metres the ground is below the headset, width = the near
+	/// edge's width in metres, forward = metres in front the near edge sits.
+	void setFixedHudPlacement(Real dropMetres, Real widthMetres, Real forwardMetres)
+	{ m_fixedHudDrop = dropMetres; m_fixedHudWidth = widthMetres; m_fixedHudForward = forwardMetres; }
+
+	/// Opacity of the fixed HUD (0..1): full when the mouse is over it, faded when it is not, so it
+	/// does not cover the battlefield while you play. Set each frame by VRControls.
+	void setFixedHudAlpha(Real a) { m_fixedHudAlpha = a; }
+
+	/// When a full-screen menu (options, generals promotion) is open, stand the HUD upright as a
+	/// readable screen rather than the flat control-bar strip, which cannot show it.
+	void setFixedHudFullScreen(Bool full) { m_fixedHudFullScreen = full; }
+
 	/// In a battle each hand's panel is hidden until the player summons it with that hand's
 	/// secondary button, so it never floats in the way while they are moving units.
 	void toggleWristPanel(Int hand);
@@ -165,6 +183,8 @@ public:
 	/// appears. Here we get the real windows, sprites and all, on a clear background.
 	IDirect3DSurface8* getUiSurface() const { return m_uiSurface; }
 	Bool hasUiSurface() const { return m_uiSurface != nullptr; }
+	Int getUiWidth() const { return m_uiWidth; }    ///< pixels; a panel crop's u0..u1 are fractions of this
+	Int getUiHeight() const { return m_uiHeight; }
 
 	/// Where the finished panel is composed: a black copy of the interface, with the interface
 	/// itself standing on top of it. This is what the headset actually sees.
@@ -197,6 +217,8 @@ public:
 		Real widthMeters, heightMeters;
 		Real u0, v0, u1, v1;                ///< the region of the source texture to show
 		Bool isGroupBar;                    ///< which texture: the group bar, or the interface
+		Real alpha;                         ///< opacity multiplier 0..1 (the fixed HUD fades when idle)
+		Bool onTop;                         ///< draw over everything, ignoring depth (so terrain cannot hide it)
 	};
 	Int getPanelCount() const { return UI_PANEL_COUNT; }
 	Bool getPanelInfo(Int index, VRPanelInfo &out) const;
@@ -232,6 +254,8 @@ private:
 		Bool active;
 		Bool isGroupBar;                    ///< draws from the group-bar swapchain, not the frame
 		Int ownerHand;                      ///< the hand it hangs off, or -1 for the fixed screen
+		Real alpha;                         ///< opacity 0..1 (fixed HUD fades when the mouse is away)
+		Bool onTop;                         ///< draw ignoring depth so terrain cannot hide the flat HUD
 	};
 	enum { UI_PANEL_SCREEN = 0, UI_PANEL_LEFT_WRIST = 1, UI_PANEL_RIGHT_WRIST = 2,
 	       UI_PANEL_LEFT_GROUPS = 3, UI_PANEL_RIGHT_GROUPS = 4, UI_PANEL_COUNT = 5 };
@@ -332,6 +356,12 @@ private:
 	IDirect3DSurface8* m_uiCompositeSurface;
 	Int m_uiWidth, m_uiHeight;
 	Bool m_uiInGame;
+	Bool m_showFixedHud;    ///< in-game, hang the HUD as a fixed panel (mouse+keyboard mode)
+	Real m_fixedHudDrop;    ///< metres the ground is below the headset, for laying the HUD flat
+	Real m_fixedHudWidth;   ///< metres wide the monitor frame's near edge is, so the HUD matches it
+	Real m_fixedHudForward; ///< metres in front the frame's near edge sits
+	Real m_fixedHudAlpha;   ///< HUD opacity 0..1 (faded when the mouse is not over it)
+	Bool m_fixedHudFullScreen; ///< a full-screen menu is up: show the HUD upright, not flat
 	Bool m_uiReady;
 	Bool m_showFlatFrame;   ///< capture the backbuffer, not the UI layer (movies)
 	UiPanel m_uiPanels[UI_PANEL_COUNT];

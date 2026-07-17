@@ -71,6 +71,19 @@ public:
 	Bool hasAimPoint() const { return m_hasAimPoint; }
 	const Coord3D &getAimPoint() const { return m_aimPoint; }
 
+	/// True while the on-screen cursor should be shown on the VR menu panel: the cursor has moved
+	/// recently, whether by the physical mouse or a controller ray. Fades after a few idle seconds.
+	Bool isCursorActive() const { return m_cursorActive; }
+	/// True while the PHYSICAL mouse specifically has moved recently. Drives the monitor-view frame
+	/// (a mouse+keyboard aid), so waving a controller does not raise it.
+	Bool isMouseActive() const { return m_mouseActive; }
+
+	/// Input mode. In mouse+keyboard mode the motion controllers are put away entirely (no rays, no
+	/// grab-locomotion) and the mouse + keyboard drive the game as on the monitor. A future VR
+	/// settings menu flips this; for now it is forced on.
+	void setMouseKbMode(Bool on) { m_mouseKbMode = on; }
+	Bool isMouseKbMode() const { return m_mouseKbMode; }
+
 private:
 	Bool computeHandRay(Int hand, Vector3 &outOrigin, Vector3 &outDir) const;
 	Bool traceTerrain(const Vector3 &origin, const Vector3 &dir, Coord3D &outHit) const;
@@ -134,6 +147,34 @@ private:
 	void updateLocomotion(W3DView *view);
 	void updatePointer(W3DView *view);
 	void updateRays(W3DView *view);
+	/// Track physical-mouse movement so the mouse+keyboard aids appear on use and fade when idle.
+	/// Cursor motion we injected from the controller ray is discounted for the physical signal.
+	void updateMouseActivity();
+	/// Soft auto-switch of the input mode: rays are primary; moving the physical mouse takes over at
+	/// once; a few idle seconds with the controllers in use hands it back to the rays.
+	void updateInputMode();
+	/// The frame on the ground marking what the flat monitor is rendering (the tactical camera's
+	/// footprint), so a mouse+keyboard player can see where edge-scrolling the mouse will pan.
+	void updateMonitorFrame(Bool visible);
+	/// A crosshair on the ground where the mouse points, so a mouse+keyboard player can see their
+	/// cursor out on the battlefield (there is no flat screen in the headset to carry it).
+	void updateMouseMarker(Bool visible);
+	/// If the mouse pixel falls on an active HUD/menu panel, return the world point ON that panel so
+	/// the one crosshair can slide onto it (instead of dropping to the terrain behind). False = the
+	/// mouse is over the open battlefield.
+	Bool mousePanelWorldPos(const Matrix3D &anchor, Int mx, Int my, Vector3 &out) const;
+	/// Edge-scroll the tactical camera when the mouse is shoved to the screen edge, as on the monitor.
+	void updateMouseScroll(W3DView *view);
+	/// Draw the mouse's drag-select band box on the ground (the flat game draws it in screen space,
+	/// which does not exist in the headset).
+	void updateMouseBoxSelect(W3DView *view);
+	/// Measure where the in-game HUD panel should sit (matched to the monitor frame) and how opaque
+	/// it should be (faded unless the mouse is over it), and hand it to OpenXR.
+	void updateFixedHud(W3DView *view, Bool inGame);
+	/// Paint a single 0-9 control-group numeral as a small seven-segment figure under a unit's
+	/// health bar, or hide its segments when there is no group. marker indexes m_groupDigit.
+	void setGroupDigit(Int marker, Int digit, const Vector3 &centre, const Vector3 &right,
+		const Vector3 &down, Real halfW, Real halfH, Real width);
 	void updatePanelToggles();
 	void applyControlGroup(Int slot, Bool assign);
 
@@ -160,6 +201,27 @@ private:
 	SimpleSceneClass *m_rayScene;
 	Line3DClass *m_rayLines[2];
 	Bool m_rayVisible[2];
+
+	// Physical-mouse activity, for the mouse+keyboard aids (on-screen cursor + monitor frame).
+	Bool m_cursorActive;              ///< cursor moved recently (physical mouse OR controller ray)
+	Bool m_mouseActive;               ///< the PHYSICAL mouse moved recently (ray-driven motion excluded)
+	Bool m_mouseSeeded;               ///< first frame only records the position, does not count as a move
+	Int m_mousePrevX, m_mousePrevY;   ///< cursor pixel last frame
+	UnsignedInt m_cursorLastMoveTime; ///< GetTickCount() of the last cursor move from either source
+	UnsignedInt m_mouseLastMoveTime;  ///< GetTickCount() of the last PHYSICAL move
+	Int m_injectedCursorX, m_injectedCursorY; ///< pixel the controller ray last drove the cursor to
+	Line3DClass *m_monitorLines[4];   ///< the four edges of the monitor-view frame on the ground
+	Line3DClass *m_mouseMarkerLines[2]; ///< a crosshair where the mouse points on the battlefield
+	Bool m_mouseKbMode;               ///< current mode: TRUE = mouse+keyboard, FALSE = rays (auto-switched)
+	Vector3 m_prevCtrlPos[2];         ///< last controller positions, to detect controller movement
+	Real m_prevCtrlQuat[2][4];        ///< last controller orientations
+	UnsignedInt m_ctrlLastMoveTime;   ///< GetTickCount() of the last real controller movement
+	Bool m_ctrlSeeded;                ///< first frame just records controller poses
+	Bool m_ctrlSpaceWasDown;          ///< edge-detect Ctrl+Space (recenter)
+	Real m_fixedHudAlpha;             ///< eased HUD opacity, full over the HUD and faded off it
+	Bool m_mouseOverHud;              ///< the cursor is on the control-bar strip (hide the world marker there)
+	Bool m_bigMenuOpen;              ///< a full-screen menu (options, generals promotion) is up: show the HUD upright
+	Line3DClass *m_groupDigit[MAX_SELECTION_MARKERS][7]; ///< seven-segment control-group numeral per unit
 };
 
 extern VRControls *TheVRControls;  ///< nullptr unless the game runs with -vr

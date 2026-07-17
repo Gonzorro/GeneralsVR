@@ -426,6 +426,7 @@ public:  // ********************************************************************
 	virtual Bool isScrolling();														///< are we scrolling?
 	virtual void setSelecting( Bool isSelecting );							///< set drag select mode
 	virtual Bool isSelecting();														///< are we selecting?
+	const IRegion2D *getDragSelectRegion() const { return &m_dragSelectRegion; }	///< GeneralsVR the drag-select rectangle (screen px), valid while isSelecting()
 	virtual void setScrollAmount( Coord2D amt );								///< set scroll amount
 	virtual Coord2D getScrollAmount();										///< get scroll amount
 

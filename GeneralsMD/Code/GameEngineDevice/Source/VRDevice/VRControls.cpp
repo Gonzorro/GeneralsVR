@@ -42,8 +42,12 @@
 #include "Common/ThingTemplate.h"
 #include "GameClient/View.h"
 #include "GameClient/Mouse.h"
+#include "GameClient/Keyboard.h"
+#include "GameClient/KeyDefs.h"
 #include "GameLogic/GameLogic.h"
 #include "GameLogic/TerrainLogic.h"
+#include "Common/Player.h"
+#include "Common/PlayerList.h"
 #include "W3DDevice/GameClient/W3DDisplay.h"
 #include "W3DDevice/GameClient/W3DScene.h"
 #include "W3DDevice/GameClient/W3DView.h"
@@ -56,6 +60,7 @@
 #include "WW3D2/scene.h"
 #include "WW3D2/ww3d.h"
 #include "WWMath/lineseg.h"
+#include "WWMath/plane.h"
 #include "WWMath/quat.h"
 
 VRControls *TheVRControls = nullptr;
@@ -146,6 +151,38 @@ VRControls::VRControls()
 		m_boxLines[i]->Set_Hidden(true);
 	}
 
+	// The four sides of the monitor-view frame: what the flat screen is rendering, laid on the
+	// ground. Soft white so it reads as a screen boundary, apart from the green select box and the
+	// coloured hand rays.
+	for (Int i = 0; i < 4; ++i)
+	{
+		m_monitorLines[i] = NEW_REF(Line3DClass, (Vector3(0.0f, 0.0f, 0.0f), Vector3(0.0f, 0.0f, 1.0f),
+			1.0f, 0.92f, 0.92f, 0.98f, 0.75f));
+		m_rayScene->Add_Render_Object(m_monitorLines[i]);
+		m_monitorLines[i]->Set_Hidden(true);
+	}
+
+	// A two-stroke crosshair marking where the mouse points on the battlefield. Warm yellow so it
+	// reads as the cursor, apart from the white frame, green box and coloured rays.
+	for (Int i = 0; i < 2; ++i)
+	{
+		m_mouseMarkerLines[i] = NEW_REF(Line3DClass, (Vector3(0.0f, 0.0f, 0.0f), Vector3(0.0f, 0.0f, 1.0f),
+			1.0f, 1.0f, 0.85f, 0.15f, 0.95f));
+		m_rayScene->Add_Render_Object(m_mouseMarkerLines[i]);
+		m_mouseMarkerLines[i]->Set_Hidden(true);
+	}
+
+	// Seven-segment numerals for the control-group number under each unit's health bar. Bright so
+	// they read against the battlefield.
+	for (Int m = 0; m < MAX_SELECTION_MARKERS; ++m)
+		for (Int s = 0; s < 7; ++s)
+		{
+			m_groupDigit[m][s] = NEW_REF(Line3DClass, (Vector3(0.0f, 0.0f, 0.0f), Vector3(0.0f, 0.0f, 1.0f),
+				1.0f, 1.0f, 1.0f, 0.35f, 1.0f));
+			m_rayScene->Add_Render_Object(m_groupDigit[m][s]);
+			m_groupDigit[m][s]->Set_Hidden(true);
+		}
+
 	// A green bead over each selected unit, with its health slung underneath.
 	for (Int i = 0; i < MAX_SELECTION_MARKERS; ++i)
 	{
@@ -179,6 +216,30 @@ VRControls::VRControls()
 	m_boxRight = Vector3(1.0f, 0.0f, 0.0f);
 	m_boxForward = Vector3(0.0f, 1.0f, 0.0f);
 	m_boxPressTime = 0;
+
+	m_cursorActive = FALSE;
+	m_mouseActive = FALSE;
+	m_mouseSeeded = FALSE;
+	m_mousePrevX = m_mousePrevY = 0;
+	m_cursorLastMoveTime = 0;
+	m_mouseLastMoveTime = 0;
+	m_injectedCursorX = m_injectedCursorY = -100000;	// a pixel the real cursor can never sit at
+
+	// Rays are the PRIMARY input; moving the physical mouse auto-switches to mouse+keyboard, and a
+	// few idle seconds hands it back. (The VR settings menu can pin a mode later.)
+	m_mouseKbMode = FALSE;
+	for (Int i = 0; i < 2; ++i)
+	{
+		m_prevCtrlPos[i] = Vector3(0.0f, 0.0f, 0.0f);
+		m_prevCtrlQuat[i][0] = m_prevCtrlQuat[i][1] = m_prevCtrlQuat[i][2] = 0.0f;
+		m_prevCtrlQuat[i][3] = 1.0f;
+	}
+	m_ctrlLastMoveTime = 0;
+	m_ctrlSeeded = FALSE;
+	m_ctrlSpaceWasDown = FALSE;
+	m_fixedHudAlpha = 1.0f;
+	m_mouseOverHud = FALSE;
+	m_bigMenuOpen = FALSE;
 }
 
 VRControls::~VRControls()
@@ -704,6 +765,481 @@ void VRControls::updateBoxVisual(Bool visible)
 }
 
 //-------------------------------------------------------------------------------------------------
+/** Watch the mouse so the mouse+keyboard aids appear on use and fade when the mouse goes idle.
+	*
+	* Two signals fall out of this. The on-screen cursor on the VR menu panel follows ANY cursor
+	* movement, mouse or controller ray, because pointing at the menu with a controller should show
+	* the cursor too. The monitor-view frame follows the PHYSICAL mouse only: the controller ray
+	* injects a WM_MOUSEMOVE at the pixel it is aiming at (see updatePointer), so we discount a move
+	* that lands exactly there - a real mouse move goes somewhere else. Both fade after a few idle
+	* seconds. GetTickCount is a wall clock, so the timer runs even when the game logic is paused. */
+//-------------------------------------------------------------------------------------------------
+void VRControls::updateMouseActivity()
+{
+	const UnsignedInt MOUSE_IDLE_HIDE_MS = 5000;	// hide the aids this long after the last move
+
+	m_cursorActive = FALSE;
+	m_mouseActive = FALSE;
+	if (TheMouse == nullptr)
+		return;
+
+	const MouseIO *mio = TheMouse->getMouseStatus();
+	const UnsignedInt now = GetTickCount();
+	const Int px = mio->pos.x;
+	const Int py = mio->pos.y;
+
+	if (!m_mouseSeeded)
+	{
+		// First frame: adopt the position without treating it as a move, or the aids flash on at
+		// startup before the player has touched anything.
+		m_mousePrevX = px;
+		m_mousePrevY = py;
+		m_mouseSeeded = TRUE;
+	}
+	else if (px != m_mousePrevX || py != m_mousePrevY)
+	{
+		m_cursorLastMoveTime = now;	// any movement wakes the on-screen cursor
+		const Bool fromController = (px == m_injectedCursorX && py == m_injectedCursorY);
+		if (!fromController)
+			m_mouseLastMoveTime = now;	// only a real mouse move wakes the monitor frame
+		m_mousePrevX = px;
+		m_mousePrevY = py;
+	}
+
+	m_cursorActive = (m_cursorLastMoveTime != 0) && ((now - m_cursorLastMoveTime) < MOUSE_IDLE_HIDE_MS);
+	m_mouseActive  = (m_mouseLastMoveTime  != 0) && ((now - m_mouseLastMoveTime)  < MOUSE_IDLE_HIDE_MS);
+}
+
+//-------------------------------------------------------------------------------------------------
+/** Soft auto-switch between the two input styles. Rays are primary; the moment the PHYSICAL mouse
+	* moves, mouse+keyboard takes over (rays hidden, cursor/frame/HUD shown). If the mouse then sits
+	* idle for a few seconds WHILE the controllers are being used, control eases back to the rays.
+	* The mouse-vs-rays branch in update() reads m_mouseKbMode, so flipping it swaps the whole style. */
+//-------------------------------------------------------------------------------------------------
+void VRControls::updateInputMode()
+{
+	if (TheOpenXR == nullptr)
+		return;
+	const UnsignedInt now = GetTickCount();
+
+	// Did either controller move beyond the natural hand jitter this frame?
+	Bool ctrlMoved = FALSE;
+	for (Int hand = 0; hand < 2; ++hand)
+	{
+		const VRControllerState &c = TheOpenXR->getController(hand);
+		if (!c.poseValid)
+			continue;
+		const Vector3 pos(c.posX, c.posY, c.posZ);
+		const Real qdot = (Real)fabs(c.quatX * m_prevCtrlQuat[hand][0] + c.quatY * m_prevCtrlQuat[hand][1]
+			+ c.quatZ * m_prevCtrlQuat[hand][2] + c.quatW * m_prevCtrlQuat[hand][3]);
+		if (m_ctrlSeeded && ((pos - m_prevCtrlPos[hand]).Length() > 0.012f || qdot < 0.9995f))
+			ctrlMoved = TRUE;	// ~1.2cm of travel or ~3.6 deg of turn
+		m_prevCtrlPos[hand] = pos;
+		m_prevCtrlQuat[hand][0] = c.quatX; m_prevCtrlQuat[hand][1] = c.quatY;
+		m_prevCtrlQuat[hand][2] = c.quatZ; m_prevCtrlQuat[hand][3] = c.quatW;
+	}
+	m_ctrlSeeded = TRUE;
+	if (ctrlMoved)
+		m_ctrlLastMoveTime = now;
+
+	// Moving the mouse takes over immediately. Otherwise, once the mouse has been idle for 3s and a
+	// controller is currently in use, hand it back to the rays.
+	const Bool mouseJustMoved = (m_mouseLastMoveTime != 0) && ((now - m_mouseLastMoveTime) < 250);
+	if (mouseJustMoved)
+		m_mouseKbMode = TRUE;
+	else if (m_mouseKbMode
+		&& (now - m_mouseLastMoveTime) >= 3000
+		&& m_ctrlLastMoveTime != 0 && (now - m_ctrlLastMoveTime) < 500)
+		m_mouseKbMode = FALSE;
+}
+
+//-------------------------------------------------------------------------------------------------
+/** Draw a frame on the ground showing what the flat monitor renders - the tactical camera's four
+	* screen corners dropped onto the terrain. A mouse+keyboard player scrolls by shoving the cursor
+	* to the screen edge, but in the headset that edge is invisible; this is where it is. */
+//-------------------------------------------------------------------------------------------------
+void VRControls::updateMonitorFrame(Bool visible)
+{
+	if (!visible)
+	{
+		for (Int i = 0; i < 4; ++i)
+			if (m_monitorLines[i] != nullptr)
+				m_monitorLines[i]->Set_Hidden(true);
+		return;
+	}
+
+	if (TheTacticalView == nullptr)
+		return;
+
+	// A ground height to lay the frame on: whatever the terrain is under the middle of the view.
+	// The centre pixel always lands on the ground, even when the top corners are near the horizon.
+	Real groundZ = 0.0f;
+	Int ox, oy;
+	TheTacticalView->getOrigin(&ox, &oy);
+	ICoord2D center = { ox + TheTacticalView->getWidth() / 2, oy + TheTacticalView->getHeight() / 2 };
+	Coord3D centerWorld;
+	if (TheTacticalView->screenToTerrain(&center, &centerWorld))
+		groundZ = centerWorld.z;
+
+	// Drop the four screen corners onto a HORIZONTAL PLANE at that height. Unlike screenToTerrain
+	// (a raycast against the finite heightmap, which misses once the view tilts low and the top
+	// corners run off the map), an infinite plane always catches them - so the frame stops
+	// vanishing when the camera comes down close. This is the same call the radar uses to draw the
+	// camera box on the minimap.
+	Coord3D tl, tr, br, bl;
+	if (TheTacticalView->getScreenCornerWorldPointsAtZ(&tl, &tr, &br, &bl, groundZ) == PlaneClass::NO_INTERSECTION)
+	{
+		for (Int i = 0; i < 4; ++i)
+			if (m_monitorLines[i] != nullptr)
+				m_monitorLines[i]->Set_Hidden(true);
+		return;
+	}
+
+	const Real lift = 6.0f;	// float it above the ground so the terrain does not swallow it
+	const Coord3D *src[4] = { &tl, &tr, &br, &bl };
+	Vector3 corners[4];
+	for (Int c = 0; c < 4; ++c)
+	{
+		// Sit each corner ON the terrain, not on the flat plane. When the camera drops in low the
+		// plane can pass under a rise and the frame sank into the hillside and vanished; following
+		// the ground height at each corner keeps it on the surface.
+		Real gz = src[c]->z;
+		if (TheTerrainLogic != nullptr)
+			gz = TheTerrainLogic->getGroundHeight(src[c]->x, src[c]->y);
+		corners[c] = Vector3(src[c]->x, src[c]->y, gz + lift);
+	}
+
+	const Real width = (3.0f + 0.004f * TheOpenXR->getWorldUnitsPerMeter()) * 0.2f;
+	for (Int i = 0; i < 4; ++i)
+	{
+		if (m_monitorLines[i] == nullptr)
+			continue;
+		m_monitorLines[i]->Reset(corners[i], corners[(i + 1) % 4], width);
+		m_monitorLines[i]->Set_Hidden(false);
+	}
+}
+
+//-------------------------------------------------------------------------------------------------
+/** A crosshair on the ground under the mouse. The cursor pixel is cast through the flat camera to
+	* a terrain point (the same mapping the game already uses for clicks), so the mark lands exactly
+	* where a mouse order would - inside the monitor-view frame, since that is the region the flat
+	* camera can see. */
+//-------------------------------------------------------------------------------------------------
+Bool VRControls::mousePanelWorldPos(const Matrix3D &anchor, Int mx, Int my, Vector3 &out) const
+{
+	if (TheOpenXR == nullptr)
+		return FALSE;
+	const Real uiW = (Real)TheOpenXR->getUiWidth();
+	const Real uiH = (Real)TheOpenXR->getUiHeight();
+	if (uiW <= 0.0f || uiH <= 0.0f)
+		return FALSE;
+	const Real scale = TheOpenXR->getWorldUnitsPerMeter();
+
+	for (Int i = 0; i < TheOpenXR->getPanelCount(); ++i)
+	{
+		OpenXRManager::VRPanelInfo info;
+		if (!TheOpenXR->getPanelInfo(i, info) || info.isGroupBar)
+			continue;
+
+		// The panel shows the crop [u0..u1]x[v0..v1] of the UI surface; in pixels that is where the
+		// mouse must be for the pointer to be ON this panel.
+		const Real x0 = info.u0 * uiW, x1 = info.u1 * uiW;
+		const Real y0 = info.v0 * uiH, y1 = info.v1 * uiH;
+		if (x1 <= x0 || y1 <= y0)
+			continue;
+		if ((Real)mx < x0 || (Real)mx > x1 || (Real)my < y0 || (Real)my > y1)
+			continue;
+
+		const Real u = ((Real)mx - x0) / (x1 - x0);	// 0 left .. 1 right
+		const Real v = ((Real)my - y0) / (y1 - y0);	// 0 top  .. 1 bottom
+
+		// The panel's world quad, exactly as drawVRPanels builds it: pose (metres) lifted through the
+		// anchor, then half-extents along its own axes.
+		Quaternion q(info.quatX, info.quatY, info.quatZ, info.quatW);
+		Matrix3D panelPose;
+		Build_Matrix3D(q, panelPose);
+		panelPose.Set_Translation(Vector3(info.posX * scale, info.posY * scale, info.posZ * scale));
+		Matrix3D panelWorld;
+		Matrix3D::Multiply(anchor, panelPose, &panelWorld);
+
+		const Vector3 origin = panelWorld.Get_Translation();
+		const Vector3 right = panelWorld.Get_X_Vector() * (info.widthMeters * 0.5f * scale);
+		const Vector3 up = panelWorld.Get_Y_Vector() * (info.heightMeters * 0.5f * scale);
+		// u:0->left(-right),1->right(+right)   v:0->top(+up),1->bottom(-up)
+		out = origin + right * (2.0f * u - 1.0f) + up * (1.0f - 2.0f * v);
+		return TRUE;
+	}
+	return FALSE;
+}
+
+//-------------------------------------------------------------------------------------------------
+void VRControls::updateMouseMarker(Bool visible)
+{
+	if (!visible || TheMouse == nullptr || TheTacticalView == nullptr)
+	{
+		for (Int i = 0; i < 2; ++i)
+			if (m_mouseMarkerLines[i] != nullptr)
+				m_mouseMarkerLines[i]->Set_Hidden(true);
+		return;
+	}
+
+	Matrix3D anchor;
+	const Bool haveAnchor = getAnchor((W3DView *)TheTacticalView, anchor);
+
+	// ONE crosshair for the whole session: it sits on a HUD/menu panel when the mouse is over one,
+	// and on the terrain otherwise. The player never learns there are two cursors underneath.
+	const MouseIO *mio = TheMouse->getMouseStatus();
+	Vector3 c;
+	Bool onPanel = FALSE;
+	if (haveAnchor && mousePanelWorldPos(anchor, mio->pos.x, mio->pos.y, c))
+	{
+		onPanel = TRUE;
+	}
+	else
+	{
+		ICoord2D mousePixel = { mio->pos.x, mio->pos.y };
+		Coord3D world;
+		if (!TheTacticalView->screenToTerrain(&mousePixel, &world))
+		{
+			for (Int i = 0; i < 2; ++i)
+				if (m_mouseMarkerLines[i] != nullptr)
+					m_mouseMarkerLines[i]->Set_Hidden(true);
+			return;
+		}
+		c = Vector3(world.x, world.y, world.z);
+	}
+
+	// Constant APPARENT size, referenced to the player: scale the cross by its distance from the
+	// head, so it never shrinks crossing from the far battlefield onto a near menu - it is the same
+	// cross the whole way.
+	Vector3 headWorld = c;
+	if (haveAnchor)
+	{
+		const VREyeView &head = TheOpenXR->getEyeView(0);
+		const Real scale = TheOpenXR->getWorldUnitsPerMeter();
+		Matrix3D headPose(TRUE);
+		headPose.Set_Translation(Vector3(head.posX * scale, head.posY * scale, head.posZ * scale));
+		Matrix3D headM;
+		Matrix3D::Multiply(anchor, headPose, &headM);
+		headWorld = headM.Get_Translation();
+	}
+	Real dist = (c - headWorld).Length();
+	if (dist < 1.0f) dist = 1.0f;
+	const Real half = 0.03f * dist;			// ~constant angular size (tune this factor)
+	const Real width = half * 0.14f;
+
+	// FLAT in both cases, parallel to the floor - the menu now lies flat on the floor like the
+	// battlefield, so the cross must not stand up on it. Just lifted a touch so it reads on top.
+	(void)onPanel;
+	c.Z += half * 0.4f;
+	const Vector3 axisX(half, 0.0f, 0.0f);
+	const Vector3 axisY(0.0f, half, 0.0f);
+
+	if (m_mouseMarkerLines[0] != nullptr)
+	{
+		m_mouseMarkerLines[0]->Reset(c - axisX, c + axisX, width);
+		m_mouseMarkerLines[0]->Set_Hidden(false);
+	}
+	if (m_mouseMarkerLines[1] != nullptr)
+	{
+		m_mouseMarkerLines[1]->Reset(c - axisY, c + axisY, width);
+		m_mouseMarkerLines[1]->Set_Hidden(false);
+	}
+}
+
+//-------------------------------------------------------------------------------------------------
+/** Edge-scroll: shove the mouse to the screen edge and the tactical camera pans that way, exactly
+	* like the monitor. scrollBy is view-relative and zoom-aware, so a fixed delta feels the same at
+	* every zoom, and because the VR eyes ride the tactical camera the whole headset view follows. */
+//-------------------------------------------------------------------------------------------------
+void VRControls::updateMouseScroll(W3DView *view)
+{
+	if (view == nullptr || TheMouse == nullptr || TheDisplay == nullptr)
+		return;
+
+	if (TheGlobalData == nullptr)
+		return;
+
+	const MouseIO *mio = TheMouse->getMouseStatus();
+
+	// Don't edge-scroll while a mouse button is held: that is a click or drag - a minimap jump, a
+	// command, a band-select. Scrolling underneath stole those (the minimap jump in particular). But
+	// plain hover-scroll now works at EVERY edge again, including the bottom over the control bar.
+	if (mio->leftState == MBS_Down || mio->rightState == MBS_Down)
+		return;
+	const Real w = (Real)TheDisplay->getWidth();
+	const Real h = (Real)TheDisplay->getHeight();
+	// A proper band, not a one-pixel sliver: the cursor is not captured in windowed VR, so it can
+	// slip off the exact edge before a thin margin ever catches it. The outer ~5% scrolls, faster
+	// the closer to the edge.
+	const Real bandX = w * 0.05f;
+	const Real bandY = h * 0.05f;
+	const Real px = (Real)mio->pos.x;
+	const Real py = (Real)mio->pos.y;
+
+	// Penetration into the band, -1..1.
+	Real sx = 0.0f, sy = 0.0f;
+	if (px < bandX)				sx = -((bandX - px) / bandX);
+	else if (px > w - bandX)	sx =  ((px - (w - bandX)) / bandX);
+	if (py < bandY)				sy = -((bandY - py) / bandY);
+	else if (py > h - bandY)	sy =  ((py - (h - bandY)) / bandY);
+	if (sx == 0.0f && sy == 0.0f)
+		return;
+
+	// THE FIX for edge-scroll doing nothing: match the game's own magnitude. LookAtXlat's edge
+	// scroll passes an offset of order SCROLL_AMT (200) times the user's scroll factors - about
+	// 100 per frame - to userScrollBy; my old value of ~0.06 was a thousand times too small to
+	// see. SCROLL_BASE is a touch under SCROLL_AMT to sit right at VR frame rates; the settings
+	// menu can expose sensitivity later. Use userScrollBy (the same call the game uses), so the
+	// scroll goes through the same permission gate.
+	const Real SCROLL_BASE = 120.0f;
+	const Real kScroll = TheGlobalData->m_keyboardScrollFactor;
+	Coord2D delta;
+	delta.x = sx * SCROLL_BASE * TheGlobalData->m_horizontalScrollSpeedFactor * kScroll;
+	delta.y = sy * SCROLL_BASE * TheGlobalData->m_verticalScrollSpeedFactor * kScroll;
+
+	const Coord3D camBefore = view->getPosition();
+	view->userScrollBy(&delta);
+	const Coord3D camAfter = view->getPosition();
+
+	static UnsignedInt s_lastScrollLog = 0;
+	const UnsignedInt nowMs = GetTickCount();
+	if ((nowMs - s_lastScrollLog) > 500)
+	{
+		s_lastScrollLog = nowMs;
+		DEBUG_LOG(("[VRSCROLL] mouse=(%d,%d) disp=%dx%d delta=(%.2f,%.2f) camXY %.1f,%.1f -> %.1f,%.1f",
+			mio->pos.x, mio->pos.y, (Int)w, (Int)h, delta.x, delta.y,
+			camBefore.x, camBefore.y, camAfter.x, camAfter.y));
+	}
+}
+
+//-------------------------------------------------------------------------------------------------
+/** Place and fade the fixed in-game HUD so it reads as the bottom of the monitor frame. Everything
+	* is measured from the frame itself each frame - width, how far in front the near edge is, and
+	* the ground drop - so the panel matches the "limits" and tracks them as the camera zooms. It
+	* fades down when the mouse is not on the control-bar strip, so it does not veil the battle. */
+//-------------------------------------------------------------------------------------------------
+void VRControls::updateFixedHud(W3DView *view, Bool inGame)
+{
+	if (TheOpenXR == nullptr)
+		return;
+
+	const Bool show = m_mouseKbMode && inGame && view != nullptr && TheTacticalView != nullptr;
+	TheOpenXR->setShowFixedHud(show);
+	// When a full-screen menu is up, the HUD stands upright as a readable screen instead of the flat
+	// control-bar strip (measured by updateUiCrop last frame).
+	TheOpenXR->setFixedHudFullScreen(m_bigMenuOpen);
+	if (!show)
+		return;
+
+	const Real scale = TheOpenXR->getWorldUnitsPerMeter();
+	if (scale <= 0.0f)
+		return;
+
+	Matrix3D anchor;
+	if (!getAnchor(view, anchor))
+		return;
+	const Vector3 camPos = anchor.Get_Translation();
+
+	// Ground level under the headset -> how far down the table is, in metres.
+	Real groundZ = camPos.Z;
+	if (TheTerrainLogic != nullptr)
+		groundZ = TheTerrainLogic->getGroundHeight(camPos.X, camPos.Y);
+	const Real drop = (camPos.Z - groundZ) / scale;
+
+	// The monitor frame's near (bottom) edge: width and how far in front it sits, both in metres,
+	// from the same projection the frame is drawn with.
+	Real widthM = 2.4f, forwardM = 1.2f;
+	Int ox, oy;
+	TheTacticalView->getOrigin(&ox, &oy);
+	ICoord2D centrePix = { ox + TheTacticalView->getWidth() / 2, oy + TheTacticalView->getHeight() / 2 };
+	Coord3D cw;
+	Real planeZ = groundZ;
+	if (TheTacticalView->screenToTerrain(&centrePix, &cw))
+		planeZ = cw.z;
+	Coord3D tl, tr, br, bl;
+	if (TheTacticalView->getScreenCornerWorldPointsAtZ(&tl, &tr, &br, &bl, planeZ) != PlaneClass::NO_INTERSECTION)
+	{
+		const Vector3 blv(bl.x, bl.y, bl.z), brv(br.x, br.y, br.z);
+		widthM = (brv - blv).Length() / scale;
+
+		Vector3 fwd = -anchor.Get_Z_Vector();
+		fwd.Z = 0.0f;
+		if (fwd.Length2() > 0.0001f)
+			fwd.Normalize();
+		const Vector3 nearMid = (blv + brv) * 0.5f;
+		forwardM = Vector3::Dot_Product(nearMid - camPos, fwd) / scale;
+	}
+	TheOpenXR->setFixedHudPlacement(drop, widthM, forwardM);
+
+	// The cursor is "on the HUD" when it is on the control-bar strip OR when a full menu is open
+	// (the whole screen is then the menu). That hides the battlefield crosshair - so you never see
+	// two crosses at once - and keeps the HUD opaque while you use it. Default dim off it is 50%.
+	const Real CONTROL_BAR_TOP = 0.66f;
+	Bool overStrip = FALSE;
+	if (TheMouse != nullptr && TheDisplay != nullptr)
+		overStrip = ((Real)TheMouse->getMouseStatus()->pos.y >= CONTROL_BAR_TOP * (Real)TheDisplay->getHeight());
+	m_mouseOverHud = overStrip || m_bigMenuOpen;
+	const Real targetAlpha = m_mouseOverHud ? 1.0f : 0.5f;
+	m_fixedHudAlpha += (targetAlpha - m_fixedHudAlpha) * 0.2f;
+	TheOpenXR->setFixedHudAlpha(m_fixedHudAlpha);
+}
+
+//-------------------------------------------------------------------------------------------------
+/** Draw the mouse's drag-select band box on the ground. The game already does the actual selection
+	* from the physical mouse; the flat UI just draws the rectangle in screen space, which the
+	* headset cannot show - so we project its four corners onto the terrain and draw it there,
+	* reusing the same line objects the controller box-select uses (idle in mouse mode). */
+//-------------------------------------------------------------------------------------------------
+void VRControls::updateMouseBoxSelect(W3DView *view)
+{
+	if (view == nullptr || TheTacticalView == nullptr || TheInGameUI == nullptr
+		|| !TheInGameUI->isSelecting())
+	{
+		for (Int i = 0; i < 4; ++i)
+			if (m_boxLines[i] != nullptr)
+				m_boxLines[i]->Set_Hidden(true);
+		return;
+	}
+
+	const IRegion2D *reg = TheInGameUI->getDragSelectRegion();
+	if (reg == nullptr)
+		return;
+
+	ICoord2D sc[4] =
+	{
+		{ reg->lo.x, reg->lo.y },
+		{ reg->hi.x, reg->lo.y },
+		{ reg->hi.x, reg->hi.y },
+		{ reg->lo.x, reg->hi.y },
+	};
+
+	const Real lift = 4.0f;
+	Vector3 corners[4];
+	for (Int c = 0; c < 4; ++c)
+	{
+		Coord3D wpt;
+		if (!TheTacticalView->screenToTerrain(&sc[c], &wpt))
+		{
+			for (Int i = 0; i < 4; ++i)
+				if (m_boxLines[i] != nullptr)
+					m_boxLines[i]->Set_Hidden(true);
+			return;
+		}
+		corners[c] = Vector3(wpt.x, wpt.y, wpt.z + lift);
+	}
+
+	const Real width = (3.0f + 0.004f * TheOpenXR->getWorldUnitsPerMeter()) * 0.2f;
+	for (Int i = 0; i < 4; ++i)
+	{
+		if (m_boxLines[i] == nullptr)
+			continue;
+		m_boxLines[i]->Reset(corners[i], corners[(i + 1) % 4], width);
+		m_boxLines[i]->Set_Hidden(false);
+	}
+}
+
+//-------------------------------------------------------------------------------------------------
 /** Hold the trigger and sweep the laser across the ground to take everything inside the box. A
 	* short press is still a single click, so the two gestures do not fight. */
 //-------------------------------------------------------------------------------------------------
@@ -874,6 +1410,11 @@ void VRControls::updateSelectionMarkers()
 					m_healthFill[used]->Set_Hidden(true);
 				}
 
+				// Control-group number: the seven-segment figure read as ugly 3D. Hidden for now; the
+				// follow-up is a proper billboard TEXT numeral (a font, facing the camera like the
+				// health bar), the way the flat game shows it.
+				setGroupDigit(used, -1, barCentre, barRight, Vector3(0.0f, 0.0f, -1.0f), 1.0f, 1.0f, 1.0f);
+
 				++used;
 			}
 		}
@@ -884,6 +1425,54 @@ void VRControls::updateSelectionMarkers()
 		if (m_selectionBeads[i] != nullptr) m_selectionBeads[i]->Set_Hidden(true);
 		if (m_healthBack[i] != nullptr) m_healthBack[i]->Set_Hidden(true);
 		if (m_healthFill[i] != nullptr) m_healthFill[i]->Set_Hidden(true);
+		for (Int s = 0; s < 7; ++s)
+			if (m_groupDigit[i][s] != nullptr) m_groupDigit[i][s]->Set_Hidden(true);
+	}
+}
+
+//-------------------------------------------------------------------------------------------------
+/** Paint one 0-9 control-group numeral as a seven-segment figure, or hide it (digit < 0). Segment
+	* endpoints live in a [0,1] cell (x along `right`, y along `down`); we map them into the world
+	* plane about `centre`. Same numbering the flat game shows under the health bar. */
+//-------------------------------------------------------------------------------------------------
+void VRControls::setGroupDigit(Int marker, Int digit, const Vector3 &centre, const Vector3 &right,
+	const Vector3 &down, Real halfW, Real halfH, Real width)
+{
+	if (marker < 0 || marker >= MAX_SELECTION_MARKERS)
+		return;
+
+	// Segment bits: a=1 b=2 c=4 d=8 e=16 f=32 g=64.
+	static const UnsignedInt SEG[10] =
+		{ 0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F };
+	static const Real END[7][4] =
+	{
+		{ 0.0f, 0.0f, 1.0f, 0.0f },   // a  top
+		{ 1.0f, 0.0f, 1.0f, 0.5f },   // b  top-right
+		{ 1.0f, 0.5f, 1.0f, 1.0f },   // c  bottom-right
+		{ 0.0f, 1.0f, 1.0f, 1.0f },   // d  bottom
+		{ 0.0f, 0.5f, 0.0f, 1.0f },   // e  bottom-left
+		{ 0.0f, 0.0f, 0.0f, 0.5f },   // f  top-left
+		{ 0.0f, 0.5f, 1.0f, 0.5f },   // g  middle
+	};
+
+	const UnsignedInt mask = (digit >= 0 && digit <= 9) ? SEG[digit] : 0u;
+
+	for (Int s = 0; s < 7; ++s)
+	{
+		Line3DClass *seg = m_groupDigit[marker][s];
+		if (seg == nullptr)
+			continue;
+		if (!(mask & (1u << s)))
+		{
+			seg->Set_Hidden(true);
+			continue;
+		}
+		const Vector3 p0 = centre + right * ((END[s][0] - 0.5f) * 2.0f * halfW)
+		                          + down  * ((END[s][1] - 0.5f) * 2.0f * halfH);
+		const Vector3 p1 = centre + right * ((END[s][2] - 0.5f) * 2.0f * halfW)
+		                          + down  * ((END[s][3] - 0.5f) * 2.0f * halfH);
+		seg->Reset(p0, p1, width);
+		seg->Set_Hidden(false);
 	}
 }
 
@@ -1359,6 +1948,10 @@ void VRControls::updatePointer(W3DView *view)
 	const LPARAM packed = MAKELPARAM(screen.x, screen.y);
 
 	mouse->addWin32Event(WM_MOUSEMOVE, 0, packed, now);
+	// Remember where the ray put the cursor so updateMouseActivity can tell this apart from a
+	// real mouse move (which lands somewhere else) - the monitor frame is a physical-mouse aid.
+	m_injectedCursorX = screen.x;
+	m_injectedCursorY = screen.y;
 
 	const VRControllerState &right = TheOpenXR->getController(VR_HAND_RIGHT);
 	const VRControllerState &left = TheOpenXR->getController(VR_HAND_LEFT);
@@ -1668,6 +2261,38 @@ void VRControls::update()
 	W3DView *view = (W3DView *)TheTacticalView;
 	const Bool inGame = (TheGameLogic != nullptr && TheGameLogic->isInGame());
 
+	// Watch the mouse first, so both the menu cursor and the in-game frame have a fresh answer.
+	updateMouseActivity();
+	// Then decide which input is driving - rays or mouse+keyboard - and switch softly between them.
+	updateInputMode();
+
+	// Keyboard shortcuts that work EVERYWHERE, from the title screen on - not gated by game state.
+	if (TheKeyboard != nullptr && TheOpenXR != nullptr)
+	{
+		// Ctrl+Space recenters the VR view (the mouse+keyboard equivalent of the rays' reset).
+		const Bool recenterCombo = TheKeyboard->isCtrl() && TheKeyboard->isKeyDown(KEY_SPACE);
+		if (recenterCombo && !m_ctrlSpaceWasDown)
+			TheOpenXR->recenter();
+		m_ctrlSpaceWasDown = recenterCombo;
+
+		// Ctrl+O pulls the whole battlefield CLOSER, Ctrl+L pushes it FURTHER, by scaling the VR
+		// world size (world-units-per-metre). The tactical camera and its render limits do not move
+		// at all - only how big the map feels around you. Held to ease in; clamped to a sane range.
+		if (TheKeyboard->isCtrl())
+		{
+			Real s = TheOpenXR->getWorldUnitsPerMeter();
+			if (TheKeyboard->isKeyDown(KEY_O)) s *= 0.99f;	// fewer units/metre -> map bigger -> closer
+			if (TheKeyboard->isKeyDown(KEY_L)) s *= 1.01f;	// further
+			if (s < 40.0f) s = 40.0f;
+			if (s > 4000.0f) s = 4000.0f;
+			TheOpenXR->setWorldUnitsPerMeter(s);
+		}
+	}
+
+	// In mouse+keyboard mode there is no controller to summon the HUD, so ask for the fixed in-game
+	// HUD panel and measure where it belongs (matched to the monitor frame) and how opaque.
+	updateFixedHud(view, inGame);
+
 	// Skipping the intro. The movie does not run in a blocking loop at all - it plays across
 	// ordinary frames, and Escape reaches it through the window translator, which then calls
 	// stopMovie(). So we call the same thing: no keyboard needed in a headset.
@@ -1688,7 +2313,36 @@ void VRControls::update()
 				DEBUG_LOG(("OpenXR: movie skipped by controller"));
 			}
 		}
+		updateMonitorFrame(FALSE);	// no battlefield behind the film - put the frame away
+		updateMouseMarker(FALSE);
 		return;	// nothing else to do while a movie is on screen
+	}
+
+	// Mouse + keyboard mode: the motion controllers are put away entirely - no rays, no ray pointer,
+	// no grab-locomotion. The physical mouse and keyboard drive the game through its ordinary input,
+	// exactly as on the monitor; we only add the VR-side visuals (cursor, frame, drag box) and
+	// edge-scrolling. (A future settings menu flips m_mouseKbMode; for now it is forced on.)
+	if (m_mouseKbMode)
+	{
+		for (Int hand = 0; hand < 2; ++hand)
+		{
+			if (m_rayLines[hand] != nullptr)
+				m_rayLines[hand]->Set_Hidden(true);
+			m_rayVisible[hand] = FALSE;
+		}
+		if (TheWritableGlobalData != nullptr)
+			TheWritableGlobalData->m_vrAimValid = FALSE;	// no ray aim; placement follows the real mouse
+
+		updateMouseScroll(inGame ? view : nullptr);
+		updateMouseBoxSelect(inGame ? view : nullptr);
+		updateSelectionMarkers();
+		updateUiCrop();
+		// Show the frame and crosshair whenever mouse+keyboard is the input (always, in this mode).
+		// The crosshair is now the ONE cursor: it slides onto the HUD and menu panels as well as the
+		// battlefield (mousePanelWorldPos), so it is NO LONGER hidden over the HUD.
+		updateMonitorFrame(inGame && view != nullptr);
+		updateMouseMarker(inGame && view != nullptr);
+		return;
 	}
 
 	updatePanelToggles();
@@ -1729,6 +2383,11 @@ void VRControls::update()
 	// The beams are drawn everywhere, including the menus - that is the whole point of them.
 	updateRays(view);
 	updateSelectionMarkers();
+
+	// This is the RAYS path (m_mouseKbMode is false here), so the mouse+keyboard aids belong hidden -
+	// the moment the mouse moves, update() takes the other branch and shows them.
+	updateMonitorFrame(FALSE);
+	updateMouseMarker(FALSE);
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -1748,10 +2407,12 @@ void VRControls::updateUiCrop()
 
 	const Real BOTTOM_STRIP = 0.66f;	// where the control bar begins
 	Real top = BOTTOM_STRIP;
+	Bool bigMenu = FALSE;
 
 	if (TheWindowManager != nullptr)
 	{
-		const Real screenHeight = (Real)TheDisplay->getHeight();
+		const Real screenW = (Real)TheDisplay->getWidth();
+		const Real screenH = (Real)TheDisplay->getHeight();
 
 		for (GameWindow *win = TheWindowManager->winGetWindowList(); win != nullptr;
 			win = win->winGetNext())
@@ -1764,9 +2425,17 @@ void VRControls::updateUiCrop()
 			if (y < 0)
 				y = 0;
 
-			const Real winTop = (Real)y / screenHeight;
+			const Real winTop = (Real)y / screenH;
 			if (winTop < top)
 				top = winTop;
+
+			// A window that covers a big slab of the screen is a full menu (options, generals
+			// promotion), not the control bar - the flat strip cannot show it, so flag it.
+			Int ww = 0, wh = 0;
+			win->winGetSize(&ww, &wh);
+			if (screenW > 0.0f && screenH > 0.0f
+				&& (Real)wh / screenH > 0.45f && (Real)ww / screenW > 0.4f)
+				bigMenu = TRUE;
 		}
 	}
 
@@ -1774,4 +2443,5 @@ void VRControls::updateUiCrop()
 	if (top > BOTTOM_STRIP) top = BOTTOM_STRIP;
 
 	TheWritableGlobalData->m_vrUiCropTop = top;
+	m_bigMenuOpen = bigMenu;
 }

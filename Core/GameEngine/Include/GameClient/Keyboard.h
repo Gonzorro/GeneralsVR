@@ -113,6 +113,7 @@ public:
 	Bool isCtrl();
 	Bool isAlt();
 	Int getModifierFlags() { return m_modifiers; }
+	Bool isKeyDown( KeyDefType key ) { return getKeyStateBit( key, KEY_STATE_DOWN ); }	///< GeneralsVR raw down-state of a key, for polling shortcuts
 
 	// access methods for key data
 	void resetKeys();												///< reset the state of the keys
