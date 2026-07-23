@@ -235,6 +235,8 @@ VRControls::VRControls()
 		m_prevCtrlQuat[i][3] = 1.0f;
 	}
 	m_ctrlLastMoveTime = 0;
+	m_rayPressFirstTime = 0;
+	m_rayPressCount = 0;
 	m_ctrlSeeded = FALSE;
 	m_ctrlSpaceWasDown = FALSE;
 	m_fixedHudAlpha = 1.0f;
@@ -851,6 +853,45 @@ void VRControls::updateInputMode()
 		&& (now - m_mouseLastMoveTime) >= 3000
 		&& m_ctrlLastMoveTime != 0 && (now - m_ctrlLastMoveTime) < 500)
 		m_mouseKbMode = FALSE;
+
+	// GeneralsVR @feature Squeezing the trigger a few times is a clear "give me the rays back":
+	// the player should not have to wait out the mouse-idle timer or wave the controller around.
+	// Three squeezes inside 1.5 seconds flip back to the rays; a single stray squeeze while
+	// mousing does not. The flip completes on the RELEASE of the last squeeze, so the squeeze
+	// that causes it can never land a ray click on whatever the laser happens to cross.
+	if (m_mouseKbMode)
+	{
+		Bool pressEdge = FALSE, releaseEdge = FALSE, anyDown = FALSE;
+		for (Int hand = 0; hand < 2; ++hand)
+		{
+			const VRControllerState &c = TheOpenXR->getController(hand);
+			if (c.triggerPressed)  pressEdge = TRUE;
+			if (c.triggerReleased) releaseEdge = TRUE;
+			if (c.trigger)         anyDown = TRUE;
+		}
+		if (pressEdge)
+		{
+			if (m_rayPressCount == 0 || (now - m_rayPressFirstTime) > 1500)
+			{
+				m_rayPressFirstTime = now;
+				m_rayPressCount = 1;
+			}
+			else
+			{
+				m_rayPressCount++;
+			}
+			m_ctrlLastMoveTime = now;	// mashing counts as "controller in use" for the idle handback too
+		}
+		if (releaseEdge && !anyDown && m_rayPressCount >= 3 && (now - m_rayPressFirstTime) <= 1500)
+		{
+			m_mouseKbMode = FALSE;
+			m_rayPressCount = 0;
+		}
+	}
+	else
+	{
+		m_rayPressCount = 0;
+	}
 }
 
 //-------------------------------------------------------------------------------------------------

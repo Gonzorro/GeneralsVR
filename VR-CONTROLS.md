@@ -7,7 +7,9 @@ Launch from the **GeneralsVR** desktop shortcut (Quest Link running).
 The game's interface floats on a screen in front of you. Point the **right controller** and pull
 the **right trigger** to click. **B** or **Y** skips the intro movie.
 
-Mouse and keyboard still work at all times — the monitor mirrors everything.
+Mouse and keyboard still work at all times, the monitor mirrors everything. Moving the mouse
+takes control instantly. To hand control back to the lasers, either leave the mouse alone for a
+few seconds while using the controllers, or simply squeeze the trigger three times quickly.
 
 ## In a battle
 

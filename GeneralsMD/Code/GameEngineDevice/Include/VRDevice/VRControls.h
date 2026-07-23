@@ -216,6 +216,8 @@ private:
 	Vector3 m_prevCtrlPos[2];         ///< last controller positions, to detect controller movement
 	Real m_prevCtrlQuat[2][4];        ///< last controller orientations
 	UnsignedInt m_ctrlLastMoveTime;   ///< GetTickCount() of the last real controller movement
+	UnsignedInt m_rayPressFirstTime;  ///< start of the current trigger-mash burst (mouse mode only)
+	Int m_rayPressCount;              ///< trigger presses inside the burst window; 3 = "give me the rays"
 	Bool m_ctrlSeeded;                ///< first frame just records controller poses
 	Bool m_ctrlSpaceWasDown;          ///< edge-detect Ctrl+Space (recenter)
 	Real m_fixedHudAlpha;             ///< eased HUD opacity, full over the HUD and faded off it
