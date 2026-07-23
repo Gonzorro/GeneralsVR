@@ -531,6 +531,26 @@ Bool OpenXRManager::createVulkanCopyResources()
 	return TRUE;
 }
 
+// GeneralsVR @bugfix GitHub issue #2: Meta runtime 1.205.0 crashes with an access violation
+// inside its own IPC client (RuntimeIPCServiceClient_32.dll) during xrCreateSession on some
+// setups, where runtime 1.117.0 succeeds. We cannot fix their runtime, but we can survive it:
+// catch the hardware exception so a broken runtime downgrades the game to flat rendering with
+// a clear log line instead of taking the whole process down. SEH needs a function with no C++
+// objects to unwind, hence this tiny wrapper.
+static XrResult xrCreateSessionGuarded(XrInstance instance, const XrSessionCreateInfo* sci,
+	XrSession* session, unsigned long* crashCode)
+{
+	__try
+	{
+		return xrCreateSession(instance, sci, session);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		*crashCode = GetExceptionCode();
+		return XR_ERROR_RUNTIME_FAILURE;
+	}
+}
+
 //-------------------------------------------------------------------------------------------------
 Bool OpenXRManager::createSession()
 {
@@ -571,9 +591,20 @@ Bool OpenXRManager::createSession()
 	// The runtime may touch the shared queue; follow DXVK's interop contract.
 	m_dxvkInterop->FlushRenderingCommands();
 	m_dxvkInterop->LockSubmissionQueue();
-	XrResult result = xrCreateSession(m_instance, &sci, &m_session);
+	DEBUG_LOG(("OpenXR: session: calling xrCreateSession (instance=%p physicalDevice=%p device=%p queueFamily=%u queueIndex=%u)",
+		binding.instance, binding.physicalDevice, binding.device, binding.queueFamilyIndex, binding.queueIndex));
+	unsigned long sessionCrashCode = 0;
+	XrResult result = xrCreateSessionGuarded(m_instance, &sci, &m_session, &sessionCrashCode);
 	m_dxvkInterop->ReleaseSubmissionQueue();
 
+	if (sessionCrashCode != 0)
+	{
+		DEBUG_LOG(("OpenXR: session: xrCreateSession CRASHED inside the OpenXR runtime (exception 0x%08lX). "
+			"Known Meta runtime bug (GitHub issue #2) - VR unavailable, the game continues flat.",
+			sessionCrashCode));
+		m_session = XR_NULL_HANDLE;
+		return FALSE;
+	}
 	if (XR_FAILED(result))
 	{
 		DEBUG_LOG(("OpenXR: session: xrCreateSession FAILED (%d)", (int)result));
