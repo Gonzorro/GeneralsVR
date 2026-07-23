@@ -116,8 +116,91 @@ constexpr const UnsignedInt MAX_CELL_COUNT = 500;
 constexpr const UnsignedInt MAX_ADJUSTMENT_CELL_COUNT = 400;
 constexpr const UnsignedInt MAX_SAFE_PATH_CELL_COUNT = 2000;
 
-constexpr const UnsignedInt PATHFIND_CELLS_PER_FRAME = 5000; // Number of cells we will search pathfinding per frame.
+constexpr const UnsignedInt PATHFIND_CELLS_PER_FRAME = 5000; // Max cells walked during a single retail-compatible open-list insertion sort. Leave at the retail value.
+
+// GeneralsVR @perf: per-frame cumulative pathfinding budget shared across ALL queued path requests in one logic tick
+// (for Pathfinder::processPathfindQueue). The original engine drains the request queue until 5000 cells have been
+// examined in a single tick; on modern hardware one pathfind cell costs ~20us (cache thrashing on the large cell
+// arrays), so 5000 cells is ~100ms of work crammed into one frame -> a visible stutter whenever many units path at once
+// (worst in big battles, exactly where VR framerate hurts most). Capping the tick to ~900 cells (~18ms) keeps the 30Hz
+// sim from hitching; the request queue deterministically carries the leftover work into later ticks, so no path is ever
+// dropped or shortened. Insight lifted from the GeneralsZH Thrax Edition / GeneralsOnline pathfinding pass; the
+// per-search depth (PATHFIND_CELLS_PER_FRAME above) is deliberately left at the retail value so long routes still
+// resolve fully and units never bail to the nearest cliff.
+//
+// CURRENTLY PARKED (unused): draining fewer cells per tick than stock diverges the lockstep sim from unmodified
+// copies (path completion shifts ticks; m_cumulativeCellsAllocated is even CRC'd), which forfeits cross-play with the
+// flat game. Plan (docs/pathfinding-fast-identical-plan.md): first make the pathfinder faster with bit-identical
+// results, then re-enable this budget gated to non-network games only. Until then the drain uses the retail constant.
+constexpr const UnsignedInt PATHFIND_CELLS_PER_FRAME_BUDGET = 900;
 constexpr const UnsignedInt CELL_INFOS_TO_ALLOCATE = 30000;
+
+// GeneralsVR @profile: Phase-0 measurement for the pathfinding perf work (docs/pathfinding-fast-identical-plan.md).
+// Counters + QueryPerformanceCounter timing, logged only - nothing here feeds back into any simulation decision, so
+// results stay bit-identical with the profiling enabled or disabled. Remove by flipping the define to 0.
+#define GVR_PATHFIND_PROFILE 1
+#if GVR_PATHFIND_PROFILE
+struct GvrPathProfile
+{
+	__int64 freq;              // QPC frequency, resolved lazily
+	Int depth;                 // live GvrSearchTimer nesting depth (only the outermost records)
+	// accumulators since the last processPathfindQueue report (~one logic tick)
+	__int64 searchTicks;       // QPC ticks inside top-level searches
+	__int64 cfmTicks;          // QPC ticks inside checkForMovement (subset of searchTicks)
+	__int64 vmpTicks;          // QPC ticks inside validMovementPosition (subset of searchTicks)
+	Int searches;              // top-level searches completed
+	Int neighborVisits;        // neighbor cells examined in internalFindPath's loop
+	Int walkSteps;             // total open-list insertion-walk steps (the O(n) sorted-list scans; nonzero on the fast path = legacy fallback ran)
+	UnsignedInt maxWalk;       // longest single insertion walk this tick
+	Int capHits;               // legacy: walks that hit the 5000 cap (splice quirk fired); fast path: inserts with >5000 already listed (same divergence regime)
+	Int maxOpen;               // largest open-list size seen this tick (fast path only)
+};
+static GvrPathProfile s_gvrProf = {0};
+
+static inline __int64 gvrProfNow(void)
+{
+	__int64 t;
+	QueryPerformanceCounter((LARGE_INTEGER *)&t);
+	return t;
+}
+
+static inline Int gvrProfUs(__int64 ticks)
+{
+	if (s_gvrProf.freq == 0) {
+		QueryPerformanceFrequency((LARGE_INTEGER *)&s_gvrProf.freq);
+	}
+	return (Int)((ticks * 1000000) / s_gvrProf.freq);
+}
+
+// Times one top-level pathfind entry point; RAII so every return path is covered. Nested searches
+// (findPath -> internalFindPath etc.) are not double-counted: only the outermost timer records.
+struct GvrSearchTimer
+{
+	__int64 m_t0;
+	const char *m_kind;
+	GvrSearchTimer(const char *kind) : m_t0(0), m_kind(kind)
+	{
+		if (s_gvrProf.depth++ == 0) {
+			m_t0 = gvrProfNow();
+		}
+	}
+	~GvrSearchTimer()
+	{
+		if (--s_gvrProf.depth == 0) {
+			__int64 dt = gvrProfNow() - m_t0;
+			s_gvrProf.searchTicks += dt;
+			s_gvrProf.searches++;
+			Int us = gvrProfUs(dt);
+			if (us > 2000) {
+				DEBUG_LOG(("GVRPROF slow-search frame=%d kind=%s us=%d", TheGameLogic->getFrame(), m_kind, us));
+			}
+		}
+	}
+};
+#define GVR_SEARCH_TIMER(kind) GvrSearchTimer gvrSearchTimer_(kind)
+#else
+#define GVR_SEARCH_TIMER(kind) ((void)0)
+#endif
 
 //-----------------------------------------------------------------------------------
 PathNode::PathNode() :
@@ -1216,6 +1299,9 @@ PathfindCellInfo *PathfindCellInfo::getACellInfo(PathfindCell *cell,const ICoord
 		info->m_obstacleIsFence = false;
 		info->m_obstacleIsTransparent = false;
 		info->m_blockedByAlly = false;
+#if GVR_FAST_OPENLIST
+		info->m_openIndexGen = 0;
+#endif
 	}
 	return info;
 }
@@ -1732,6 +1818,16 @@ void PathfindCell::forwardInsertionSortRetailCompatible(PathfindCellList& list)
 		currentCell = currentCell->getNextOpen();
 	}
 
+#if GVR_PATHFIND_PROFILE
+	s_gvrProf.walkSteps += (Int)cellCount;
+	if (cellCount > s_gvrProf.maxWalk) {
+		s_gvrProf.maxWalk = cellCount;
+	}
+	if (cellCount >= PATHFIND_CELLS_PER_FRAME && currentCell) {
+		s_gvrProf.capHits++;
+	}
+#endif
+
 	if (currentCell)
 	{
 		// insert just before "currentCell"
@@ -1851,6 +1947,76 @@ void PathfindCell::reverseInsertionSort(PathfindCellList& list)
 /// put self on "open" list in ascending cost order, return new list
 void PathfindCell::putOnSortedOpenList( PathfindCellList &list )
 {
+#if GVR_FAST_OPENLIST
+	// GeneralsVR @perf The legacy sorts below find the insertion slot by walking the sorted
+	// linked list one node at a time: O(n) cold-memory hops per insert, measured at 1.4M walk
+	// steps inside ONE big-battle tick (~26ms - the pathfinding stutter). The index finds the
+	// same slot in O(log n); the list splice itself is copied from the legacy sort, so list
+	// order stays bit-identical: ascending m_totalCost, FIFO among equal costs (multimap
+	// inserts at the end of the equal range, exactly like the legacy walks).
+	// If a hard reset kept list nodes while clearing the index, fall through to the legacy
+	// walk until the list drains and the index restarts (self-healing, logged via walkSteps).
+	// Determinism note (docs/pathfinding-fast-identical-plan.md): the retail walk caps at
+	// 5000 steps and splices out of order beyond that; the index never caps. That regime has
+	// never been observed (max open list ever measured: 331) - the tripwire below logs it.
+	if (list.m_head == nullptr || !list.m_index.empty())
+	{
+		DEBUG_ASSERTCRASH(m_info, ("Has to have info."));
+		DEBUG_ASSERTCRASH(m_info->m_closed == FALSE && m_info->m_open == FALSE, ("Serious error - Invalid flags. jba"));
+
+		m_info->m_open = true;
+		m_info->m_closed = false;
+
+		GvrOpenCellIndex::iterator it = list.m_index.insert(std::make_pair(m_info->m_totalCost, m_info));
+		m_info->m_openIndexIt = it;
+		m_info->m_openIndexGen = list.m_indexGen;
+
+#if GVR_PATHFIND_PROFILE
+		if ((Int)list.m_index.size() > s_gvrProf.maxOpen) {
+			s_gvrProf.maxOpen = (Int)list.m_index.size();
+		}
+		if (list.m_index.size() > (size_t)PATHFIND_CELLS_PER_FRAME) {
+			s_gvrProf.capHits++;	// retail's capped-walk regime: divergence risk vs stock builds
+		}
+#endif
+
+		GvrOpenCellIndex::iterator next = it;
+		++next;
+		if (next != list.m_index.end())
+		{
+			// insert just before the index neighbour, exactly like the legacy sorts
+			PathfindCellInfo* nextInfo = next->second;
+			if (nextInfo->m_prevOpen)
+				nextInfo->m_prevOpen->m_nextOpen = m_info;
+			else
+				list.m_head = this;
+			m_info->m_prevOpen = nextInfo->m_prevOpen;
+			nextInfo->m_prevOpen = m_info;
+			m_info->m_nextOpen = nextInfo;
+		}
+		else if (list.m_index.size() == 1)
+		{
+			// the list was empty: we are the whole list
+			list.m_head = this;
+			list.m_tail = this;
+			m_info->m_prevOpen = nullptr;
+			m_info->m_nextOpen = nullptr;
+		}
+		else
+		{
+			// costliest so far: append after the previous index entry, which is the list tail
+			GvrOpenCellIndex::iterator prev = it;
+			--prev;
+			PathfindCellInfo* prevInfo = prev->second;
+			prevInfo->m_nextOpen = m_info;
+			m_info->m_prevOpen = prevInfo;
+			m_info->m_nextOpen = nullptr;
+			list.m_tail = this;
+		}
+		return;
+	}
+#endif
+
 #if RETAIL_COMPATIBLE_PATHFINDING
 	if (!s_useFixedPathfinding) {
 		forwardInsertionSortRetailCompatible(list);
@@ -1874,6 +2040,14 @@ void PathfindCell::removeFromOpenList( PathfindCellList &list )
 {
 	DEBUG_ASSERTCRASH(m_info, ("Has to have info."));
 	DEBUG_ASSERTCRASH(m_info->m_closed==FALSE && m_info->m_open==TRUE, ("Serious error - Invalid flags. jba"));
+#if GVR_FAST_OPENLIST
+	// Only trust the stored iterator when it belongs to the index's current generation.
+	if (m_info->m_openIndexGen == list.m_indexGen && !list.m_index.empty())
+	{
+		list.m_index.erase(m_info->m_openIndexIt);
+		m_info->m_openIndexGen = 0;
+	}
+#endif
 	if (m_info->m_nextOpen)
 		m_info->m_nextOpen->m_prevOpen = m_info->m_prevOpen;
 	else {
@@ -1895,6 +2069,12 @@ void PathfindCell::removeFromOpenList( PathfindCellList &list )
 Int PathfindCell::releaseOpenList( PathfindCellList &list )
 {
 	Int count = 0;
+#if GVR_FAST_OPENLIST
+	// Bulk clear: drop the whole index up front and invalidate every stored iterator via the
+	// generation bump. Covers the retail crash-recovery early-return below as well.
+	list.m_index.clear();
+	++list.m_indexGen;
+#endif
 	while (list.m_head) {
 		count++;
 		DEBUG_ASSERTCRASH(list.m_head->m_info, ("Has to have info."));
@@ -6097,6 +6277,25 @@ void Pathfinder::processPathfindQueue()
 		PROFILER_PLOT("PathfindCells", (double)m_cumulativeCellsAllocated);
 		PROFILER_PLOT("PathfindPaths", (double)pathsFound);
 	}
+#if GVR_PATHFIND_PROFILE
+	// Covers ALL pathfinding since the previous tick's report: the queue drain above plus any direct
+	// findPath/findGroundPath/checkPathCost calls made elsewhere in the frame.
+	if (s_gvrProf.searches > 0) {
+		DEBUG_LOG(("GVRPROF tick frame=%d searches=%d queueCells=%d queuePaths=%d us=%d cfm_us=%d vmp_us=%d visits=%d walk=%d maxwalk=%u caphits=%d openmax=%d",
+			TheGameLogic->getFrame(), s_gvrProf.searches, m_cumulativeCellsAllocated, pathsFound,
+			gvrProfUs(s_gvrProf.searchTicks), gvrProfUs(s_gvrProf.cfmTicks), gvrProfUs(s_gvrProf.vmpTicks),
+			s_gvrProf.neighborVisits, s_gvrProf.walkSteps, s_gvrProf.maxWalk, s_gvrProf.capHits, s_gvrProf.maxOpen));
+	}
+	s_gvrProf.searchTicks = 0;
+	s_gvrProf.cfmTicks = 0;
+	s_gvrProf.vmpTicks = 0;
+	s_gvrProf.searches = 0;
+	s_gvrProf.neighborVisits = 0;
+	s_gvrProf.walkSteps = 0;
+	s_gvrProf.maxWalk = 0;
+	s_gvrProf.capHits = 0;
+	s_gvrProf.maxOpen = 0;
+#endif
 #ifdef DEBUG_QPF
 	if (pathsFound>0) {
 #ifdef DEBUG_LOGGING
@@ -6353,7 +6552,14 @@ Int Pathfinder::examineNeighboringCells(PathfindCell *parentCell, PathfindCell *
 					continue;
 			}
 
+#if GVR_PATHFIND_PROFILE
+			s_gvrProf.neighborVisits++;
+			__int64 gvrT0 = gvrProfNow();
+#endif
 			Bool movementValid = validMovementPosition(isCrusher, locomotorSet.getValidSurfaces(), newCell, parentCell);
+#if GVR_PATHFIND_PROFILE
+			s_gvrProf.vmpTicks += gvrProfNow() - gvrT0;
+#endif
 			Bool dozerHack = false;
 			if (!movementValid && obj->isKindOf(KINDOF_DOZER) && newCell->getType() == PathfindCell::CELL_OBSTACLE) {
 				Object* obstacle = TheGameLogic->findObjectByID(newCell->getObstacleID());
@@ -6383,7 +6589,15 @@ Int Pathfinder::examineNeighboringCells(PathfindCell *parentCell, PathfindCell *
 			if (dy<0) dy = -dy;
 			if (dx>1+radius) info.considerTransient = false;
 			if (dy>1+radius) info.considerTransient = false;
-			if (!checkForMovement(obj, info) || info.enemyFixed) {
+#if GVR_PATHFIND_PROFILE
+			gvrT0 = gvrProfNow();
+#endif
+			// call hoisted out of the condition unchanged: the original short-circuit always evaluated it first
+			Bool gvrCanMove = checkForMovement(obj, info);
+#if GVR_PATHFIND_PROFILE
+			s_gvrProf.cfmTicks += gvrProfNow() - gvrT0;
+#endif
+			if (!gvrCanMove || info.enemyFixed) {
 				if (!m_isTunneling) {
 					continue;
 				}
@@ -6503,6 +6717,7 @@ Int Pathfinder::examineNeighboringCells(PathfindCell *parentCell, PathfindCell *
 Path *Pathfinder::findPath( Object *obj, const LocomotorSet& locomotorSet, const Coord3D *from,
 													 const Coord3D *rawTo)
 {
+	GVR_SEARCH_TIMER("path");
 	if (!clientSafeQuickDoesPathExist(locomotorSet, from, rawTo)) {
 		return nullptr;
 	}
@@ -6541,6 +6756,7 @@ Path *Pathfinder::internalFindPath( Object *obj, const LocomotorSet& locomotorSe
 #ifdef DEBUG_LOGGING
 	Int startTimeMS = ::GetTickCount();
 #endif
+	GVR_SEARCH_TIMER("internal");
 	Bool centerInCell = true;
 	Int radius = 0;
 	if (obj) {
@@ -7114,6 +7330,7 @@ Path *Pathfinder::findGroundPath( const Coord3D *from,
 													 const Coord3D *rawTo, Int pathDiameter, Bool crusher)
 {
 	//CRCDEBUG_LOG(("Pathfinder::findGroundPath()"));
+	GVR_SEARCH_TIMER("ground");
 #ifdef DEBUG_LOGGING
 	Int startTimeMS = ::GetTickCount();
 #endif
@@ -7609,6 +7826,7 @@ void Pathfinder::processHierarchicalCell( const ICoord2D &scanCell, const ICoord
 Path *Pathfinder::findHierarchicalPath( Bool isHuman, const LocomotorSet& locomotorSet, const Coord3D *from,
 													 const Coord3D *to, Bool crusher)
 {
+	GVR_SEARCH_TIMER("hier");
 	return internal_findHierarchicalPath(isHuman, locomotorSet.getValidSurfaces(), from, to, crusher, FALSE);
 }
 
@@ -7620,6 +7838,7 @@ Path *Pathfinder::findHierarchicalPath( Bool isHuman, const LocomotorSet& locomo
 Path *Pathfinder::findClosestHierarchicalPath( Bool isHuman, const LocomotorSet& locomotorSet, const Coord3D *from,
 													 const Coord3D *to, Bool crusher)
 {
+	GVR_SEARCH_TIMER("hierClosest");
 	return internal_findHierarchicalPath(isHuman, locomotorSet.getValidSurfaces(), from, to, crusher, TRUE);
 }
 
@@ -7633,6 +7852,7 @@ Path *Pathfinder::internal_findHierarchicalPath( Bool isHuman, const LocomotorSu
 													 const Coord3D *rawTo, Bool crusher, Bool closestOK)
 {
 	//CRCDEBUG_LOG(("Pathfinder::findGroundPath()"));
+	GVR_SEARCH_TIMER("hierInternal");
 #ifdef DEBUG_LOGGING
 	Int startTimeMS = ::GetTickCount();
 #endif
@@ -8477,6 +8697,7 @@ Int Pathfinder::checkPathCost(Object *obj, const LocomotorSet& locomotorSet, con
 		const Coord3D *rawTo)
 {
 	//CRCDEBUG_LOG(("Pathfinder::checkPathCost()"));
+	GVR_SEARCH_TIMER("cost");
 	if (m_isMapReady == false) return 0;
 	enum {MAX_COST = 0x7fff0000};
 	if (!obj) return MAX_COST;
@@ -8733,6 +8954,7 @@ Path *Pathfinder::findClosestPath( Object *obj, const LocomotorSet& locomotorSet
 #ifdef DEBUG_LOGGING
 	Int startTimeMS = ::GetTickCount();
 #endif
+	GVR_SEARCH_TIMER("closest");
 	Bool isHuman = true;
 	if (obj && obj->getControllingPlayer() && (obj->getControllingPlayer()->getPlayerType()==PLAYER_COMPUTER)) {
 		isHuman = false; // computer gets to cheat.

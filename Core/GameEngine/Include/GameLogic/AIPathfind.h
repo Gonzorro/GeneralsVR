@@ -35,6 +35,18 @@
 #include "GameLogic/LocomotorSet.h"
 #include "GameLogic/GameLogic.h"
 
+#include <map>
+
+// GeneralsVR @perf Fast open-list ordering: an ordered index finds the sorted-list insertion
+// slot in O(log n) instead of the legacy O(n) node-by-node walk, which profiling showed IS the
+// big-battle pathfinding stutter (docs/pathfinding-fast-identical-plan.md). List order stays
+// bit-identical. Flip to 0 to fall back to the untouched legacy sorts for A/B comparison.
+#define GVR_FAST_OPENLIST 1
+#if GVR_FAST_OPENLIST
+class PathfindCellInfo;
+typedef std::multimap<UnsignedShort, PathfindCellInfo*> GvrOpenCellIndex;
+#endif
+
 class Bridge;
 class Object;
 class Weapon;
@@ -246,6 +258,11 @@ protected:
 	/// @todo Do we need both mark values in this cell?  Can't store a single value and compare it?
 	UnsignedInt m_open:1;													///< place for marking this cell as on the open list
 	UnsignedInt m_closed:1;												///< place for marking this cell as on the closed list
+
+#if GVR_FAST_OPENLIST
+	GvrOpenCellIndex::iterator m_openIndexIt;	///< where this info sits in its list's open index
+	UnsignedInt m_openIndexGen;					///< index generation the iterator belongs to (0 = none)
+#endif
 };
 
 // TheSuperHackers @info The PathfindCellList class acts as a new management class for the pathfindcell open and closed lists
@@ -254,12 +271,35 @@ class PathfindCellList
 	friend class PathfindCell;
 
 public:
+#if GVR_FAST_OPENLIST
+	PathfindCellList() : m_head(nullptr), m_tail(nullptr), m_indexGen(1) {}
+#else
 	PathfindCellList() : m_head(nullptr), m_tail(nullptr) {}
+#endif
 
 #if RETAIL_COMPATIBLE_PATHFINDING
-	void reset(PathfindCell* newHead = nullptr) { m_head = newHead; m_tail = nullptr; }
+	void reset(PathfindCell* newHead = nullptr)
+	{
+		m_head = newHead;
+		m_tail = nullptr;
+#if GVR_FAST_OPENLIST
+		// A reset that keeps list nodes (crash recovery) leaves the index unable to vouch for
+		// the list: clear it and bump the generation so stale iterators can never be erased.
+		// Inserts self-heal by walking the legacy way until the list drains.
+		m_index.clear();
+		++m_indexGen;
+#endif
+	}
 #else
-	void reset() { m_head = nullptr; m_tail = nullptr; }
+	void reset()
+	{
+		m_head = nullptr;
+		m_tail = nullptr;
+#if GVR_FAST_OPENLIST
+		m_index.clear();
+		++m_indexGen;
+#endif
+	}
 #endif
 
 	PathfindCell* getHead() const { return m_head; }
@@ -271,6 +311,10 @@ public:
 private:
 	PathfindCell* m_head;
 	PathfindCell* m_tail;
+#if GVR_FAST_OPENLIST
+	GvrOpenCellIndex m_index;	///< mirrors the sorted list: totalCost -> info, FIFO among equal costs
+	UnsignedInt m_indexGen;		///< bumped on every bulk clear; per-info iterators are only trusted when generations match
+#endif
 };
 
 /**
