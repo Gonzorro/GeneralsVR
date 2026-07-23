@@ -288,6 +288,8 @@ private:
 	XrSystemId m_systemId;
 	XrSession m_session;
 	XrSpace m_appSpace;
+	UnsignedInt m_runtimeMajor, m_runtimeMinor, m_runtimePatch;	///< runtime version from xrGetInstanceProperties
+	Bool m_runtimeSessionCrashRisk;	///< Meta v205+ crashes creating 32-bit Vulkan sessions (issue #2)
 	XrSessionState m_sessionState;
 	XrEnvironmentBlendMode m_blendMode;
 	Bool m_sessionRunning;

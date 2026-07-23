@@ -84,6 +84,10 @@ OpenXRManager::OpenXRManager()
 	, m_systemId(XR_NULL_SYSTEM_ID)
 	, m_session(XR_NULL_HANDLE)
 	, m_appSpace(XR_NULL_HANDLE)
+	, m_runtimeMajor(0)
+	, m_runtimeMinor(0)
+	, m_runtimePatch(0)
+	, m_runtimeSessionCrashRisk(FALSE)
 	, m_sessionState(XR_SESSION_STATE_UNKNOWN)
 	, m_blendMode(XR_ENVIRONMENT_BLEND_MODE_OPAQUE)
 	, m_sessionRunning(FALSE)
@@ -238,9 +242,23 @@ Bool OpenXRManager::init()
 	XrInstanceProperties ip = {XR_TYPE_INSTANCE_PROPERTIES};
 	if (XR_SUCCEEDED(xrGetInstanceProperties(m_instance, &ip)))
 	{
+		m_runtimeMajor = XR_VERSION_MAJOR(ip.runtimeVersion);
+		m_runtimeMinor = XR_VERSION_MINOR(ip.runtimeVersion);
+		m_runtimePatch = XR_VERSION_PATCH(ip.runtimeVersion);
 		DEBUG_LOG(("OpenXR: runtime '%s' version %u.%u.%u", ip.runtimeName,
-			XR_VERSION_MAJOR(ip.runtimeVersion), XR_VERSION_MINOR(ip.runtimeVersion),
-			XR_VERSION_PATCH(ip.runtimeVersion)));
+			m_runtimeMajor, m_runtimeMinor, m_runtimePatch));
+
+		// GeneralsVR @bugfix Meta runtime v205 (reported as 1.205.x) crashes on its OWN worker
+		// thread inside xrCreateSession with a Vulkan binding - GitHub issue #2, reproduced
+		// locally the day the update reached this machine. A foreign thread's crash cannot be
+		// caught, so the only safe move is to never make the call on the known-broken
+		// generation. Gated >= 205 until Meta fixes it or our D3D11 backend lands.
+		if (strstr(ip.runtimeName, "Oculus") != nullptr
+			&& m_runtimeMajor == 1 && m_runtimeMinor >= 205)
+		{
+			m_runtimeSessionCrashRisk = TRUE;
+			DEBUG_LOG(("OpenXR: runtime generation v%u has a known session-create crash - VR will be skipped (-xrforce to attempt anyway)", m_runtimeMinor));
+		}
 	}
 
 	XrSystemGetInfo sgi = {XR_TYPE_SYSTEM_GET_INFO};
@@ -554,6 +572,18 @@ static XrResult xrCreateSessionGuarded(XrInstance instance, const XrSessionCreat
 //-------------------------------------------------------------------------------------------------
 Bool OpenXRManager::createSession()
 {
+	// GeneralsVR @bugfix Do not even attempt the session on the known-crashing Meta runtime
+	// generation (see the version check at bootstrap): the crash happens on Meta's own worker
+	// thread, which no guard on our side can catch. Flat mode is the only safe outcome.
+	if (m_runtimeSessionCrashRisk && (TheGlobalData == nullptr || !TheGlobalData->m_gvrXrForce))
+	{
+		DEBUG_LOG(("OpenXR: session: SKIPPED - Meta runtime %u.%u.%u has a known crash creating"
+			" 32-bit Vulkan sessions (GitHub issue #2). The game continues flat."
+			" Launch with -xrforce to attempt anyway.",
+			m_runtimeMajor, m_runtimeMinor, m_runtimePatch));
+		return FALSE;
+	}
+
 	PFN_xrGetVulkanGraphicsDeviceKHR pGetGraphicsDevice = nullptr;
 	xrGetInstanceProcAddr(m_instance, "xrGetVulkanGraphicsDeviceKHR", (PFN_xrVoidFunction*)&pGetGraphicsDevice);
 	if (pGetGraphicsDevice == nullptr)
