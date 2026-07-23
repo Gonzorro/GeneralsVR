@@ -463,6 +463,25 @@ Int parseVRRes(char *args[], int num)
 	return 2;
 }
 
+// GeneralsVR @testonly -xrforce: attempt VR even on a Meta runtime with a known session crash.
+Int parseXrForce(char *args[], int num)
+{
+	TheWritableGlobalData->m_gvrXrForce = TRUE;
+	return 1;
+}
+
+// GeneralsVR @testonly Dev pacing override: -gamespeed 90 runs solo games at 3x wall-clock speed.
+Int parseGameSpeed(char *args[], int num)
+{
+	if (num > 1)
+	{
+		const Int fps = atoi(args[1]);
+		if (fps >= 30 && fps <= 300)  // 30 = the stock logic rate; below that is a slowdown, not a speedup
+			TheWritableGlobalData->m_gvrGameSpeedOverride = fps;
+	}
+	return 2;
+}
+
 Int parseHeadless(char *args[], int num)
 {
 	TheWritableGlobalData->m_headless = TRUE;
@@ -1199,6 +1218,12 @@ static CommandLineParam paramsForStartup[] =
 
 	// GeneralsVR @feature Per-eye render resolution scale (default 1.0).
 	{ "-vrres", parseVRRes },
+
+	// GeneralsVR @testonly Dev pacing override for faster test sessions (solo only).
+	{ "-gamespeed", parseGameSpeed },
+
+	// GeneralsVR @testonly Attempt VR despite a known-crashing Meta runtime (experiments only).
+	{ "-xrforce", parseXrForce },
 
 	// TheSuperHackers @feature helmutbuhler 13/04/2025
 	// Play back a replay. Pass the filename including .rep afterwards.

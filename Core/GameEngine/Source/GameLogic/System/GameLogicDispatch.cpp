@@ -913,6 +913,16 @@ bool GameLogic::onNewGame(MAYBE_UNUSED GameMessage *msg)
 		}
 	}
 
+	// GeneralsVR @testonly -gamespeed N pins the solo logic rate to N fps so dev test sessions run
+	// faster in wall-clock time. Pacing only: what each sim frame computes is untouched, so the
+	// session's replay remains a valid bit-identity verification recording. Never in network games.
+	if (TheGlobalData->m_gvrGameSpeedOverride > 0 && TheNetwork == nullptr)
+	{
+		DEBUG_LOG(("TEST -gamespeed override: logic pinned to %d FPS", TheGlobalData->m_gvrGameSpeedOverride));
+		TheFramePacer->setLogicTimeScaleFps(TheGlobalData->m_gvrGameSpeedOverride);
+		TheFramePacer->enableLogicTimeScale(TRUE);
+	}
+
 	// prepare for new game
 	prepareNewGame( gameMode, diff, rankPoints );
 

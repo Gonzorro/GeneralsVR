@@ -153,6 +153,16 @@ public:
 	// engine is CPU-heavy per draw call.
 	Real m_vrResolutionScale;
 
+	// GeneralsVR @testonly Dev pacing override (-gamespeed N): pin the solo logic rate to N
+	// frames per second so test sessions run faster in wall-clock time. Pacing only - the
+	// content of every sim frame is untouched, so recordings stay valid verification replays.
+	// Dormant unless the flag is passed; only dev staging scripts pass it, never the launcher.
+	Int m_gvrGameSpeedOverride;
+
+	// GeneralsVR @testonly -xrforce: attempt VR session creation even on a Meta runtime
+	// generation with a known session-create crash (GitHub issue #2). Experiments only.
+	Bool m_gvrXrForce;
+
 	Bool m_windowed;
 	Int m_xResolution;
 	Int m_yResolution;

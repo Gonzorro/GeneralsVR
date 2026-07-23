@@ -645,6 +645,8 @@ GlobalData::GlobalData()
 	m_vrUiCropTop = 0.66f;
 	m_vrWorldUnitsPerMeter = 500.0f;
 	m_vrResolutionScale = 1.0f;
+	m_gvrGameSpeedOverride = 0;
+	m_gvrXrForce = FALSE;
 	m_windowed = 0;
 	m_xResolution = DEFAULT_DISPLAY_WIDTH;
 	m_yResolution = DEFAULT_DISPLAY_HEIGHT;
