@@ -1359,10 +1359,16 @@ void MilesAudioManager::openDevice()
 	const AudioSettings *audioSettings = getAudioSettings();
 	m_selectedSpeakerType = TheAudio->translateSpeakerTypeToUnsignedInt(m_prefSpeaker);
 
-	retval = AIL_quick_startup(audioSettings->m_useDigital, audioSettings->m_useMidi, audioSettings->m_outputRate, audioSettings->m_outputBits, audioSettings->m_outputChannels);
+	// GeneralsVR @bugfix Headless runs (replay simulation) have no app window, and in a windowless or
+	// service session Miles' quick-startup crashes inside the digital-device open instead of failing.
+	// Skip the call there and fall through to the engine's designed "no sound hardware" path below
+	// (audio off, no providers) - the same state the retail game reaches on a machine without audio.
+	if (!TheGlobalData->m_headless) {
+		retval = AIL_quick_startup(audioSettings->m_useDigital, audioSettings->m_useMidi, audioSettings->m_outputRate, audioSettings->m_outputBits, audioSettings->m_outputChannels);
 
-	// Quick handles tells us where to store the various devices. For now, we're only interested in the digital handle.
-	AIL_quick_handles(&m_digitalHandle, nullptr, nullptr);
+		// Quick handles tells us where to store the various devices. For now, we're only interested in the digital handle.
+		AIL_quick_handles(&m_digitalHandle, nullptr, nullptr);
+	}
 
 	if (retval) {
 		buildProviderList();
