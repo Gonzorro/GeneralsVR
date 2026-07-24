@@ -2,7 +2,7 @@
 
 I'm turning **Command & Conquer: Generals — Zero Hour** into a VR game.
 
-Not a remake, not a port to another engine — the **original game**, running natively in a VR
+Not a remake, not a port to another engine, the **original game**, running natively in a VR
 headset. You stand over the battlefield like a general at a war table: look around the map,
 point a laser to select your units, give orders with the motion controllers, build your base,
 and resize yourself from "the whole war on a table" down to "standing among the tanks".
@@ -44,7 +44,7 @@ From then on just use the **GeneralsVR** desktop shortcut.
 > anything until you're actually in a skirmish.
 
 **Your Zero Hour install is never touched.** Everything lives in its own folder
-(`%LOCALAPPDATA%\GeneralsVR`) — no game files are copied or changed. To uninstall, delete that
+(`%LOCALAPPDATA%\GeneralsVR`) no game files are copied or changed. To uninstall, delete that
 folder and the desktop shortcut (or run `GeneralsVR.ps1 -Uninstall`).
 
 The launcher auto-updates to my newest build every time you play. If an update ever breaks
@@ -85,7 +85,7 @@ enjoying GeneralsVR and you're able to, [**sponsoring me**](https://github.com/s
 makes a real difference: the more support this gets, the more freelance work I can turn down and
 the more time goes straight into VR.
 
-And the bigger plan — once Zero Hour is solid, I want to bring the **other Command & Conquer
+And the bigger plan. Once Zero Hour is solid, I want to bring the **other Command & Conquer
 games into VR** too. Every sponsor gets me closer to making that the main thing I do. No pressure
 at all if you can't; starring the repo and sending bug reports helps just as much. 🫡
 
