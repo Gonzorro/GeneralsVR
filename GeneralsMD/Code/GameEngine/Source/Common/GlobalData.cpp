@@ -643,6 +643,8 @@ GlobalData::GlobalData()
 	m_vrPlaceAngleValid = FALSE;
 	m_vrPlaceAngle = 0.0f;
 	m_vrUiCropTop = 0.66f;
+	m_vrUiCapture = FALSE;
+	m_vrHideHudReadouts = TRUE;
 	m_vrWorldUnitsPerMeter = 500.0f;
 	m_vrResolutionScale = 1.0f;
 	m_gvrGameSpeedOverride = 0;

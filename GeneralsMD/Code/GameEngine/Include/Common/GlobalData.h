@@ -140,6 +140,16 @@ public:
 	// player is shown half a menu.
 	Real m_vrUiCropTop;    ///< 0..1 down the screen
 
+	// GeneralsVR @feature TRUE only while the game's 2D interface is being repainted into the VR
+	// panel texture (a second, VR-only UI pass). The HUD's floating readouts (FPS, clocks) check
+	// this and sit the pass out: inside the headset they are clutter stamped over the panels,
+	// while the monitor's own pass keeps them. Nothing else may key off this.
+	Bool m_vrUiCapture;
+
+	// GeneralsVR @feature Hide those readouts (FPS, system time, game time) on the VR panels.
+	// Defaults on; the in-VR settings menu will carry the toggle so a player can bring them back.
+	Bool m_vrHideHudReadouts;
+
 	// GeneralsVR @feature Interpolate drawable motion between 30Hz sim ticks (-smoothmotion).
 	// Implied by -vr, where 30Hz stepping is nauseating. Render-only; the sim is untouched.
 	Bool m_smoothMotion;

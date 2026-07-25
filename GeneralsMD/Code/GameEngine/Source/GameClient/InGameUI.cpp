@@ -3795,22 +3795,29 @@ void InGameUI::postWindowDraw()
 	Int hudOffsetX = 0;
 	Int hudOffsetY = 0;
 
+	// GeneralsVR These floating readouts stay off the VR panels: in the headset they sat stamped
+	// across the top of the HUD and every menu (the panel shows the whole frame). The monitor's
+	// own pass keeps them; only the VR capture pass is marked. m_vrHideHudReadouts is the player
+	// toggle (the in-VR settings menu will carry it).
+	const Bool vrPanelPass = (TheGlobalData != nullptr && TheGlobalData->m_vrUiCapture
+		&& TheGlobalData->m_vrHideHudReadouts);
+
 	if (m_networkLatencyPointSize > 0 && TheGameLogic->isInMultiplayerGame())
 	{
 		drawNetworkLatency(hudOffsetX, hudOffsetY);
 	}
 
-	if (m_renderFpsPointSize > 0)
+	if (m_renderFpsPointSize > 0 && !vrPanelPass)
 	{
 		drawRenderFps(hudOffsetX, hudOffsetY);
 	}
 
-	if (m_systemTimePointSize > 0)
+	if (m_systemTimePointSize > 0 && !vrPanelPass)
 	{
 		drawSystemTime(hudOffsetX, hudOffsetY);
 	}
 
-	if ( (m_gameTimePointSize > 0) && !TheGameLogic->isInShellGame() && TheGameLogic->isInGame() )
+	if ( (m_gameTimePointSize > 0) && !TheGameLogic->isInShellGame() && TheGameLogic->isInGame() && !vrPanelPass )
 	{
 		drawGameTime();
 	}

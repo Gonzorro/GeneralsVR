@@ -2274,7 +2274,16 @@ void W3DDisplay::drawVRScene( W3DView *view )
 				DX8Wrapper::Clear(true, false, Vector3(0.0f, 0.0f, 0.0f), 0.0f);
 			}
 
+			// The HUD readouts (FPS, clocks) read this and skip themselves: in the headset they
+			// are stamped over the panel, top of every menu, and mean nothing there. The
+			// monitor's own pass is not marked, so it keeps them.
+			if (TheWritableGlobalData != nullptr)
+				TheWritableGlobalData->m_vrUiCapture = TRUE;
+
 			TheInGameUI->DRAW();	// this repaints the whole window system, menus included
+
+			if (TheWritableGlobalData != nullptr)
+				TheWritableGlobalData->m_vrUiCapture = FALSE;
 			// GeneralsVR The game cursor is a DX8 HARDWARE cursor: the GPU composites it onto the
 			// monitor, so it never lands in this off-screen panel surface - the headset would show
 			// no pointer. So draw our own: a small outlined crosshair at the mouse pixel, straight
