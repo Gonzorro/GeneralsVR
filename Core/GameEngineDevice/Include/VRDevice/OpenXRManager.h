@@ -163,9 +163,12 @@ public:
 	/// does not cover the battlefield while you play. Set each frame by VRControls.
 	void setFixedHudAlpha(Real a) { m_fixedHudAlpha = a; }
 
-	/// When a full-screen menu (options, generals promotion) is open, stand the HUD upright as a
-	/// readable screen rather than the flat control-bar strip, which cannot show it.
-	void setFixedHudFullScreen(Bool full) { m_fixedHudFullScreen = full; }
+	/// An in-game menu or dialog is open (the Escape menu, options, a quit-confirm box, the
+	/// generals promotion screen). Measured each frame by VRControls from the window system.
+	/// Mouse+keyboard mode stands the HUD upright to show it; rays mode summons the left wrist
+	/// panel so the menu lands on the hand - without this the menu opened INVISIBLY in rays
+	/// mode, pausing the game with nothing to click.
+	void setUiMenuOpen(Bool open) { m_uiMenuOpen = open; }
 
 	/// In a battle each hand's panel is hidden until the player summons it with that hand's
 	/// secondary button, so it never floats in the way while they are moving units.
@@ -396,7 +399,7 @@ private:
 	Real m_fixedHudWidth;   ///< metres wide the monitor frame's near edge is, so the HUD matches it
 	Real m_fixedHudForward; ///< metres in front the frame's near edge sits
 	Real m_fixedHudAlpha;   ///< HUD opacity 0..1 (faded when the mouse is not over it)
-	Bool m_fixedHudFullScreen; ///< a full-screen menu is up: show the HUD upright, not flat
+	Bool m_uiMenuOpen;      ///< an in-game menu/dialog is up: give it a panel the ray can reach
 	Bool m_uiReady;
 	Bool m_showFlatFrame;   ///< capture the backbuffer, not the UI layer (movies)
 	UiPanel m_uiPanels[UI_PANEL_COUNT];

@@ -220,6 +220,8 @@ VRControls::VRControls()
 	m_cursorActive = FALSE;
 	m_mouseActive = FALSE;
 	m_mouseSeeded = FALSE;
+	m_prevInGame = FALSE;
+	m_modeGraceUntil = 0;
 	m_mousePrevX = m_mousePrevY = 0;
 	m_cursorLastMoveTime = 0;
 	m_mouseLastMoveTime = 0;
@@ -241,7 +243,7 @@ VRControls::VRControls()
 	m_ctrlSpaceWasDown = FALSE;
 	m_fixedHudAlpha = 1.0f;
 	m_mouseOverHud = FALSE;
-	m_bigMenuOpen = FALSE;
+	m_menuOpen = FALSE;
 }
 
 VRControls::~VRControls()
@@ -847,7 +849,7 @@ void VRControls::updateInputMode()
 	// Moving the mouse takes over immediately. Otherwise, once the mouse has been idle for 3s and a
 	// controller is currently in use, hand it back to the rays.
 	const Bool mouseJustMoved = (m_mouseLastMoveTime != 0) && ((now - m_mouseLastMoveTime) < 250);
-	if (mouseJustMoved)
+	if (mouseJustMoved && now >= m_modeGraceUntil)
 		m_mouseKbMode = TRUE;
 	else if (m_mouseKbMode
 		&& (now - m_mouseLastMoveTime) >= 3000
@@ -1167,9 +1169,8 @@ void VRControls::updateFixedHud(W3DView *view, Bool inGame)
 
 	const Bool show = m_mouseKbMode && inGame && view != nullptr && TheTacticalView != nullptr;
 	TheOpenXR->setShowFixedHud(show);
-	// When a full-screen menu is up, the HUD stands upright as a readable screen instead of the flat
-	// control-bar strip (measured by updateUiCrop last frame).
-	TheOpenXR->setFixedHudFullScreen(m_bigMenuOpen);
+	// (Whether a menu is up - which stands the HUD upright - is measured by updateUiCrop, which
+	// pushes it to OpenXR itself; both input modes need it, not just this one.)
 	if (!show)
 		return;
 
@@ -1220,7 +1221,7 @@ void VRControls::updateFixedHud(W3DView *view, Bool inGame)
 	Bool overStrip = FALSE;
 	if (TheMouse != nullptr && TheDisplay != nullptr)
 		overStrip = ((Real)TheMouse->getMouseStatus()->pos.y >= CONTROL_BAR_TOP * (Real)TheDisplay->getHeight());
-	m_mouseOverHud = overStrip || m_bigMenuOpen;
+	m_mouseOverHud = overStrip || m_menuOpen;
 	const Real targetAlpha = m_mouseOverHud ? 1.0f : 0.5f;
 	m_fixedHudAlpha += (targetAlpha - m_fixedHudAlpha) * 0.2f;
 	TheOpenXR->setFixedHudAlpha(m_fixedHudAlpha);
@@ -1861,7 +1862,7 @@ void VRControls::updatePointer(W3DView *view)
 		screen.y = panelY;
 		haveTarget = TRUE;
 	}
-	else if (view != nullptr && TheGameLogic != nullptr && TheGameLogic->isInGame())
+	else if (!m_menuOpen && view != nullptr && TheGameLogic != nullptr && TheGameLogic->isInGame())
 	{
 		// Otherwise point at the battlefield. Crucially this hits UNITS AND BUILDINGS, not just
 		// the ground: the cursor is placed on the point where the laser actually strikes the
@@ -1913,7 +1914,10 @@ void VRControls::updatePointer(W3DView *view)
 	// exactly the one where the cursor cannot be placed at all. The cursor still follows along
 	// when it can (it drives the GUI, the hover highlight and building placement), but a click
 	// no longer depends on it.
-	if (pick == OpenXRManager::VR_PICK_NONE && view != nullptr
+	// With a menu up, a ray that happens to miss the menu screen must NOT reach the battlefield:
+	// selection is client-side and works even while the game sits paused, so a stray trigger
+	// pull would silently rewrite the player's selection behind the Escape menu.
+	if (pick == OpenXRManager::VR_PICK_NONE && !m_menuOpen && view != nullptr
 		&& TheGameLogic != nullptr && TheGameLogic->isInGame()
 		&& (TheInGameUI == nullptr || TheInGameUI->getPendingPlaceType() == nullptr))
 	{
@@ -2173,6 +2177,7 @@ void VRControls::updateRays(W3DView *view)
 		// Stop the beam where it actually lands: on a panel if one is in the way, otherwise on
 		// the ground, otherwise just fade out at arm's reach.
 		Real length = RAY_MAX_METERS * scale;
+		Bool onPanel = FALSE;
 
 		Int px = 0, py = 0;
 		Real panelDistance = 0.0f;
@@ -2182,6 +2187,7 @@ void VRControls::updateRays(W3DView *view)
 			// coplanar, and the depth test throws the beam away - which reads as a laser that
 			// cannot touch the menu at all.
 			length = panelDistance * scale * 0.97f;
+			onPanel = TRUE;
 		}
 		else if (inGame)
 		{
@@ -2200,11 +2206,20 @@ void VRControls::updateRays(W3DView *view)
 
 		// The beam IS the reticle: it takes the colour of whatever the game would do if the
 		// player pressed the button now. Only the pointing hand - the other stays its own colour.
+		// Not while it rests on a panel, though: there the click is a menu click, and a beam
+		// glowing attack-red because an enemy happens to stand BEHIND the options screen is a lie.
 		if (inGame && hand == VR_HAND_RIGHT)
 		{
-			Real r, g, b;
-			getReticleColor(origin, dir, r, g, b);
-			line->Re_Color(r, g, b);
+			if (onPanel)
+			{
+				line->Re_Color(0.35f, 0.85f, 1.00f);	// the pointer's own cyan, as in the menus
+			}
+			else
+			{
+				Real r, g, b;
+				getReticleColor(origin, dir, r, g, b);
+				line->Re_Color(r, g, b);
+			}
 		}
 
 		line->Set_Hidden(false);
@@ -2302,6 +2317,20 @@ void VRControls::update()
 	W3DView *view = (W3DView *)TheTacticalView;
 	const Bool inGame = (TheGameLogic != nullptr && TheGameLogic->isInGame());
 
+	// Entering or leaving a match warps and re-captures the cursor, sometimes over several
+	// frames of loading. None of that is the player: whoever was genuinely driving on the
+	// previous screen keeps control, and for a grace window the mouse cannot steal it.
+	if (inGame != m_prevInGame)
+	{
+		m_prevInGame = inGame;
+		const UnsignedInt now = GetTickCount();
+		const Bool mouseWasDriving = (m_mouseLastMoveTime != 0) && ((now - m_mouseLastMoveTime) < 2000);
+		m_mouseKbMode = mouseWasDriving;
+		m_mouseSeeded = FALSE;
+		m_mouseLastMoveTime = 0;
+		m_modeGraceUntil = now + 1500;
+	}
+
 	// Watch the mouse first, so both the menu cursor and the in-game frame have a fresh answer.
 	updateMouseActivity();
 	// Then decide which input is driving - rays or mouse+keyboard - and switch softly between them.
@@ -2389,8 +2418,10 @@ void VRControls::update()
 	updatePanelToggles();
 
 	// Locomotion only means something when there is a battlefield to move over. In the menus the
-	// controllers must not fling the tactical camera around behind the player's back.
-	if (inGame && view != nullptr)
+	// controllers must not fling the tactical camera around behind the player's back - and that
+	// includes the IN-GAME menus: with the Escape menu up, the sticks and grips belong to the
+	// menu screen, not to the paused world behind it.
+	if (inGame && view != nullptr && !m_menuOpen)
 		updateLocomotion(view);
 
 	// Pointing works everywhere: at the menu screen floating in front of the player, at the
@@ -2448,7 +2479,7 @@ void VRControls::updateUiCrop()
 
 	const Real BOTTOM_STRIP = 0.66f;	// where the control bar begins
 	Real top = BOTTOM_STRIP;
-	Bool bigMenu = FALSE;
+	Bool menuOpen = FALSE;
 
 	if (TheWindowManager != nullptr)
 	{
@@ -2463,6 +2494,17 @@ void VRControls::updateUiCrop()
 
 			Int x = 0, y = 0;
 			win->winGetPosition(&x, &y);
+
+			Int ww = 0, wh = 0;
+			win->winGetSize(&ww, &wh);
+
+			// A "visible" window parked outside the screen is the window system's way of putting
+			// it away; counting one would raise the menu screen during ordinary play, forever.
+			if (x + ww <= 0 || y + wh <= 0
+				|| (screenW > 0.0f && (Real)x >= screenW)
+				|| (screenH > 0.0f && (Real)y >= screenH))
+				continue;
+
 			if (y < 0)
 				y = 0;
 
@@ -2470,13 +2512,15 @@ void VRControls::updateUiCrop()
 			if (winTop < top)
 				top = winTop;
 
-			// A window that covers a big slab of the screen is a full menu (options, generals
-			// promotion), not the control bar - the flat strip cannot show it, so flag it.
-			Int ww = 0, wh = 0;
-			win->winGetSize(&ww, &wh);
+			// A window reaching into the upper half of the screen is a menu or a dialog - the
+			// Escape menu, options, a quit-confirm box, the promotion screen. The control bar and
+			// its pieces all live on the bottom strip and never come up here. (The old test asked
+			// for a near-full-screen window, which missed every small dialog: a quit-confirm box
+			// opened invisibly, pausing the game behind nothing.)
 			if (screenW > 0.0f && screenH > 0.0f
-				&& (Real)wh / screenH > 0.45f && (Real)ww / screenW > 0.4f)
-				bigMenu = TRUE;
+				&& winTop < 0.5f
+				&& (Real)wh / screenH > 0.10f && (Real)ww / screenW > 0.15f)
+				menuOpen = TRUE;
 		}
 	}
 
@@ -2484,5 +2528,12 @@ void VRControls::updateUiCrop()
 	if (top > BOTTOM_STRIP) top = BOTTOM_STRIP;
 
 	TheWritableGlobalData->m_vrUiCropTop = top;
-	m_bigMenuOpen = bigMenu;
+
+	if (menuOpen != m_menuOpen)
+		DEBUG_LOG(("OpenXR: ui: in-game menu %s", menuOpen ? "opened" : "closed"));
+	m_menuOpen = menuOpen;
+	// Both modes read this when laying out the panels: mouse+keyboard stands the HUD upright,
+	// rays raises the big menu screen.
+	if (TheOpenXR != nullptr)
+		TheOpenXR->setUiMenuOpen(menuOpen);
 }

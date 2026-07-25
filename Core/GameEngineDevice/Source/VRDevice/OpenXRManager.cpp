@@ -155,7 +155,7 @@ OpenXRManager::OpenXRManager()
 	, m_fixedHudWidth(2.4f)
 	, m_fixedHudForward(1.2f)
 	, m_fixedHudAlpha(1.0f)
-	, m_fixedHudFullScreen(FALSE)
+	, m_uiMenuOpen(FALSE)
 	, m_uiReady(FALSE)
 	, m_showFlatFrame(FALSE)
 	, m_groupBarTexture(nullptr)
@@ -1599,10 +1599,11 @@ void OpenXRManager::layoutUiPanels()
 			p.pose.position.z = -(fwd - 0.5f * p.heightMeters);	// top of the bar at the near edge
 		}
 
-		// (2) A full-screen menu (options, generals promotion) - on its OWN upright screen over the
-		// play scene, cropped to the area ABOVE the control bar so it shows fully without touching or
-		// duplicating the bar. (Reuses an unused panel slot; the wrist panels are idle in this mode.)
-		if (m_fixedHudFullScreen)
+		// (2) A menu or dialog (options, a quit-confirm box, generals promotion) - on its OWN upright
+		// screen over the play scene, cropped to the area ABOVE the control bar so it shows fully
+		// without touching or duplicating the bar. (Reuses an unused panel slot; the wrist panels are
+		// idle in this mode.)
+		if (m_uiMenuOpen)
 		{
 			UiPanel& m = m_uiPanels[UI_PANEL_LEFT_WRIST];
 			m.active = TRUE;
@@ -1637,7 +1638,15 @@ void OpenXRManager::layoutUiPanels()
 
 	for (Int hand = 0; hand < VR_HAND_COUNT; ++hand)
 	{
-		if (!m_wristPanelOpen[hand])
+		// A menu or dialog opening over the battle (the Escape menu, options, a quit-confirm
+		// box, the promotion screen) summons the LEFT panel by itself: the menu lives on the
+		// hand, by design - no screen floats up in front of the player. Without this the game
+		// paused behind an INVISIBLE menu unless the panel happened to be up already. The
+		// summon is an overlay, not a toggle: when the menu closes, the panel goes back to
+		// whatever the player had chosen.
+		const Bool summoned = m_wristPanelOpen[hand]
+			|| (hand == VR_HAND_LEFT && m_uiMenuOpen);
+		if (!summoned)
 			continue;
 
 		const VRControllerState& c = m_controllers[hand];

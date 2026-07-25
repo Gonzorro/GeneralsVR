@@ -215,6 +215,8 @@ private:
 	Bool m_mouseKbMode;               ///< current mode: TRUE = mouse+keyboard, FALSE = rays (auto-switched)
 	Vector3 m_prevCtrlPos[2];         ///< last controller positions, to detect controller movement
 	Real m_prevCtrlQuat[2][4];        ///< last controller orientations
+	Bool m_prevInGame;                ///< menu/battle transition detector (cursor warps there must not flip modes)
+	UnsignedInt m_modeGraceUntil;     ///< until this tick, mouse movement cannot steal control (loading warps)
 	UnsignedInt m_ctrlLastMoveTime;   ///< GetTickCount() of the last real controller movement
 	UnsignedInt m_rayPressFirstTime;  ///< start of the current trigger-mash burst (mouse mode only)
 	Int m_rayPressCount;              ///< trigger presses inside the burst window; 3 = "give me the rays"
@@ -222,7 +224,7 @@ private:
 	Bool m_ctrlSpaceWasDown;          ///< edge-detect Ctrl+Space (recenter)
 	Real m_fixedHudAlpha;             ///< eased HUD opacity, full over the HUD and faded off it
 	Bool m_mouseOverHud;              ///< the cursor is on the control-bar strip (hide the world marker there)
-	Bool m_bigMenuOpen;              ///< a full-screen menu (options, generals promotion) is up: show the HUD upright
+	Bool m_menuOpen;                 ///< an in-game menu/dialog is up (Escape menu, options, quit-confirm, promotion)
 	Line3DClass *m_groupDigit[MAX_SELECTION_MARKERS][7]; ///< seven-segment control-group numeral per unit
 };
 
