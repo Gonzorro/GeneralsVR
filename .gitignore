@@ -67,3 +67,5 @@ build.ninja
 ## Python
 __pycache__/
 *.pyc
+## xrhost build leftovers
+Core/Tools/xrhost/*.obj

@@ -33,6 +33,12 @@
 #include "Lib/BaseType.h"
 
 #define XR_USE_GRAPHICS_API_VULKAN
+// GeneralsVR hosted mode needs the Win32 external-memory/semaphore declarations (exporting eye
+// images and the frame timeline to the 64-bit host process). windows.h is already in scope here
+// via the D3D8 headers, which is what vulkan_win32.h requires.
+#ifndef VK_USE_PLATFORM_WIN32_KHR
+#define VK_USE_PLATFORM_WIN32_KHR
+#endif
 #include <vulkan/vulkan.h>
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
@@ -91,7 +97,7 @@ public:
 	void shutdown();
 
 	Bool isAvailable() const { return m_systemId != XR_NULL_SYSTEM_ID; }
-	Bool hasSession() const { return m_session != XR_NULL_HANDLE; }
+	Bool hasSession() const { return m_session != XR_NULL_HANDLE || m_hostedMode; }
 
 	/// True only when every VR resource exists (session, swapchains, eye targets with their
 	/// Vulkan images, depth). If any part of the graphics setup failed, this stays false and
@@ -340,6 +346,33 @@ private:
 	VkCommandBuffer m_vkCommandBuffer;
 	VkFence m_vkFence;
 	Bool m_copyInFlight; ///< our copy command buffer is still executing; must not be re-recorded
+
+	// GeneralsVR hosted mode: Meta v205+ crashes 32-bit sessions, so a 64-bit host process
+	// (GeneralsVR-xrhost.exe) owns OpenXR and this manager feeds it. Contract: VRHostProtocol.h.
+	// When m_hostedMode is true there is no local XrSession; poses and controller state arrive
+	// through shared memory and finished eye images leave through exported Vulkan images.
+	Bool m_hostedMode;
+	struct VRHostSharedBlock* m_hostShm;
+	void* m_hostMapping;                 ///< HANDLE of the shared-memory mapping
+	void* m_hostProcess;                 ///< HANDLE of the spawned host process
+	VkImage m_exportImages[MAX_EYES];    ///< the host imports these as D3D11 textures
+	VkDeviceMemory m_exportMemory[MAX_EYES];
+	VkSemaphore m_exportTimeline;        ///< timeline; host opens the same object as a D3D11 fence
+	UnsignedInt m_prevHostButtons[VR_HAND_COUNT];
+	Bool m_exportImageInitialized[MAX_EYES]; ///< first copy must transition from UNDEFINED
+	unsigned __int64 m_hostSubmitCounter;
+	unsigned __int64 m_hostLastFrameIndex;   ///< pacing: wait for the host's next frame tick
+
+	VkImage m_hostUiImage;               ///< host's shared UI texture, imported (panels' pixel source)
+	VkDeviceMemory m_hostUiMemory;
+	Bool m_hostUiInitialized;            ///< first copy transitions from UNDEFINED
+
+	Bool hostedStart();                  ///< create shm, spawn the host, wait for bring-up
+	Bool hostedCreateExports();          ///< import the host's shared eye textures + fence
+	Bool hostedSetupUi();                ///< request + import the host's shared UI texture
+	void hostedBeginFrame();             ///< poses/controllers/timing from shared memory
+	void hostedSubmitFrame(Bool worldRendered); ///< copy eyes to exports, signal the timeline
+	void hostedShutdown();
 
 	// Eye render targets (D3D8 side) and their Vulkan images
 	IDirect3DDevice8* m_d3d8Device;   ///< borrowed; used to fetch the backbuffer each frame

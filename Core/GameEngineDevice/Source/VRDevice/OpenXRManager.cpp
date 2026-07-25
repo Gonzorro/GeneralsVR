@@ -25,6 +25,7 @@
 
 #include "Common/Debug.h"
 #include "Common/GlobalData.h"
+#include "VRDevice/VRHostProtocol.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -60,6 +61,22 @@ namespace
 		PFN_vkWaitForFences waitForFences;
 		PFN_vkResetFences resetFences;
 		PFN_vkDeviceWaitIdle deviceWaitIdle;
+
+		// GeneralsVR hosted mode (Meta v205 workaround): exportable images + timeline semaphore
+		// so the 64-bit host can import our eye renders. Soft-loaded: absent on an exotic driver
+		// just means hosted VR is unavailable and the game stays flat.
+		PFN_vkCreateImage createImage;
+		PFN_vkDestroyImage destroyImage;
+		PFN_vkGetImageMemoryRequirements getImageMemoryRequirements;
+		PFN_vkAllocateMemory allocateMemory;
+		PFN_vkFreeMemory freeMemory;
+		PFN_vkBindImageMemory bindImageMemory;
+		PFN_vkGetMemoryWin32HandleKHR getMemoryWin32HandleKHR;
+		PFN_vkCreateSemaphore createSemaphore;
+		PFN_vkDestroySemaphore destroySemaphore;
+		PFN_vkGetSemaphoreWin32HandleKHR getSemaphoreWin32HandleKHR;
+		PFN_vkImportSemaphoreWin32HandleKHR importSemaphoreWin32HandleKHR;
+		PFN_vkGetPhysicalDeviceMemoryProperties getPhysicalDeviceMemoryProperties;
 	};
 
 	VulkanApi g_vk = {};
@@ -88,6 +105,16 @@ OpenXRManager::OpenXRManager()
 	, m_runtimeMinor(0)
 	, m_runtimePatch(0)
 	, m_runtimeSessionCrashRisk(FALSE)
+	, m_hostedMode(FALSE)
+	, m_hostShm(nullptr)
+	, m_hostMapping(nullptr)
+	, m_hostProcess(nullptr)
+	, m_exportTimeline(VK_NULL_HANDLE)
+	, m_hostSubmitCounter(0)
+	, m_hostLastFrameIndex(0)
+	, m_hostUiImage(VK_NULL_HANDLE)
+	, m_hostUiMemory(VK_NULL_HANDLE)
+	, m_hostUiInitialized(FALSE)
 	, m_sessionState(XR_SESSION_STATE_UNKNOWN)
 	, m_blendMode(XR_ENVIRONMENT_BLEND_MODE_OPAQUE)
 	, m_sessionRunning(FALSE)
@@ -173,7 +200,12 @@ OpenXRManager::OpenXRManager()
 		m_eyeViews[i] = VREyeView();
 		m_eyePoses[i] = XrPosef();
 		m_eyeFovs[i] = XrFovf();
+		m_exportImages[i] = VK_NULL_HANDLE;
+		m_exportMemory[i] = VK_NULL_HANDLE;
+		m_exportImageInitialized[i] = FALSE;
 	}
+	for (int i = 0; i < VR_HAND_COUNT; ++i)
+		m_prevHostButtons[i] = 0;
 }
 
 OpenXRManager::~OpenXRManager()
@@ -514,6 +546,24 @@ Bool OpenXRManager::loadVulkanFunctions()
 
 	#undef LOAD_VK
 
+	// Hosted-mode entry points: load without failing - their absence only disables hosted VR.
+	#define LOAD_VK_SOFT(member, name) \
+		g_vk.member = (PFN_##name)g_vk.getDeviceProcAddr(m_vkDevice, #name);
+	LOAD_VK_SOFT(createImage, vkCreateImage)
+	LOAD_VK_SOFT(destroyImage, vkDestroyImage)
+	LOAD_VK_SOFT(getImageMemoryRequirements, vkGetImageMemoryRequirements)
+	LOAD_VK_SOFT(allocateMemory, vkAllocateMemory)
+	LOAD_VK_SOFT(freeMemory, vkFreeMemory)
+	LOAD_VK_SOFT(bindImageMemory, vkBindImageMemory)
+	LOAD_VK_SOFT(getMemoryWin32HandleKHR, vkGetMemoryWin32HandleKHR)
+	LOAD_VK_SOFT(createSemaphore, vkCreateSemaphore)
+	LOAD_VK_SOFT(destroySemaphore, vkDestroySemaphore)
+	LOAD_VK_SOFT(getSemaphoreWin32HandleKHR, vkGetSemaphoreWin32HandleKHR)
+	LOAD_VK_SOFT(importSemaphoreWin32HandleKHR, vkImportSemaphoreWin32HandleKHR)
+	#undef LOAD_VK_SOFT
+	g_vk.getPhysicalDeviceMemoryProperties = (PFN_vkGetPhysicalDeviceMemoryProperties)
+		getInstanceProcAddr(m_vkInstance, "vkGetPhysicalDeviceMemoryProperties");
+
 	DEBUG_LOG(("OpenXR: vulkan entry points resolved"));
 	return TRUE;
 }
@@ -577,10 +627,12 @@ Bool OpenXRManager::createSession()
 	// thread, which no guard on our side can catch. Flat mode is the only safe outcome.
 	if (m_runtimeSessionCrashRisk && (TheGlobalData == nullptr || !TheGlobalData->m_gvrXrForce))
 	{
-		DEBUG_LOG(("OpenXR: session: SKIPPED - Meta runtime %u.%u.%u has a known crash creating"
-			" 32-bit Vulkan sessions (GitHub issue #2). The game continues flat."
-			" Launch with -xrforce to attempt anyway.",
+		DEBUG_LOG(("OpenXR: session: direct 32-bit session would crash on Meta runtime %u.%u.%u"
+			" (GitHub issue #2) - starting the 64-bit host instead",
 			m_runtimeMajor, m_runtimeMinor, m_runtimePatch));
+		if (hostedStart())
+			return TRUE;
+		DEBUG_LOG(("OpenXR: hosted mode unavailable - the game continues flat"));
 		return FALSE;
 	}
 
@@ -929,6 +981,20 @@ void OpenXRManager::syncControllers()
 //-------------------------------------------------------------------------------------------------
 Bool OpenXRManager::pollSkipRequest()
 {
+	if (m_hostedMode)
+	{
+		// same edge semantics as the direct path, read from the host's shared state
+		Bool skip = FALSE;
+		for (Int hand = 0; hand < VR_HAND_COUNT; ++hand)
+		{
+			const Bool down = (m_hostShm->controller[hand].buttons & VR_HOST_BTN_SECONDARY) != 0;
+			VRControllerState& c = m_controllers[hand];
+			if (down && !c.secondaryButton)
+				skip = TRUE;
+			c.secondaryButton = down;
+		}
+		return skip;
+	}
 	if (!m_actionsReady || !m_sessionRunning)
 		return FALSE;
 
@@ -1231,6 +1297,11 @@ Bool OpenXRManager::createUiSwapchain()
 	if (FAILED(m_uiCompositeTexture->GetSurfaceLevel(0, &m_uiCompositeSurface)))
 		return FALSE;
 
+	// Hosted mode: the panels' pixels travel through a host-created shared texture instead of
+	// a local XR swapchain (which cannot exist - there is no local session).
+	if (m_hostedMode)
+		return hostedSetupUi();
+
 	XrSwapchainCreateInfo swci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
 	swci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
 	swci.format = VK_FORMAT_B8G8R8A8_SRGB;
@@ -1408,6 +1479,11 @@ Bool OpenXRManager::copyGroupBar(UnsignedInt imageIndex)
 //-------------------------------------------------------------------------------------------------
 void OpenXRManager::recenter()
 {
+	if (m_hostedMode)
+	{
+		++m_hostShm->recenterRequests;
+		return;
+	}
 	if (m_session == XR_NULL_HANDLE || m_appSpace == XR_NULL_HANDLE)
 		return;
 
@@ -1872,6 +1948,25 @@ void OpenXRManager::initGraphics(IDirect3DDevice8* d3d8Device)
 	if (!createVulkanCopyResources())
 		return;
 
+	// Hosted mode has no local session: no swapchains, actions or UI quads to create. The eye
+	// render targets plus the copy machinery above are everything the stereo path needs - the
+	// exported images stand in for swapchains, the host owns the rest. (Known v1 limitation:
+	// the in-headset UI panels are absent; menus and the command bar live on the monitor.)
+	if (m_hostedMode)
+	{
+		if (!createEyeTargets(d3d8Device))
+		{
+			DEBUG_LOG(("OpenXR: hosted: eye targets unavailable - staying flat"));
+			return;
+		}
+		// The interface panels ride a host-created shared texture (v4). Not fatal: without
+		// them the battlefield still works and menus stay on the monitor.
+		createUiSwapchain();
+		m_stereoReady = TRUE;
+		DEBUG_LOG(("OpenXR: hosted graphics ready - stereo path armed through the host"));
+		return;
+	}
+
 	// Controllers are a bonus, not a requirement: if this fails the headset still renders and
 	// the game is still playable with mouse and keyboard.
 	createActions();
@@ -1896,8 +1991,688 @@ void OpenXRManager::initGraphics(IDirect3DDevice8* d3d8Device)
 }
 
 //-------------------------------------------------------------------------------------------------
+// GeneralsVR hosted mode - Meta v205+ crashes 32-bit session creation, so a 64-bit host
+// process (GeneralsVR-xrhost.exe) owns OpenXR and this manager feeds it. VRHostProtocol.h.
+//-------------------------------------------------------------------------------------------------
+Bool OpenXRManager::hostedStart()
+{
+	if (g_vk.createImage == nullptr || g_vk.allocateMemory == nullptr
+		|| g_vk.bindImageMemory == nullptr || g_vk.createSemaphore == nullptr
+		|| g_vk.importSemaphoreWin32HandleKHR == nullptr
+		|| g_vk.getPhysicalDeviceMemoryProperties == nullptr)
+	{
+		DEBUG_LOG(("OpenXR: hosted: driver lacks import entry points - staying flat"));
+		return FALSE;
+	}
+
+	char shmName[128];
+	sprintf(shmName, VR_HOST_SHM_NAME_FMT, (unsigned long)GetCurrentProcessId());
+	m_hostMapping = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+		0, sizeof(VRHostSharedBlock), shmName);
+	if (m_hostMapping == nullptr)
+	{
+		DEBUG_LOG(("OpenXR: hosted: CreateFileMapping failed (%lu)", GetLastError()));
+		return FALSE;
+	}
+	m_hostShm = (VRHostSharedBlock*)MapViewOfFile((HANDLE)m_hostMapping, FILE_MAP_ALL_ACCESS,
+		0, 0, sizeof(VRHostSharedBlock));
+	if (m_hostShm == nullptr)
+	{
+		DEBUG_LOG(("OpenXR: hosted: MapViewOfFile failed (%lu)", GetLastError()));
+		return FALSE;
+	}
+	memset(m_hostShm, 0, sizeof(VRHostSharedBlock));
+	m_hostShm->gamePid = GetCurrentProcessId();
+
+	// the host lives next to our own exe
+	char exePath[MAX_PATH];
+	GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+	char* slash = strrchr(exePath, '\\');
+	if (slash) slash[1] = 0;
+	char cmdLine[MAX_PATH * 2];
+	sprintf(cmdLine, "\"%s%s\" %lu", exePath, VR_HOST_EXE_NAME, (unsigned long)GetCurrentProcessId());
+
+	STARTUPINFOA si = {};
+	si.cb = sizeof(si);
+	PROCESS_INFORMATION pi = {};
+	if (!CreateProcessA(nullptr, cmdLine, nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+		nullptr, exePath, &si, &pi))
+	{
+		DEBUG_LOG(("OpenXR: hosted: could not start %s (%lu)", VR_HOST_EXE_NAME, GetLastError()));
+		return FALSE;
+	}
+	CloseHandle(pi.hThread);
+	m_hostProcess = pi.hProcess;
+	DEBUG_LOG(("OpenXR: hosted: %s started (pid %lu)", VR_HOST_EXE_NAME, pi.dwProcessId));
+
+	// wait for the host's OpenXR bring-up AND its shared resources (v3: host creates them)
+	for (Int waited = 0; waited < 12000; waited += 100)
+	{
+		if (m_hostShm->hostResourcesReady)
+			break;
+		if (m_hostShm->state == VRHOST_STATE_NO_RUNTIME || m_hostShm->state == VRHOST_STATE_FATAL
+			|| WaitForSingleObject((HANDLE)m_hostProcess, 0) == WAIT_OBJECT_0)
+		{
+			DEBUG_LOG(("OpenXR: hosted: host failed during bring-up (state %u, err 0x%08x)",
+				m_hostShm->state, m_hostShm->lastError));
+			return FALSE;
+		}
+		Sleep(100);
+	}
+	if (!m_hostShm->hostResourcesReady)
+	{
+		DEBUG_LOG(("OpenXR: hosted: host bring-up timed out"));
+		return FALSE;
+	}
+
+	// Hosted v1 renders at the runtime's recommended size (the -vrres scale applies only to
+	// the direct path; revisit once the pipeline is proven).
+	m_eyeCount = (Int)VR_HOST_EYE_COUNT;
+	m_eyeWidth = (Int)m_hostShm->eyeWidth;
+	m_eyeHeight = (Int)m_hostShm->eyeHeight;
+	if (!hostedCreateExports())
+		return FALSE;
+
+	m_hostedMode = TRUE;
+	m_sessionRunning = TRUE;
+	DEBUG_LOG(("OpenXR: HOSTED mode active - VR via the 64-bit runtime (%u.%u.%u), eyes %dx%d",
+		m_hostShm->runtimeMajor, m_hostShm->runtimeMinor, m_hostShm->runtimePatch,
+		m_eyeWidth, m_eyeHeight));
+	return TRUE;
+}
+
+//-------------------------------------------------------------------------------------------------
+// v3: the host CREATED the shared textures and fence (D3D11-created/Vulkan-imported is the
+// direction real drivers support; our Vulkan-exported handles came back E_INVALIDARG in D3D11).
+// Duplicate the host's handles into this process and import them into DXVK's device.
+Bool OpenXRManager::hostedCreateExports()
+{
+	for (Int eye = 0; eye < m_eyeCount; ++eye)
+	{
+		HANDLE texHandle = nullptr;
+		if (!DuplicateHandle((HANDLE)m_hostProcess, (HANDLE)(uintptr_t)m_hostShm->eyeTextureHandle[eye],
+			GetCurrentProcess(), &texHandle, 0, FALSE, DUPLICATE_SAME_ACCESS))
+		{
+			DEBUG_LOG(("OpenXR: hosted: duplicating eye %d handle out of the host failed (%lu)", eye, GetLastError()));
+			return FALSE;
+		}
+
+		VkExternalMemoryImageCreateInfo ext = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
+		ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT;
+
+		VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+		ici.pNext = &ext;
+		ici.imageType = VK_IMAGE_TYPE_2D;
+		ici.format = VK_FORMAT_B8G8R8A8_UNORM;
+		ici.extent.width = (uint32_t)m_eyeWidth;
+		ici.extent.height = (uint32_t)m_eyeHeight;
+		ici.extent.depth = 1;
+		ici.mipLevels = 1;
+		ici.arrayLayers = 1;
+		ici.samples = VK_SAMPLE_COUNT_1_BIT;
+		ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+		ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+		ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		if (g_vk.createImage(m_vkDevice, &ici, nullptr, &m_exportImages[eye]) != VK_SUCCESS)
+		{
+			DEBUG_LOG(("OpenXR: hosted: import image %d failed", eye));
+			return FALSE;
+		}
+
+		VkMemoryRequirements memReq = {};
+		g_vk.getImageMemoryRequirements(m_vkDevice, m_exportImages[eye], &memReq);
+		VkPhysicalDeviceMemoryProperties memProps = {};
+		g_vk.getPhysicalDeviceMemoryProperties(m_vkPhysicalDevice, &memProps);
+		uint32_t typeIndex = UINT32_MAX;
+		for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i)
+		{
+			if ((memReq.memoryTypeBits & (1u << i))
+				&& (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+			{ typeIndex = i; break; }
+		}
+		if (typeIndex == UINT32_MAX)
+		{
+			DEBUG_LOG(("OpenXR: hosted: no device-local memory type for the imported image"));
+			return FALSE;
+		}
+
+		VkMemoryDedicatedAllocateInfo ded = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO };
+		ded.image = m_exportImages[eye];
+		VkImportMemoryWin32HandleInfoKHR imp = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR };
+		imp.pNext = &ded;
+		imp.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT;
+		imp.handle = texHandle;
+		VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+		mai.pNext = &imp;
+		mai.allocationSize = memReq.size;
+		mai.memoryTypeIndex = typeIndex;
+		if (g_vk.allocateMemory(m_vkDevice, &mai, nullptr, &m_exportMemory[eye]) != VK_SUCCESS
+			|| g_vk.bindImageMemory(m_vkDevice, m_exportImages[eye], m_exportMemory[eye], 0) != VK_SUCCESS)
+		{
+			DEBUG_LOG(("OpenXR: hosted: importing the host's eye %d texture failed", eye));
+			return FALSE;
+		}
+	}
+
+	// The host's shared D3D11 fence and a Vulkan timeline semaphore are the same kernel object
+	// family; import the fence as the timeline's payload.
+	HANDLE fenceHandle = nullptr;
+	if (!DuplicateHandle((HANDLE)m_hostProcess, (HANDLE)(uintptr_t)m_hostShm->fenceHandle,
+		GetCurrentProcess(), &fenceHandle, 0, FALSE, DUPLICATE_SAME_ACCESS))
+	{
+		DEBUG_LOG(("OpenXR: hosted: duplicating the fence handle failed (%lu)", GetLastError()));
+		return FALSE;
+	}
+	VkSemaphoreTypeCreateInfo type = { VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
+	type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+	type.initialValue = 0;
+	VkSemaphoreCreateInfo sci = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+	sci.pNext = &type;
+	if (g_vk.createSemaphore(m_vkDevice, &sci, nullptr, &m_exportTimeline) != VK_SUCCESS)
+	{
+		DEBUG_LOG(("OpenXR: hosted: timeline semaphore failed (driver too old?)"));
+		return FALSE;
+	}
+	VkImportSemaphoreWin32HandleInfoKHR simp = { VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR };
+	simp.semaphore = m_exportTimeline;
+	simp.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
+	simp.handle = fenceHandle;
+	if (g_vk.importSemaphoreWin32HandleKHR(m_vkDevice, &simp) != VK_SUCCESS)
+	{
+		DEBUG_LOG(("OpenXR: hosted: importing the host's fence failed"));
+		return FALSE;
+	}
+
+	m_hostShm->texturesPublished = 1;
+	DEBUG_LOG(("OpenXR: hosted: host's eye textures + fence imported into DXVK's device"));
+	return TRUE;
+}
+
+//-------------------------------------------------------------------------------------------------
+// v4: ask the host for a shared texture at the interface's size and import it, exactly like the
+// eyes. The host shows crops of it as floating quads driven by the per-frame panel list.
+Bool OpenXRManager::hostedSetupUi()
+{
+	m_hostShm->uiWidth = (uint32_t)m_uiWidth;
+	m_hostShm->uiHeight = (uint32_t)m_uiHeight;
+	m_hostShm->uiRequest = 1;
+	for (Int waited = 0; waited < 3000; waited += 50)
+	{
+		if (m_hostShm->uiResourcesReady)
+			break;
+		if (m_hostShm->uiRequest == 2)
+		{
+			DEBUG_LOG(("OpenXR: hosted: host could not create the UI texture - panels off"));
+			return FALSE;
+		}
+		Sleep(50);
+	}
+	if (!m_hostShm->uiResourcesReady)
+	{
+		DEBUG_LOG(("OpenXR: hosted: UI texture wait timed out - panels off"));
+		return FALSE;
+	}
+
+	HANDLE uiHandle = nullptr;
+	if (!DuplicateHandle((HANDLE)m_hostProcess, (HANDLE)(uintptr_t)m_hostShm->uiTextureHandle,
+		GetCurrentProcess(), &uiHandle, 0, FALSE, DUPLICATE_SAME_ACCESS))
+	{
+		DEBUG_LOG(("OpenXR: hosted: duplicating the UI handle failed (%lu)", GetLastError()));
+		return FALSE;
+	}
+
+	VkExternalMemoryImageCreateInfo ext = { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO };
+	ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT;
+	VkImageCreateInfo ici = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+	ici.pNext = &ext;
+	ici.imageType = VK_IMAGE_TYPE_2D;
+	ici.format = VK_FORMAT_B8G8R8A8_UNORM;
+	ici.extent.width = (uint32_t)m_uiWidth;
+	ici.extent.height = (uint32_t)m_uiHeight;
+	ici.extent.depth = 1;
+	ici.mipLevels = 1;
+	ici.arrayLayers = 1;
+	ici.samples = VK_SAMPLE_COUNT_1_BIT;
+	ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+	ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+	ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	if (g_vk.createImage(m_vkDevice, &ici, nullptr, &m_hostUiImage) != VK_SUCCESS)
+		return FALSE;
+
+	VkMemoryRequirements memReq = {};
+	g_vk.getImageMemoryRequirements(m_vkDevice, m_hostUiImage, &memReq);
+	VkPhysicalDeviceMemoryProperties memProps = {};
+	g_vk.getPhysicalDeviceMemoryProperties(m_vkPhysicalDevice, &memProps);
+	uint32_t typeIndex = UINT32_MAX;
+	for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i)
+	{
+		if ((memReq.memoryTypeBits & (1u << i))
+			&& (memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+		{ typeIndex = i; break; }
+	}
+	if (typeIndex == UINT32_MAX)
+		return FALSE;
+
+	VkMemoryDedicatedAllocateInfo ded = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO };
+	ded.image = m_hostUiImage;
+	VkImportMemoryWin32HandleInfoKHR imp = { VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR };
+	imp.pNext = &ded;
+	imp.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT;
+	imp.handle = uiHandle;
+	VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+	mai.pNext = &imp;
+	mai.allocationSize = memReq.size;
+	mai.memoryTypeIndex = typeIndex;
+	if (g_vk.allocateMemory(m_vkDevice, &mai, nullptr, &m_hostUiMemory) != VK_SUCCESS
+		|| g_vk.bindImageMemory(m_vkDevice, m_hostUiImage, m_hostUiMemory, 0) != VK_SUCCESS)
+	{
+		DEBUG_LOG(("OpenXR: hosted: importing the host's UI texture failed"));
+		return FALSE;
+	}
+
+	m_hostShm->uiConnected = 1;
+	m_uiReady = TRUE;	// the direct path sets this after ITS swapchain; hosted is ready here
+	DEBUG_LOG(("OpenXR: hosted: UI panels wired through the host (%dx%d)", m_uiWidth, m_uiHeight));
+	return TRUE;
+}
+
+//-------------------------------------------------------------------------------------------------
+void OpenXRManager::hostedBeginFrame()
+{
+	// the host dying must never take the game down: drop to flat and keep playing
+	if (WaitForSingleObject((HANDLE)m_hostProcess, 0) == WAIT_OBJECT_0)
+	{
+		DEBUG_LOG(("OpenXR: hosted: host process ended (state %u) - continuing flat", m_hostShm->state));
+		m_hostedMode = FALSE;
+		m_sessionRunning = FALSE;
+		m_stereoReady = FALSE;
+		return;
+	}
+
+	// Headset off the head: the runtime throttles the host's xrWaitFrame and then pauses the
+	// session outright, so hostFrameIndex crawls and finally freezes - and pacing on it would
+	// hold EVERY game frame for the full timeout below, dragging the monitor game to ~10 fps
+	// the moment the headset is set down. Not focused means nobody is looking through the
+	// lenses, so there is nothing to pace FOR: skip the wait and let the flat game run at
+	// monitor speed. The block is still snapshotted below every frame, so the first focused
+	// tick after the headset goes back on resumes VR pacing and rendering by itself.
+	const Bool focused = (m_hostShm->sessionFocused != 0);
+
+	static Bool s_prevFocused = FALSE;
+	if (focused != s_prevFocused)
+	{
+		s_prevFocused = focused;
+		DEBUG_LOG(("OpenXR: hosted: session %s - %s", focused ? "focused" : "unfocused",
+			focused ? "pacing on the headset, stereo on" : "headset down; flat runs free"));
+	}
+
+	// PACING: in direct mode xrWaitFrame blocks the loop at the headset's rate; hosted mode
+	// must do the same or the game renders unthrottled, saturates the GPU and starves the
+	// host's compositor (the "very laggy" failure). Wait for the host's next frame tick.
+	if (focused)
+	{
+		const DWORD paceStart = GetTickCount();
+		while (m_hostShm->hostFrameIndex == m_hostLastFrameIndex
+			&& GetTickCount() - paceStart < 100)
+		{
+			Sleep(1);
+		}
+	}
+
+	// SEQLOCK: copy the host's per-frame block only when stable, or a mid-write read hands us
+	// a torn pose - a one-frame camera spike or a phantom controller jump.
+	VRHostSharedBlock snap;
+	for (Int attempt = 0; attempt < 16; ++attempt)
+	{
+		const UnsignedInt s1 = m_hostShm->frameSeq;
+		if (s1 & 1u)
+		{
+			Sleep(0);
+			continue;
+		}
+		memcpy(&snap, m_hostShm, sizeof(snap));
+		if (m_hostShm->frameSeq == s1)
+			break;
+	}
+	m_hostLastFrameIndex = snap.hostFrameIndex;
+
+	m_predictedDisplayTime = (XrTime)snap.predictedDisplayTimeNs;
+
+	for (Int eye = 0; eye < m_eyeCount; ++eye)
+	{
+		const VRHostPose& p = snap.eyePose[eye];
+		VREyeView& v = m_eyeViews[eye];
+		v.quatX = p.quatX; v.quatY = p.quatY; v.quatZ = p.quatZ; v.quatW = p.quatW;
+		v.posX = p.posX; v.posY = p.posY; v.posZ = p.posZ;
+		v.angleLeft = p.fovLeft; v.angleRight = p.fovRight;
+		v.angleUp = p.fovUp; v.angleDown = p.fovDown;
+		m_eyePoses[eye].orientation.x = p.quatX;
+		m_eyePoses[eye].orientation.y = p.quatY;
+		m_eyePoses[eye].orientation.z = p.quatZ;
+		m_eyePoses[eye].orientation.w = p.quatW;
+		m_eyePoses[eye].position.x = p.posX;
+		m_eyePoses[eye].position.y = p.posY;
+		m_eyePoses[eye].position.z = p.posZ;
+		m_eyeFovs[eye].angleLeft = p.fovLeft;
+		m_eyeFovs[eye].angleRight = p.fovRight;
+		m_eyeFovs[eye].angleUp = p.fovUp;
+		m_eyeFovs[eye].angleDown = p.fovDown;
+	}
+
+	for (Int hand = 0; hand < VR_HAND_COUNT; ++hand)
+	{
+		const VRHostController& hc = snap.controller[hand];
+		VRControllerState& c = m_controllers[hand];
+		const UnsignedInt prev = m_prevHostButtons[hand];
+		const UnsignedInt now = hc.buttons;
+
+		c.trigger = (now & VR_HOST_BTN_TRIGGER) != 0;
+		c.triggerPressed = c.trigger && !(prev & VR_HOST_BTN_TRIGGER);
+		c.triggerReleased = !c.trigger && (prev & VR_HOST_BTN_TRIGGER);
+		c.grip = (now & VR_HOST_BTN_GRIP) != 0;
+		c.gripPressed = c.grip && !(prev & VR_HOST_BTN_GRIP);
+		c.gripReleased = !c.grip && (prev & VR_HOST_BTN_GRIP);
+		c.primaryButton = (now & VR_HOST_BTN_PRIMARY) != 0;
+		c.primaryPressed = c.primaryButton && !(prev & VR_HOST_BTN_PRIMARY);
+		c.secondaryButton = (now & VR_HOST_BTN_SECONDARY) != 0;
+		c.secondaryPressed = c.secondaryButton && !(prev & VR_HOST_BTN_SECONDARY);
+		c.stickClick = (now & VR_HOST_BTN_STICKCLICK) != 0;
+		c.stickClickPressed = c.stickClick && !(prev & VR_HOST_BTN_STICKCLICK);
+		c.stickX = hc.stickX;
+		c.stickY = hc.stickY;
+		c.poseValid = hc.aimPose.valid ? TRUE : FALSE;
+		if (c.poseValid)
+		{
+			c.quatX = hc.aimPose.quatX; c.quatY = hc.aimPose.quatY;
+			c.quatZ = hc.aimPose.quatZ; c.quatW = hc.aimPose.quatW;
+			c.posX = hc.aimPose.posX; c.posY = hc.aimPose.posY; c.posZ = hc.aimPose.posZ;
+		}
+
+		// the three-bar button recenters, exactly like the direct path
+		if ((now & VR_HOST_BTN_MENU) && !(prev & VR_HOST_BTN_MENU))
+			recenter();
+
+		m_prevHostButtons[hand] = now;
+	}
+
+	// Unfocused frames are flat frames: no stereo pass, no eye copies, no controller input.
+	// The snapshot above still ran, so focus returning is seen on the very next game frame.
+	m_frameActive = focused;
+}
+
+//-------------------------------------------------------------------------------------------------
+void OpenXRManager::hostedSubmitFrame(Bool worldRendered)
+{
+	m_frameActive = FALSE;
+	if (!worldRendered || !m_stereoReady)
+		return;
+	// backpressure: if the host is more than two frames behind, skip - never queue unbounded
+	if (m_hostShm->gameSubmitIndex > m_hostShm->hostConsumedIndex + 2)
+		return;
+
+	if (m_copyInFlight)
+	{
+		g_vk.waitForFences(m_vkDevice, 1, &m_vkFence, VK_TRUE, UINT64_MAX);
+		g_vk.resetFences(m_vkDevice, 1, &m_vkFence);
+		g_vk.resetCommandBuffer(m_vkCommandBuffer, 0);
+		m_copyInFlight = FALSE;
+	}
+
+	VkCommandBufferBeginInfo cbi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+	cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	if (g_vk.beginCommandBuffer(m_vkCommandBuffer, &cbi) != VK_SUCCESS)
+		return;
+
+	VkImageSubresourceRange range = {};
+	range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	range.levelCount = 1;
+	range.layerCount = 1;
+
+	for (Int eye = 0; eye < m_eyeCount; ++eye)
+	{
+		VkImage src = getVulkanImage(m_eyeTextures[eye], &m_eyeImageLayout);
+		if (src == VK_NULL_HANDLE)
+			continue;
+
+		VkImageMemoryBarrier pre[2] = {};
+		pre[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+		pre[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+		pre[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+		pre[0].oldLayout = m_eyeImageLayout;
+		pre[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+		pre[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		pre[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		pre[0].image = src;
+		pre[0].subresourceRange = range;
+
+		pre[1] = pre[0];
+		pre[1].srcAccessMask = 0;
+		pre[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		pre[1].oldLayout = m_exportImageInitialized[eye]
+			? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
+		pre[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		pre[1].image = m_exportImages[eye];
+		m_exportImageInitialized[eye] = TRUE;
+
+		g_vk.cmdPipelineBarrier(m_vkCommandBuffer,
+			VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+			0, 0, nullptr, 0, nullptr, 2, pre);
+
+		VkImageCopy copy = {};
+		copy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		copy.srcSubresource.layerCount = 1;
+		copy.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		copy.dstSubresource.layerCount = 1;
+		copy.extent.width = (uint32_t)m_eyeWidth;
+		copy.extent.height = (uint32_t)m_eyeHeight;
+		copy.extent.depth = 1;
+		g_vk.cmdCopyImage(m_vkCommandBuffer,
+			src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			m_exportImages[eye], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			1, &copy);
+
+		VkImageMemoryBarrier post = pre[0];
+		post.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+		post.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+		post.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+		post.newLayout = m_eyeImageLayout;
+		g_vk.cmdPipelineBarrier(m_vkCommandBuffer,
+			VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+			0, 0, nullptr, 0, nullptr, 1, &post);
+	}
+
+	// UI panels (v4): the composited interface rides the same command buffer into the host's
+	// shared UI texture, so the fence value covers it together with the eyes.
+	if (m_hostUiImage != VK_NULL_HANDLE && m_uiCompositeTexture != nullptr)
+	{
+		VkImageLayout uiLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		VkImage uiSrc = getVulkanImage(m_uiCompositeTexture, &uiLayout);
+		if (uiSrc != VK_NULL_HANDLE)
+		{
+			VkImageMemoryBarrier pre[2] = {};
+			pre[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+			pre[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+			pre[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+			pre[0].oldLayout = uiLayout;
+			pre[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+			pre[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			pre[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			pre[0].image = uiSrc;
+			pre[0].subresourceRange = range;
+			pre[1] = pre[0];
+			pre[1].srcAccessMask = 0;
+			pre[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+			pre[1].oldLayout = m_hostUiInitialized ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
+			pre[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+			pre[1].image = m_hostUiImage;
+			m_hostUiInitialized = TRUE;
+			g_vk.cmdPipelineBarrier(m_vkCommandBuffer,
+				VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+				0, 0, nullptr, 0, nullptr, 2, pre);
+
+			VkImageCopy copy = {};
+			copy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			copy.srcSubresource.layerCount = 1;
+			copy.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			copy.dstSubresource.layerCount = 1;
+			copy.extent.width = (uint32_t)m_uiWidth;
+			copy.extent.height = (uint32_t)m_uiHeight;
+			copy.extent.depth = 1;
+			g_vk.cmdCopyImage(m_vkCommandBuffer,
+				uiSrc, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+				m_hostUiImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+
+			VkImageMemoryBarrier post = pre[0];
+			post.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+			post.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+			post.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+			post.newLayout = uiLayout;
+			g_vk.cmdPipelineBarrier(m_vkCommandBuffer,
+				VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+				0, 0, nullptr, 0, nullptr, 1, &post);
+		}
+	}
+
+	if (g_vk.endCommandBuffer(m_vkCommandBuffer) != VK_SUCCESS)
+		return;
+
+	const unsigned __int64 signalValue = m_hostSubmitCounter + 1;
+	VkTimelineSemaphoreSubmitInfo tsi = { VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
+	tsi.signalSemaphoreValueCount = 1;
+	tsi.pSignalSemaphoreValues = &signalValue;
+	VkSubmitInfo submit = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+	submit.pNext = &tsi;
+	submit.commandBufferCount = 1;
+	submit.pCommandBuffers = &m_vkCommandBuffer;
+	submit.signalSemaphoreCount = 1;
+	submit.pSignalSemaphores = &m_exportTimeline;
+
+	m_dxvkInterop->FlushRenderingCommands();
+	m_dxvkInterop->LockSubmissionQueue();
+	const VkResult sr = g_vk.queueSubmit(m_vkQueue, 1, &submit, m_vkFence);
+	m_dxvkInterop->ReleaseSubmissionQueue();
+	if (sr != VK_SUCCESS)
+	{
+		DEBUG_LOG(("OpenXR: hosted: eye submit failed (%d)", (int)sr));
+		return;
+	}
+	m_copyInFlight = TRUE;
+	m_hostSubmitCounter = signalValue;
+
+	// publish the panel list for this frame (host renders crops of the shared UI texture).
+	// layoutUiPanels runs inside the DIRECT submit path only, so hosted has to run it here.
+	if (m_hostUiImage != VK_NULL_HANDLE)
+	{
+		layoutUiPanels();
+		UnsignedInt count = 0;
+		for (Int i = 0; i < getPanelCount() && count < VR_HOST_MAX_PANELS; ++i)
+		{
+			VRPanelInfo info;
+			VRHostSharedBlock::VRHostPanel& p = m_hostShm->panels[count];
+			if (!getPanelInfo(i, info))
+			{
+				continue;
+			}
+			p.pose.quatX = info.quatX; p.pose.quatY = info.quatY;
+			p.pose.quatZ = info.quatZ; p.pose.quatW = info.quatW;
+			p.pose.posX = info.posX; p.pose.posY = info.posY; p.pose.posZ = info.posZ;
+			p.pose.valid = 1;
+			p.widthMeters = info.widthMeters;
+			p.heightMeters = info.heightMeters;
+			p.u0 = info.u0; p.v0 = info.v0; p.u1 = info.u1; p.v1 = info.v1;
+			p.alpha = info.alpha;
+			p.visible = 1;
+			p.isGroupBar = info.isGroupBar ? 1u : 0u;
+			p.onTop = info.onTop ? 1u : 0u;
+			++count;
+		}
+		m_hostShm->panelCount = count;
+	}
+
+	// Echo the poses this frame was RENDERED with; the host stamps the layer with them so the
+	// compositor's reprojection works with us instead of against us (fixes camera wobble).
+	for (Int eye = 0; eye < m_eyeCount; ++eye)
+	{
+		VRHostPose& rp = m_hostShm->renderPose[eye];
+		rp.quatX = m_eyePoses[eye].orientation.x; rp.quatY = m_eyePoses[eye].orientation.y;
+		rp.quatZ = m_eyePoses[eye].orientation.z; rp.quatW = m_eyePoses[eye].orientation.w;
+		rp.posX = m_eyePoses[eye].position.x; rp.posY = m_eyePoses[eye].position.y;
+		rp.posZ = m_eyePoses[eye].position.z;
+		rp.fovLeft = m_eyeFovs[eye].angleLeft; rp.fovRight = m_eyeFovs[eye].angleRight;
+		rp.fovUp = m_eyeFovs[eye].angleUp; rp.fovDown = m_eyeFovs[eye].angleDown;
+		rp.valid = 1;
+	}
+
+	m_hostShm->gameSubmitIndex = signalValue;
+}
+
+//-------------------------------------------------------------------------------------------------
+void OpenXRManager::hostedShutdown()
+{
+	if (m_hostShm != nullptr)
+		m_hostShm->gameRequestsStop = 1;
+	if (m_hostProcess != nullptr)
+	{
+		WaitForSingleObject((HANDLE)m_hostProcess, 2000);
+		CloseHandle((HANDLE)m_hostProcess);
+		m_hostProcess = nullptr;
+	}
+	if (m_copyInFlight)
+	{
+		g_vk.waitForFences(m_vkDevice, 1, &m_vkFence, VK_TRUE, UINT64_MAX);
+		m_copyInFlight = FALSE;
+	}
+	if (m_exportTimeline != VK_NULL_HANDLE && g_vk.destroySemaphore != nullptr)
+	{
+		g_vk.destroySemaphore(m_vkDevice, m_exportTimeline, nullptr);
+		m_exportTimeline = VK_NULL_HANDLE;
+	}
+	for (Int eye = 0; eye < MAX_EYES; ++eye)
+	{
+		if (m_exportImages[eye] != VK_NULL_HANDLE && g_vk.destroyImage != nullptr)
+		{
+			g_vk.destroyImage(m_vkDevice, m_exportImages[eye], nullptr);
+			m_exportImages[eye] = VK_NULL_HANDLE;
+		}
+		if (m_exportMemory[eye] != VK_NULL_HANDLE && g_vk.freeMemory != nullptr)
+		{
+			g_vk.freeMemory(m_vkDevice, m_exportMemory[eye], nullptr);
+			m_exportMemory[eye] = VK_NULL_HANDLE;
+		}
+	}
+	if (m_hostUiImage != VK_NULL_HANDLE && g_vk.destroyImage != nullptr)
+	{
+		g_vk.destroyImage(m_vkDevice, m_hostUiImage, nullptr);
+		m_hostUiImage = VK_NULL_HANDLE;
+	}
+	if (m_hostUiMemory != VK_NULL_HANDLE && g_vk.freeMemory != nullptr)
+	{
+		g_vk.freeMemory(m_vkDevice, m_hostUiMemory, nullptr);
+		m_hostUiMemory = VK_NULL_HANDLE;
+	}
+	if (m_hostShm != nullptr)
+	{
+		UnmapViewOfFile(m_hostShm);
+		m_hostShm = nullptr;
+	}
+	if (m_hostMapping != nullptr)
+	{
+		CloseHandle((HANDLE)m_hostMapping);
+		m_hostMapping = nullptr;
+	}
+	m_hostedMode = FALSE;
+}
+
+//-------------------------------------------------------------------------------------------------
 void OpenXRManager::beginFrame()
 {
+	if (m_hostedMode)
+	{
+		hostedBeginFrame();
+		return;
+	}
 	if (m_session == XR_NULL_HANDLE)
 		return;
 
@@ -2155,6 +2930,11 @@ void OpenXRManager::submitFrame(Bool worldRendered)
 {
 	if (!m_frameActive)
 		return;
+	if (m_hostedMode)
+	{
+		hostedSubmitFrame(worldRendered);
+		return;
+	}
 
 	XrCompositionLayerProjectionView projViews[MAX_EYES];
 	XrCompositionLayerProjection worldLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
@@ -2369,6 +3149,9 @@ void OpenXRManager::shutdown()
 		g_vk.deviceWaitIdle(m_vkDevice);
 	m_copyInFlight = FALSE;
 	m_stereoReady = FALSE;
+
+	if (m_hostedMode || m_hostShm != nullptr)
+		hostedShutdown();
 
 	if (m_uiSwapchain != XR_NULL_HANDLE)
 	{
