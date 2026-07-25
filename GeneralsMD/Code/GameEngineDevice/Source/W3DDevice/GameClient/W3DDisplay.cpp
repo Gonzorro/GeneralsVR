@@ -2293,7 +2293,13 @@ void W3DDisplay::drawVRScene( W3DView *view )
 			// this panel, so skip the 2D cursor here or the player would see two. In the menus (no
 			// world scene behind the panel) the 2D cursor is the only pointer, so it stays.
 			const Bool worldCursorOwnsIt = inGame && TheVRControls != nullptr && TheVRControls->isMouseKbMode();
-			if (TheMouse != nullptr && !worldCursorOwnsIt
+			// Only draw the 2D cursor while something 2D is actually pointed at: the ray resting
+			// on a panel, or the physical mouse in use. At any other time the cursor pixel is
+			// parked or stale, and drawing it paints a phantom X on the HUD panel for a beam
+			// that is out on the battlefield.
+			const Bool pointerOnUi = TheVRControls == nullptr
+				|| TheVRControls->isRayOnScreenPanel() || TheVRControls->isMouseActive();
+			if (TheMouse != nullptr && !worldCursorOwnsIt && pointerOnUi
 				&& (TheVRControls == nullptr || TheVRControls->isCursorActive()))
 			{
 				const ICoord2D &mp = TheMouse->getMouseStatus()->pos;

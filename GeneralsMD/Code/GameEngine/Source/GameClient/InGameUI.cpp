@@ -1534,6 +1534,17 @@ void InGameUI::handleRadiusCursor()
 				hasPos = TheRadar->screenPixelToWorld( &mouseIO->pos, &pos );
 			}
 
+			// GeneralsVR The laser is the pointer, and most of what it can reach never projects
+			// onto the flat screen at all - the mouse pixel is parked while the beam is out on
+			// the battlefield. Its published ground hit is this decal's true position; without
+			// it a superweapon's target circle could only slide around the little patch of the
+			// battlefield the monitor happens to frame.
+			if( !hasPos && TheGlobalData->m_vrAimValid )
+			{
+				pos = TheGlobalData->m_vrAimPoint;
+				hasPos = true;
+			}
+
 			if( !hasPos )
 			{
 				// if radar off, or point not on radar

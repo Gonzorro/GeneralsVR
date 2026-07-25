@@ -44,6 +44,7 @@
 class W3DView;
 class Line3DClass;
 class SimpleSceneClass;
+class Win32Mouse;
 
 class VRControls
 {
@@ -70,6 +71,12 @@ public:
 	/// Is a controller ray currently pointing at the ground? (Drives the in-world cursor.)
 	Bool hasAimPoint() const { return m_hasAimPoint; }
 	const Coord3D &getAimPoint() const { return m_aimPoint; }
+
+	/// The right ray is resting on a UI panel THIS frame, so the cursor pixel it drives is real.
+	/// The panel cursor is only drawn while this (or the physical mouse) is live: at any other
+	/// time the cursor pixel is parked or stale, and drawing it paints a phantom X on the HUD
+	/// panel for a beam that is pointing somewhere else entirely.
+	Bool isRayOnScreenPanel() const { return m_rayOnScreenPanel; }
 
 	/// True while the on-screen cursor should be shown on the VR menu panel: the cursor has moved
 	/// recently, whether by the physical mouse or a controller ray. Fades after a few idle seconds.
@@ -100,6 +107,14 @@ private:
 	/// mouse translators would have produced.
 	void selectUnderRay(const Vector3 &origin, const Vector3 &dir);
 	void commandUnderRay(const Vector3 &origin, const Vector3 &dir);
+
+	/// Move the injected cursor to the top-left corner, where no window lives. The cursor is a
+	/// fiction while the beam is out on the battlefield, but the game still reads its pixel for
+	/// hover - left over a menu or the control bar, that UI lights up for a ray pointing at the
+	/// dirt. Releases any held synthetic buttons first (never park mid-"drag").
+	void parkCursor(Win32Mouse *mouse);
+	/// Let go of any mouse buttons we injected, at the pixel they were last driven to.
+	void releasePointerButtons(Win32Mouse *mouse);
 
 	/// Sweep the laser across the ground with the trigger held to take everything inside the
 	/// box, the way a mouse drag does. A rectangle is drawn on the ground while you sweep, so
@@ -196,6 +211,8 @@ private:
 	Coord3D m_aimPoint;
 	Bool m_leftDown;              ///< synthetic mouse button state we have injected
 	Bool m_rightDown;
+	Bool m_rayOnScreenPanel;      ///< the right ray rests on a UI panel this frame
+	Bool m_cursorParked;          ///< the injected cursor sits in the windowless corner
 
 	// The laser pointers.
 	SimpleSceneClass *m_rayScene;

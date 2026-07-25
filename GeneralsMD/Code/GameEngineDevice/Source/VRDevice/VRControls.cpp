@@ -117,6 +117,8 @@ VRControls::VRControls()
 	, m_hasAimPoint(FALSE)
 	, m_leftDown(FALSE)
 	, m_rightDown(FALSE)
+	, m_rayOnScreenPanel(FALSE)
+	, m_cursorParked(FALSE)
 	, m_rayScene(nullptr)
 {
 	m_grabbing[0] = m_grabbing[1] = FALSE;
@@ -1580,9 +1582,12 @@ void VRControls::getReticleColor(const Vector3 &origin, const Vector3 &dir,
 
 	if (TheGameClient == nullptr || TheInGameUI == nullptr)
 		return;
-	if (TheInGameUI->getAllSelectedDrawables() == nullptr
-		|| TheInGameUI->getAllSelectedDrawables()->empty())
-		return;	// nothing selected: nothing would happen, so promise nothing
+	// A pending command button (spy drone, satellite scan, paradrop) targets with the beam even
+	// when nothing is selected - the shortcut powers usually have nothing selected at all.
+	if (TheInGameUI->getGUICommand() == nullptr
+		&& (TheInGameUI->getAllSelectedDrawables() == nullptr
+			|| TheInGameUI->getAllSelectedDrawables()->empty()))
+		return;	// nothing selected and no power pending: nothing would happen, promise nothing
 
 	Drawable *draw = pickDrawable(origin, dir);
 	Coord3D ground;
@@ -1816,6 +1821,41 @@ void VRControls::updateLocomotion(W3DView *view)
 
 
 //-------------------------------------------------------------------------------------------------
+void VRControls::releasePointerButtons(Win32Mouse *mouse)
+{
+	const DWORD now = GetTickCount();
+	const LPARAM packed = MAKELPARAM(m_injectedCursorX, m_injectedCursorY);
+	if (m_leftDown)
+	{
+		m_leftDown = FALSE;
+		mouse->addWin32Event(WM_LBUTTONUP, 0, packed, now);
+	}
+	if (m_rightDown)
+	{
+		m_rightDown = FALSE;
+		mouse->addWin32Event(WM_RBUTTONUP, 0, packed, now);
+	}
+}
+
+//-------------------------------------------------------------------------------------------------
+void VRControls::parkCursor(Win32Mouse *mouse)
+{
+	// Never park with a button still held: the engine would read it as a drag to the corner.
+	releasePointerButtons(mouse);
+
+	if (m_cursorParked)
+		return;
+	m_cursorParked = TRUE;
+
+	// The top-left corner: nothing lives there in a battle, and even a full-screen window has
+	// no button in its extreme corner. Parked through the injected bookkeeping, so the move is
+	// not mistaken for the physical mouse waking up.
+	mouse->addWin32Event(WM_MOUSEMOVE, 0, MAKELPARAM(0, 0), GetTickCount());
+	m_injectedCursorX = 0;
+	m_injectedCursorY = 0;
+}
+
+//-------------------------------------------------------------------------------------------------
 /** Point at the battlefield and click. The ray's ground hit is projected into the tactical
 	* camera's screen space and injected as a real Win32 mouse event, so selection, band boxes
 	* and orders all run through the engine's own input pipeline untouched. */
@@ -1823,6 +1863,7 @@ void VRControls::updateLocomotion(W3DView *view)
 void VRControls::updatePointer(W3DView *view)
 {
 	m_hasAimPoint = FALSE;
+	m_rayOnScreenPanel = FALSE;
 
 	Win32Mouse *mouse = (Win32Mouse *)TheMouse;
 	if (mouse == nullptr || TheOpenXR == nullptr)
@@ -1838,6 +1879,7 @@ void VRControls::updatePointer(W3DView *view)
 	// frame the ray hit, so the engine's GUI sees an ordinary cursor over an ordinary button.
 	Int panelX = 0, panelY = 0;
 	const OpenXRManager::VRPickKind pick = TheOpenXR->pickUiPanel(VR_HAND_RIGHT, panelX, panelY);
+	m_rayOnScreenPanel = (pick == OpenXRManager::VR_PICK_SCREEN);
 
 	if (pick == OpenXRManager::VR_PICK_GROUP_SLOT)
 	{
@@ -1862,7 +1904,14 @@ void VRControls::updatePointer(W3DView *view)
 		screen.y = panelY;
 		haveTarget = TRUE;
 	}
-	else if (!m_menuOpen && view != nullptr && TheGameLogic != nullptr && TheGameLogic->isInGame())
+	else if (m_menuOpen && view != nullptr && TheGameLogic != nullptr && TheGameLogic->isInGame())
+	{
+		// A menu is up and the beam is not on it: the cursor must not sit anywhere on the flat
+		// screen. Frozen where it happened to be, it kept HOVERING whatever it froze over - a
+		// menu button lighting up for a ray pointing at the dirt was exactly that.
+		parkCursor(mouse);
+	}
+	else if (view != nullptr && TheGameLogic != nullptr && TheGameLogic->isInGame())
 	{
 		// Otherwise point at the battlefield. Crucially this hits UNITS AND BUILDINGS, not just
 		// the ground: the cursor is placed on the point where the laser actually strikes the
@@ -1891,7 +1940,23 @@ void VRControls::updatePointer(W3DView *view)
 		{
 			m_hasAimPoint = TRUE;
 			m_aimPoint = hit;
-			haveTarget = TRUE;
+
+			// The flat screen still carries the game's own UI. A battlefield hit that projects
+			// onto one of those pixels - the control bar strip catches a LOT of them - must not
+			// drive the cursor there: in the headset the player is pointing at open ground, but
+			// the game would see its UI hovered, and the HUD panel showed an X sliding across it
+			// for a beam nowhere near it.
+			if (TheWindowManager != nullptr
+				&& TheWindowManager->getWindowUnderCursor(screen.x, screen.y) != nullptr)
+				parkCursor(mouse);
+			else
+				haveTarget = TRUE;
+		}
+		else
+		{
+			// Sky, or outside the flat camera's view: no pixel to drive. Park rather than leave
+			// the cursor stale over whatever it last touched.
+			parkCursor(mouse);
 		}
 
 		// Say exactly where the chain breaks. A click that goes nowhere is otherwise silent:
@@ -1927,10 +1992,24 @@ void VRControls::updatePointer(W3DView *view)
 			// ONE trigger does both jobs, the way one mouse button does: what happens depends on
 			// what you are pointing at, not on which button you chose. The decision waits for the
 			// RELEASE - a press cannot know yet whether it is the start of a box sweep.
-			const Bool wasBoxing = m_boxing;
-			updateBoxSelect(origin, dir);
+			const Bool pendingTarget = (TheInGameUI != nullptr
+				&& TheInGameUI->getGUICommand() != nullptr);
 
-			if (rightState.triggerReleased && !wasBoxing)
+			const Bool wasBoxing = m_boxing;
+			// While a command button waits for a target, a held trigger is AIMING, not the start
+			// of a band box - sweeping the beam to line up a strike must not select an army.
+			if (!pendingTarget)
+				updateBoxSelect(origin, dir);
+
+			if (rightState.triggerReleased && !wasBoxing && pendingTarget)
+			{
+				// A command button is waiting for a target (spy drone, satellite scan, paradrop):
+				// this release IS the target, wherever the beam lands. It must bypass the
+				// selection logic below - a shortcut power often has NOTHING selected, and that
+				// read as "a click on nothing clears" and quietly swallowed the power.
+				commandUnderRay(origin, dir);
+			}
+			else if (rightState.triggerReleased && !wasBoxing)
 			{
 				Drawable *underRay = pickDrawable(origin, dir);
 				const Bool isOwn = (underRay != nullptr && underRay->getObject() != nullptr
@@ -1976,23 +2055,39 @@ void VRControls::updatePointer(W3DView *view)
 			if (rightState.primaryPressed)
 				commandUnderRay(origin, dir);
 
-			// The left trigger drops the selection.
+			// The left trigger drops the selection - or, while a command button is waiting for a
+			// target, it cancels that instead: the flat game's right-click-to-cancel, without
+			// which a pending power could not be backed out of in the headset at all.
 			const VRControllerState &leftState = TheOpenXR->getController(VR_HAND_LEFT);
 			if (leftState.triggerPressed && TheInGameUI != nullptr && TheMessageStream != nullptr)
 			{
-				TheInGameUI->deselectAllDrawables();
-				TheMessageStream->appendMessage(GameMessage::MSG_DESTROY_SELECTED_GROUP);
+				if (TheInGameUI->getGUICommand() != nullptr)
+				{
+					TheInGameUI->setGUICommand(nullptr);
+				}
+				else
+				{
+					TheInGameUI->deselectAllDrawables();
+					TheMessageStream->appendMessage(GameMessage::MSG_DESTROY_SELECTED_GROUP);
+				}
 			}
 		}
 	}
 
 	if (!haveTarget)
-		return;	// pointing at nothing; leave the cursor where it is
+	{
+		// Pointing at nothing the cursor may touch. Any button we injected must not stay held
+		// through this: the engine would read the eventual release as the end of a DRAG from the
+		// last pixel to wherever the cursor surfaces next - a phantom band box.
+		releasePointerButtons(mouse);
+		return;
+	}
 
 	const DWORD now = GetTickCount();
 	const LPARAM packed = MAKELPARAM(screen.x, screen.y);
 
 	mouse->addWin32Event(WM_MOUSEMOVE, 0, packed, now);
+	m_cursorParked = FALSE;
 	// Remember where the ray put the cursor so updateMouseActivity can tell this apart from a
 	// real mouse move (which lands somewhere else) - the monitor frame is a physical-mouse aid.
 	m_injectedCursorX = screen.x;
@@ -2208,9 +2303,11 @@ void VRControls::updateRays(W3DView *view)
 		// player pressed the button now. Only the pointing hand - the other stays its own colour.
 		// Not while it rests on a panel, though: there the click is a menu click, and a beam
 		// glowing attack-red because an enemy happens to stand BEHIND the options screen is a lie.
+		// Same while a menu is open anywhere: world clicks are gated off, so battle colours would
+		// promise actions the trigger cannot take.
 		if (inGame && hand == VR_HAND_RIGHT)
 		{
-			if (onPanel)
+			if (onPanel || m_menuOpen)
 			{
 				line->Re_Color(0.35f, 0.85f, 1.00f);	// the pointer's own cyan, as in the menus
 			}
@@ -2368,6 +2465,8 @@ void VRControls::update()
 	// stopMovie(). So we call the same thing: no keyboard needed in a headset.
 	if (TheDisplay != nullptr && TheDisplay->isMoviePlaying())
 	{
+		m_rayOnScreenPanel = FALSE;	// nothing is being pointed at during a film
+
 		// No lasers across the intro. There is nothing to point at, and leaving them lit means
 		// two beams hanging over the film - this path returns early, so they must be put away
 		// here or they simply keep whatever state they were last left in.
@@ -2394,6 +2493,11 @@ void VRControls::update()
 	// edge-scrolling. (A future settings menu flips m_mouseKbMode; for now it is forced on.)
 	if (m_mouseKbMode)
 	{
+		// The physical mouse owns the cursor here: the ray is not on any panel, and the cursor
+		// is wherever the player put it, not parked.
+		m_rayOnScreenPanel = FALSE;
+		m_cursorParked = FALSE;
+
 		for (Int hand = 0; hand < 2; ++hand)
 		{
 			if (m_rayLines[hand] != nullptr)
