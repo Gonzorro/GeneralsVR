@@ -22,8 +22,21 @@ MANUAL WAY (this zip)
    does the same one-time setup as the easy way (one admin prompt for
    registry entries the game requires) and opens the launcher.
 
-Do NOT start generalszhv.exe directly - it only works when the launcher
-starts it pointed at your game.
+WHAT'S IN THE FOLDER
+--------------------
+START-GeneralsVR      the only thing you need to click
+Data\                 the game build itself (generalszhv.exe and its files)
+Debug\                every log the game writes lands here
+
+Do NOT start Data\generalszhv.exe directly - it only works when the
+launcher starts it pointed at your game.
+
+REPORTING A BUG
+---------------
+Attach the files from the Debug folder of your install
+(%LOCALAPPDATA%\GeneralsVR\Debug - mainly DebugLogFile.txt and
+xrhost_log.txt) to your issue. They contain no personal data, just what
+the game and the VR host were doing.
 
 GOT THE GAME FROM GOG / EA / A DISC (not Steam)?
 ------------------------------------------------

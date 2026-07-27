@@ -8,7 +8,9 @@ point a laser to select your units, give orders with the motion controllers, bui
 and resize yourself from "the whole war on a table" down to "standing among the tanks".
 
 > **Early alpha, looking for testers.** It's playable end to end (skirmish), but expect rough
-> edges. Found a bug? [Open an issue](https://github.com/Gonzorro/GeneralsVR/issues/new/choose).
+> edges. Found a bug? [Open an issue](https://github.com/Gonzorro/GeneralsVR/issues/new/choose)
+> and attach the files from `%LOCALAPPDATA%\GeneralsVR\Debug`. That folder is exactly why it
+> exists: it makes your report ten times more useful to me.
 
 ## What you need
 
@@ -46,6 +48,20 @@ From then on just use the **GeneralsVR** desktop shortcut.
 **Your Zero Hour install is never touched.** Everything lives in its own folder
 (`%LOCALAPPDATA%\GeneralsVR`), and no game files are copied or changed. To uninstall, delete that
 folder and the desktop shortcut (or run `GeneralsVR.ps1 -Uninstall`).
+
+### What's in the folder
+
+Since v0.2.0 the install is organized so you always know where things are:
+
+- **`START-GeneralsVR`** at the top: the only thing you ever need to double-click.
+- **`Data\`**: the game build itself (`generalszhv.exe` and everything it needs). Don't start
+  it directly; it only works when the launcher points it at your game.
+- **`Debug\`**: every log the game writes lands here. **Reporting a bug? Attach the files from
+  `%LOCALAPPDATA%\GeneralsVR\Debug`**, mainly `DebugLogFile.txt` and `xrhost_log.txt`. They
+  contain no personal data, just what the game and the VR host were doing.
+- **`Data\Enhanced\`**: drop an upscaled texture pack in here (keeping its folder structure)
+  and flip **Assets** to **Enhanced** in the VR settings menu to use it. Ships empty; I can't
+  bundle EA-derived packs.
 
 The launcher auto-updates to my newest build every time you play. If an update ever breaks
 something for you, press **V** in the launcher and pick the previous version. You stay on it

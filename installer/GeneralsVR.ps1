@@ -157,7 +157,24 @@ function Install-Build($release) {
     Invoke-WebRequest -Uri $asset.browser_download_url -Headers $Headers -OutFile $tmpZip -UseBasicParsing
     if (Test-Path $tmpDir) { Remove-Item $tmpDir -Recurse -Force }
     Expand-Archive $tmpZip -DestinationPath $tmpDir -Force
+
+    # v0.2.0 moved the game into Data\ (Start-Game prefers it over the old top-level
+    # spot). Crossing that boundary in either direction must not leave the OTHER
+    # layout's binaries behind: an upgrade sweeps the stale top-level copies, and
+    # pinning back to an old version removes Data\ so the old exe is the one found.
+    $newLayout = Test-Path (Join-Path $tmpDir "Data\$ExeName")
+    if (-not $newLayout) {
+        $dataDir = Join-Path $InstallDir 'Data'
+        if (Test-Path $dataDir) { Remove-Item $dataDir -Recurse -Force }
+    }
     Copy-Item (Join-Path $tmpDir '*') $InstallDir -Recurse -Force
+    if ($newLayout) {
+        foreach ($old in $ExeName, 'd3d8.dll', 'd3d9.dll', 'GeneralsVR-xrhost.exe', 'msvcp140_atomic_wait.dll') {
+            $p = Join-Path $InstallDir $old
+            if (Test-Path $p) { Remove-Item $p -Force }
+        }
+    }
+
     Remove-Item $tmpZip -Force
     Remove-Item $tmpDir -Recurse -Force
     $cfg = Get-Config
@@ -169,9 +186,11 @@ function Install-Build($release) {
 function Copy-LocalFiles {
     # Running from an extracted zip (not from the install folder): copy everything
     # that came with this script into the install folder and continue from there.
+    # The exe sits in Data\ since v0.2.0; the top-level check keeps old zips working.
     $here = Split-Path -Parent $PSCommandPath
     if ($here -eq $InstallDir) { return }
-    if (-not (Test-Path (Join-Path $here $ExeName))) { return }
+    if (-not (Test-Path (Join-Path $here "Data\$ExeName")) -and
+        -not (Test-Path (Join-Path $here $ExeName))) { return }
     $script:CopiedFromZip = $true
     Write-Host "Copying files into $InstallDir..." -ForegroundColor Cyan
     Copy-Item (Join-Path $here '*') $InstallDir -Recurse -Force -Exclude 'generalsvr.json', 'game-path.txt'
@@ -321,8 +340,13 @@ function Confirm-Shortcut([string]$gameDir) {
 # --------------------------------------------------------------------- launch
 
 function Start-Game([string]$gameDir) {
-    $exe = Join-Path $InstallDir $ExeName
+    # Since v0.2.0 the game lives in Data\ (dlls must sit next to the exe) and every log
+    # lands in Debug\ - that's the folder to send with a bug report. Older versions kept
+    # the exe at the top, and [V] can still pin one, so fall back to the old spot.
+    $exe = Join-Path $InstallDir "Data\$ExeName"
+    if (-not (Test-Path $exe)) { $exe = Join-Path $InstallDir $ExeName }
     if (-not (Test-Path $exe)) { throw "No game build installed yet ($exe is missing) - update first." }
+    New-Item -ItemType Directory -Force (Join-Path $InstallDir 'Debug') | Out-Null
     $cfg = Get-Config
     Confirm-MachineKeys $gameDir
     Set-VulkanKeys
@@ -453,7 +477,8 @@ try {
         Write-Host "Zero Hour found: $gameDir"
         Write-Host "Installing to:   $InstallDir  (your game folder is not touched)"
         $releases = Get-Releases
-        $haveExe = Test-Path (Join-Path $InstallDir $ExeName)
+        $haveExe = (Test-Path (Join-Path $InstallDir "Data\$ExeName")) -or
+                   (Test-Path (Join-Path $InstallDir $ExeName))
         if ($null -eq $releases) {
             if (-not $haveExe) {
                 throw "Couldn't reach GitHub to download the game - this is usually a network hiccup or GitHub's rate limit. Check your connection and run the setup again in a minute."
