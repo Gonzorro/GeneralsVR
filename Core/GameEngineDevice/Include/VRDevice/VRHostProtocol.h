@@ -34,10 +34,11 @@
 
 #define VR_HOST_EXE_NAME        "GeneralsVR-xrhost.exe"
 #define VR_HOST_SHM_NAME_FMT    "Local\\GeneralsVR-xrhost-shm-%lu"   // %lu = game process id
-#define VR_HOST_PROTOCOL_VERSION 5u
+#define VR_HOST_PROTOCOL_VERSION 6u
 #define VR_HOST_MAGIC           0x56524835u                          // 'VRH5'
 #define VR_HOST_EYE_COUNT       2
 #define VR_HOST_MAX_PANELS      8
+#define VR_HOST_MAX_REFRESH_RATES 8
 
 // controller button bits (held state; edges are computed on the game side per game frame)
 #define VR_HOST_BTN_TRIGGER    0x01u
@@ -137,6 +138,18 @@ struct VRHostSharedBlock
 		uint32_t isGroupBar;         // group-bar panels are not shown by hosted v1
 		uint32_t onTop;
 	} panels[VR_HOST_MAX_PANELS];
+
+	// --- display refresh rate (v6): XR_FB_display_refresh_rate, when the runtime offers it ---
+	// The host enumerates once after the session is up. A count of 0 means the extension is
+	// missing (the rate is then whatever the Link app is configured to) and the game should not
+	// offer a choice. Requests ride a sequence pair so the host applies each exactly once.
+	uint32_t refreshRateCount;                        // 0 = extension unavailable
+	float    refreshRates[VR_HOST_MAX_REFRESH_RATES]; // Hz, as the runtime enumerates them
+	float    currentRefreshRate;                      // Hz the runtime reports now (0 = unknown)
+	float    requestedRefreshRate;                    // game's wish in Hz; 0 = runtime's choice
+	uint32_t refreshRateRequestSeq;                   // game ++ after writing requestedRefreshRate
+	uint32_t refreshRateAppliedSeq;                   // host = last seq it pushed to the runtime
+	int32_t  refreshRateResult;                       // XrResult of that push (0 = success)
 };
 
 #pragma pack(pop)

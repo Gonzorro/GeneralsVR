@@ -128,6 +128,14 @@ OpenXRManager::OpenXRManager()
 	, m_supportsVulkan(FALSE)
 	, m_supportsVulkan1(FALSE)
 	, m_supportsD3D11(FALSE)
+	, m_supportsRefreshRate(FALSE)
+	, m_pEnumRefreshRates(nullptr)
+	, m_pGetRefreshRate(nullptr)
+	, m_pRequestRefreshRate(nullptr)
+	, m_refreshRateCount(0)
+	, m_currentRefreshRate(0.0f)
+	, m_desiredRefreshRate(0.0f)
+	, m_refreshRateDirty(FALSE)
 	, m_dxvkInterop(nullptr)
 	, m_vkInstance(VK_NULL_HANDLE)
 	, m_vkPhysicalDevice(VK_NULL_HANDLE)
@@ -183,6 +191,7 @@ OpenXRManager::OpenXRManager()
 		m_handPaths[i] = XR_NULL_PATH;
 		m_aimSpaces[i] = XR_NULL_HANDLE;
 		m_controllers[i] = VRControllerState();
+		m_controllersRaw[i] = VRControllerState();
 	}
 	for (int i = 0; i < UI_PANEL_COUNT; ++i)
 	{
@@ -191,6 +200,8 @@ OpenXRManager::OpenXRManager()
 	}
 	m_wristPanelOpen[VR_HAND_LEFT] = FALSE;
 	m_wristPanelOpen[VR_HAND_RIGHT] = FALSE;
+	for (int i = 0; i < MAX_REFRESH_RATES; ++i)
+		m_refreshRates[i] = 0.0f;
 	for (int i = 0; i < MAX_EYES; ++i)
 	{
 		m_swapchains[i] = XR_NULL_HANDLE;
@@ -252,7 +263,17 @@ Bool OpenXRManager::init()
 		return FALSE;
 	}
 
-	const char* enabledExts[] = { XR_KHR_VULKAN_ENABLE_EXTENSION_NAME };
+	// Refresh-rate control (the Headset Hz setting) is optional: enable it when offered. In
+	// hosted mode this instance is only a probe - the host enables the same extension on its
+	// own instance - but direct mode (SteamVR and friends) uses it from right here.
+	m_supportsRefreshRate = hasExtension(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
+	DEBUG_LOG(("OpenXR: %s: %s", XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME,
+		m_supportsRefreshRate ? "available" : "not offered by this runtime"));
+
+	const char* enabledExts[2] = { XR_KHR_VULKAN_ENABLE_EXTENSION_NAME };
+	uint32_t enabledExtCount = 1;
+	if (m_supportsRefreshRate)
+		enabledExts[enabledExtCount++] = XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME;
 
 	XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO};
 	strcpy(ci.applicationInfo.applicationName, "GeneralsVR");
@@ -260,7 +281,7 @@ Bool OpenXRManager::init()
 	strcpy(ci.applicationInfo.engineName, "SAGE-W3D");
 	ci.applicationInfo.engineVersion = 1;
 	ci.applicationInfo.apiVersion = XR_API_VERSION_1_0;
-	ci.enabledExtensionCount = 1;
+	ci.enabledExtensionCount = enabledExtCount;
 	ci.enabledExtensionNames = enabledExts;
 
 	XrResult result = xrCreateInstance(&ci, &m_instance);
@@ -719,7 +740,122 @@ Bool OpenXRManager::createSession()
 		}
 	}
 
+	queryDisplayRefreshRates();
+
 	return TRUE;
+}
+
+//-------------------------------------------------------------------------------------------------
+// GeneralsVR: the Headset Hz setting (XR_FB_display_refresh_rate). Direct mode only - in hosted
+// mode the host enumerates on its side and the getters below read the shared block instead.
+//-------------------------------------------------------------------------------------------------
+void OpenXRManager::queryDisplayRefreshRates()
+{
+	m_refreshRateCount = 0;
+	if (!m_supportsRefreshRate || m_session == XR_NULL_HANDLE)
+		return;
+
+	xrGetInstanceProcAddr(m_instance, "xrEnumerateDisplayRefreshRatesFB", (PFN_xrVoidFunction*)&m_pEnumRefreshRates);
+	xrGetInstanceProcAddr(m_instance, "xrGetDisplayRefreshRateFB", (PFN_xrVoidFunction*)&m_pGetRefreshRate);
+	xrGetInstanceProcAddr(m_instance, "xrRequestDisplayRefreshRateFB", (PFN_xrVoidFunction*)&m_pRequestRefreshRate);
+	if (m_pEnumRefreshRates == nullptr)
+		return;
+
+	uint32_t n = 0;
+	m_pEnumRefreshRates(m_session, 0, &n, nullptr);
+	std::vector<float> rates(n);
+	if (n == 0 || XR_FAILED(m_pEnumRefreshRates(m_session, n, &n, rates.data())))
+	{
+		DEBUG_LOG(("OpenXR: no display refresh rates enumerated"));
+		return;
+	}
+	if (n > MAX_REFRESH_RATES)
+		n = MAX_REFRESH_RATES;
+	for (uint32_t i = 0; i < n; ++i)
+		m_refreshRates[i] = rates[i];
+	m_refreshRateCount = (Int)n;
+
+	float cur = 0.0f;
+	if (m_pGetRefreshRate != nullptr && XR_SUCCEEDED(m_pGetRefreshRate(m_session, &cur)))
+		m_currentRefreshRate = cur;
+	DEBUG_LOG(("OpenXR: %d display refresh rates offered (current %.0f Hz)",
+		m_refreshRateCount, m_currentRefreshRate));
+}
+
+//-------------------------------------------------------------------------------------------------
+Int OpenXRManager::getDisplayRefreshRateCount() const
+{
+	if (m_hostedMode && m_hostShm != nullptr)
+		return (Int)m_hostShm->refreshRateCount;
+	return m_refreshRateCount;
+}
+
+//-------------------------------------------------------------------------------------------------
+Real OpenXRManager::getDisplayRefreshRate(Int i) const
+{
+	if (m_hostedMode && m_hostShm != nullptr)
+		return (i >= 0 && i < (Int)m_hostShm->refreshRateCount) ? m_hostShm->refreshRates[i] : 0.0f;
+	return (i >= 0 && i < m_refreshRateCount) ? m_refreshRates[i] : 0.0f;
+}
+
+//-------------------------------------------------------------------------------------------------
+Real OpenXRManager::getCurrentDisplayRefreshRate() const
+{
+	if (m_hostedMode && m_hostShm != nullptr)
+		return m_hostShm->currentRefreshRate;
+	return m_currentRefreshRate;
+}
+
+//-------------------------------------------------------------------------------------------------
+/** The stored Headset Hz wish, pushed once the rates are known. Runs every frame and does
+	* nothing when there is nothing pending, so the saved value from vr-settings.ini - loaded
+	* long before any session exists - lands exactly once, whichever mode came up. */
+//-------------------------------------------------------------------------------------------------
+void OpenXRManager::flushDesiredRefreshRate()
+{
+	if (!m_refreshRateDirty)
+		return;
+	const Int count = getDisplayRefreshRateCount();
+	if (count <= 0)
+		return;	// rates not published yet (or extension missing) - stays pending, costs nothing
+
+	// 0 passes through as the spec's "no preference". Anything else must be on the menu the
+	// runtime offered; a stale saved value (Link reconfigured since) is dropped with a log line.
+	Real hz = m_desiredRefreshRate;
+	if (hz != 0.0f)
+	{
+		Bool offered = FALSE;
+		for (Int i = 0; i < count; ++i)
+		{
+			if (fabs(getDisplayRefreshRate(i) - hz) < 0.5f)
+			{
+				hz = getDisplayRefreshRate(i);
+				offered = TRUE;
+				break;
+			}
+		}
+		if (!offered)
+		{
+			DEBUG_LOG(("OpenXR: saved headset rate %.0f Hz is not offered here - keeping the runtime's choice", hz));
+			m_refreshRateDirty = FALSE;
+			return;
+		}
+	}
+
+	if (m_hostedMode && m_hostShm != nullptr)
+	{
+		m_hostShm->requestedRefreshRate = (float)hz;
+		++m_hostShm->refreshRateRequestSeq;
+		DEBUG_LOG(("OpenXR: hosted: asked the host for %.0f Hz (0 = runtime's choice)", hz));
+		m_refreshRateDirty = FALSE;
+	}
+	else if (m_session != XR_NULL_HANDLE && m_pRequestRefreshRate != nullptr)
+	{
+		XrResult r = m_pRequestRefreshRate(m_session, (float)hz);
+		DEBUG_LOG(("OpenXR: refresh rate request %.0f Hz -> %s (%d)",
+			hz, XR_SUCCEEDED(r) ? "accepted" : "REFUSED", (int)r));
+		m_refreshRateDirty = FALSE;
+	}
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -882,7 +1018,8 @@ void OpenXRManager::syncControllers()
 	if (XR_FAILED(xrSyncActions(m_session, &sync)))
 		return;
 
-	// The three-bar menu button: recenter. Edge-triggered.
+	// The three-bar menu button. Just a button here - the policy (short press recenters, a
+	// long press follows the selection) lives in VRControls, same as the hosted path.
 	{
 		XrActionStateGetInfo get = {XR_TYPE_ACTION_STATE_GET_INFO};
 		get.subactionPath = m_handPaths[VR_HAND_LEFT];
@@ -891,14 +1028,19 @@ void OpenXRManager::syncControllers()
 		XrActionStateBoolean state = {XR_TYPE_ACTION_STATE_BOOLEAN};
 		xrGetActionStateBoolean(m_session, &get, &state);
 		const Bool down = state.isActive && state.currentState;
-		if (down && !m_menuButtonDown)
-			recenter();
+		VRControllerState& lc = m_controllersRaw[VR_HAND_LEFT];
+		lc.menuButton = down;
+		lc.menuPressed = down && !m_menuButtonDown;
+		lc.menuReleased = !down && m_menuButtonDown;
 		m_menuButtonDown = down;
 	}
 
 	for (Int hand = 0; hand < VR_HAND_COUNT; ++hand)
 	{
-		VRControllerState& c = m_controllers[hand];
+		// RAW states: edges are computed slot-against-its-own-past here, and the player's
+		// remap (left-handed mirror, A-B swap) is applied on top afterwards - remapping in
+		// place would compare one physical hand's present against the other's past.
+		VRControllerState& c = m_controllersRaw[hand];
 		const Bool wasTrigger = c.trigger;
 		const Bool wasGrip = c.grip;
 		const Bool wasPrimary = c.primaryButton;
@@ -934,6 +1076,7 @@ void OpenXRManager::syncControllers()
 		const Bool wasSecondary = c.secondaryButton;
 		c.secondaryButton = secondaryState.isActive && secondaryState.currentState;
 		c.secondaryPressed = c.secondaryButton && !wasSecondary;
+		c.secondaryReleased = !c.secondaryButton && wasSecondary;
 
 		get.action = m_stickAction;
 		XrActionStateVector2f stickState = {XR_TYPE_ACTION_STATE_VECTOR2F};
@@ -946,6 +1089,7 @@ void OpenXRManager::syncControllers()
 		c.gripPressed = c.grip && !wasGrip;
 		c.gripReleased = !c.grip && wasGrip;
 		c.primaryPressed = c.primaryButton && !wasPrimary;
+		c.primaryReleased = !c.primaryButton && wasPrimary;
 
 		// The aim pose: where the controller is pointing, in our reference space.
 		get.action = m_aimPoseAction;
@@ -970,6 +1114,39 @@ void OpenXRManager::syncControllers()
 				c.posZ = loc.pose.position.z;
 			}
 		}
+	}
+
+	applyControllerRemap();
+}
+
+//-------------------------------------------------------------------------------------------------
+/** The player's controller remap, applied over the raw states both input paths just read. The
+	* left-handed mirror swaps the HANDS wholesale - pose, buttons, edges - so the beam, the
+	* wrist panel, the dials and every modifier change sides by construction, with no consumer
+	* aware anything happened. The A-B swap trades the button families on each controller. */
+//-------------------------------------------------------------------------------------------------
+void OpenXRManager::applyControllerRemap()
+{
+	const Bool lefty = (TheGlobalData != nullptr && TheGlobalData->m_vrLeftHanded);
+	const Bool swapAB = (TheGlobalData != nullptr && TheGlobalData->m_vrSwapFaceButtons);
+
+	for (Int hand = 0; hand < VR_HAND_COUNT; ++hand)
+	{
+		const Int src = lefty ? (VR_HAND_COUNT - 1 - hand) : hand;
+		VRControllerState c = m_controllersRaw[src];
+
+		if (swapAB)
+		{
+			const Bool b = c.primaryButton, p = c.primaryPressed, r = c.primaryReleased;
+			c.primaryButton = c.secondaryButton;
+			c.primaryPressed = c.secondaryPressed;
+			c.primaryReleased = c.secondaryReleased;
+			c.secondaryButton = b;
+			c.secondaryPressed = p;
+			c.secondaryReleased = r;
+		}
+
+		m_controllers[hand] = c;
 	}
 }
 
@@ -1111,23 +1288,36 @@ Bool OpenXRManager::createSwapchains()
 //-------------------------------------------------------------------------------------------------
 Bool OpenXRManager::createEyeTargets(IDirect3DDevice8* device)
 {
+	// Supersampling: render the eyes LARGER than the headset asks and filter down at the copy.
+	// This is the anti-aliasing this pipeline can actually have (there is no MSAA hook through
+	// the D3D8 path); the downscale's linear filter smooths edges. Chosen in the VR settings
+	// menu, read once here - it takes effect on the next launch.
+	Real ssScale = 1.0f;
+	if (TheGlobalData != nullptr)
+	{
+		if (TheGlobalData->m_vrSuperSample == 1) ssScale = 1.3f;
+		else if (TheGlobalData->m_vrSuperSample == 2) ssScale = 1.5f;
+	}
+	m_renderWidth = (Int)(m_eyeWidth * ssScale);
+	m_renderHeight = (Int)(m_eyeHeight * ssScale);
+
 	// The engine's own depth buffer is backbuffer-sized, which is smaller than an eye target,
 	// so the eye passes need their own.
-	if (FAILED(device->CreateDepthStencilSurface(m_eyeWidth, m_eyeHeight, D3DFMT_D24S8,
+	if (FAILED(device->CreateDepthStencilSurface(m_renderWidth, m_renderHeight, D3DFMT_D24S8,
 		D3DMULTISAMPLE_NONE, &m_depthSurface)))
 	{
 		DEBUG_LOG(("OpenXR: eye targets: CreateDepthStencilSurface FAILED (%dx%d)",
-			m_eyeWidth, m_eyeHeight));
+			m_renderWidth, m_renderHeight));
 		return FALSE;
 	}
 
 	for (Int eye = 0; eye < m_eyeCount; ++eye)
 	{
-		if (FAILED(device->CreateTexture(m_eyeWidth, m_eyeHeight, 1, D3DUSAGE_RENDERTARGET,
+		if (FAILED(device->CreateTexture(m_renderWidth, m_renderHeight, 1, D3DUSAGE_RENDERTARGET,
 			D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &m_eyeTextures[eye])))
 		{
 			DEBUG_LOG(("OpenXR: eye targets: CreateTexture FAILED for eye %d (%dx%d)",
-				eye, m_eyeWidth, m_eyeHeight));
+				eye, m_renderWidth, m_renderHeight));
 			return FALSE;
 		}
 		if (FAILED(m_eyeTextures[eye]->GetSurfaceLevel(0, &m_eyeSurfaces[eye])))
@@ -1152,8 +1342,8 @@ Bool OpenXRManager::createEyeTargets(IDirect3DDevice8* device)
 		}
 	}
 
-	DEBUG_LOG(("OpenXR: eye targets: %d D3D8 render targets %dx%d, VkImages bound (layout %d)",
-		m_eyeCount, m_eyeWidth, m_eyeHeight, (int)m_eyeImageLayout));
+	DEBUG_LOG(("OpenXR: eye targets: %d D3D8 render targets %dx%d (output %dx%d), VkImages bound (layout %d)",
+		m_eyeCount, m_renderWidth, m_renderHeight, m_eyeWidth, m_eyeHeight, (int)m_eyeImageLayout));
 	return TRUE;
 }
 
@@ -1629,6 +1819,30 @@ void OpenXRManager::layoutUiPanels()
 		return;
 	}
 
+	// A radial menu is up: hang the crop VRControls painted (the pie itself) at the pose frozen
+	// when it opened, so the dial holds still in front of the player while the stick flicks.
+	if (m_radialActive && m_radialCropW > 0 && m_radialCropH > 0)
+	{
+		UiPanel& p = m_uiPanels[UI_PANEL_SCREEN];
+		p.active = TRUE;
+		p.ownerHand = -1;
+		p.isGroupBar = FALSE;
+		p.onTop = TRUE;	// a menu must be readable: terrain and buildings cannot hide it
+		p.pose.orientation.x = m_radialQuatX;
+		p.pose.orientation.y = m_radialQuatY;
+		p.pose.orientation.z = m_radialQuatZ;
+		p.pose.orientation.w = m_radialQuatW;
+		p.pose.position.x = m_radialPosX;
+		p.pose.position.y = m_radialPosY;
+		p.pose.position.z = m_radialPosZ;
+		p.widthMeters = 0.5f;
+		p.heightMeters = p.widthMeters * (Real)m_radialCropH / (Real)m_radialCropW;
+		p.cropX = m_radialCropX;
+		p.cropY = m_radialCropY;
+		p.cropW = m_radialCropW;
+		p.cropH = m_radialCropH;
+	}
+
 	// In a battle the panels stay OUT OF THE WAY until summoned: a panel floating permanently
 	// over your hand is in the way exactly when you are moving units. Each hand's secondary
 	// button (B / Y) calls up that hand's panel, which carries the game's whole bottom HUD -
@@ -1645,7 +1859,7 @@ void OpenXRManager::layoutUiPanels()
 		// summon is an overlay, not a toggle: when the menu closes, the panel goes back to
 		// whatever the player had chosen.
 		const Bool summoned = m_wristPanelOpen[hand]
-			|| (hand == VR_HAND_LEFT && m_uiMenuOpen);
+			|| (hand == VR_HAND_LEFT && (m_uiMenuOpen || m_uiDialOpen));
 		if (!summoned)
 			continue;
 
@@ -1755,7 +1969,7 @@ Bool OpenXRManager::getPanelInfo(Int index, VRPanelInfo &out) const
 
 //-------------------------------------------------------------------------------------------------
 OpenXRManager::VRPickKind OpenXRManager::pickUiPanel(Int hand, Int &outX, Int &outY,
-	Real *outDistanceMeters) const
+	Real *outDistanceMeters, Int *outHandPixelX, Int *outHandPixelY) const
 {
 	if (!m_uiReady || hand < 0 || hand >= VR_HAND_COUNT)
 		return VR_PICK_NONE;
@@ -1825,6 +2039,18 @@ OpenXRManager::VRPickKind OpenXRManager::pickUiPanel(Int hand, Int &outX, Int &o
 			outX = p.cropX + (Int)(u * p.cropW);
 			outY = p.cropY + (Int)(v * p.cropH);
 			hit = VR_PICK_SCREEN;
+
+			// The hand itself, dropped straight onto the panel plane: the near end of the 2D
+			// beam drawn ON the panel. Deliberately unclamped - off-frame is fine for a line.
+			if (outHandPixelX != nullptr || outHandPixelY != nullptr)
+			{
+				const Real hu = (localOrigin.x + halfW) / p.widthMeters;
+				const Real hv = 1.0f - (localOrigin.y + halfH) / p.heightMeters;
+				if (outHandPixelX != nullptr)
+					*outHandPixelX = p.cropX + (Int)(hu * p.cropW);
+				if (outHandPixelY != nullptr)
+					*outHandPixelY = p.cropY + (Int)(hv * p.cropH);
+			}
 		}
 
 		bestDistance = t;
@@ -2041,11 +2267,20 @@ Bool OpenXRManager::hostedStart()
 	char cmdLine[MAX_PATH * 2];
 	sprintf(cmdLine, "\"%s%s\" %lu", exePath, VR_HOST_EXE_NAME, (unsigned long)GetCurrentProcessId());
 
+	// The host writes xrhost_log.txt into its WORKING directory; in the packaged layout the
+	// Debug\ folder sits beside Data\, and starting the host there puts its log with all the
+	// others - no host rebuild needed.
+	char hostCwd[MAX_PATH];
+	sprintf(hostCwd, "%s..\\Debug\\", exePath);
+	const DWORD cwdAttrs = GetFileAttributesA(hostCwd);
+	if (cwdAttrs == INVALID_FILE_ATTRIBUTES || !(cwdAttrs & FILE_ATTRIBUTE_DIRECTORY))
+		strcpy(hostCwd, exePath);
+
 	STARTUPINFOA si = {};
 	si.cb = sizeof(si);
 	PROCESS_INFORMATION pi = {};
 	if (!CreateProcessA(nullptr, cmdLine, nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
-		nullptr, exePath, &si, &pi))
+		nullptr, hostCwd, &si, &pi))
 	{
 		DEBUG_LOG(("OpenXR: hosted: could not start %s (%lu)", VR_HOST_EXE_NAME, GetLastError()));
 		return FALSE;
@@ -2300,6 +2535,9 @@ void OpenXRManager::hostedBeginFrame()
 		return;
 	}
 
+	// A stored Headset Hz wish rides across to the host once its rate menu is published.
+	flushDesiredRefreshRate();
+
 	// Headset off the head: the runtime throttles the host's xrWaitFrame and then pauses the
 	// session outright, so hostFrameIndex crawls and finally freezes - and pacing on it would
 	// hold EVERY game frame for the full timeout below, dragging the monitor game to ~10 fps
@@ -2373,7 +2611,8 @@ void OpenXRManager::hostedBeginFrame()
 	for (Int hand = 0; hand < VR_HAND_COUNT; ++hand)
 	{
 		const VRHostController& hc = snap.controller[hand];
-		VRControllerState& c = m_controllers[hand];
+		// Raw slot; the player's remap is layered on afterwards (see applyControllerRemap).
+		VRControllerState& c = m_controllersRaw[hand];
 		const UnsignedInt prev = m_prevHostButtons[hand];
 		const UnsignedInt now = hc.buttons;
 
@@ -2385,8 +2624,10 @@ void OpenXRManager::hostedBeginFrame()
 		c.gripReleased = !c.grip && (prev & VR_HOST_BTN_GRIP);
 		c.primaryButton = (now & VR_HOST_BTN_PRIMARY) != 0;
 		c.primaryPressed = c.primaryButton && !(prev & VR_HOST_BTN_PRIMARY);
+		c.primaryReleased = !c.primaryButton && (prev & VR_HOST_BTN_PRIMARY);
 		c.secondaryButton = (now & VR_HOST_BTN_SECONDARY) != 0;
 		c.secondaryPressed = c.secondaryButton && !(prev & VR_HOST_BTN_SECONDARY);
+		c.secondaryReleased = !c.secondaryButton && (prev & VR_HOST_BTN_SECONDARY);
 		c.stickClick = (now & VR_HOST_BTN_STICKCLICK) != 0;
 		c.stickClickPressed = c.stickClick && !(prev & VR_HOST_BTN_STICKCLICK);
 		c.stickX = hc.stickX;
@@ -2399,12 +2640,15 @@ void OpenXRManager::hostedBeginFrame()
 			c.posX = hc.aimPose.posX; c.posY = hc.aimPose.posY; c.posZ = hc.aimPose.posZ;
 		}
 
-		// the three-bar button recenters, exactly like the direct path
-		if ((now & VR_HOST_BTN_MENU) && !(prev & VR_HOST_BTN_MENU))
-			recenter();
+		// The three-bar button: raw state only; VRControls owns the short/long-press policy.
+		c.menuButton = (now & VR_HOST_BTN_MENU) != 0;
+		c.menuPressed = c.menuButton && !(prev & VR_HOST_BTN_MENU);
+		c.menuReleased = !c.menuButton && (prev & VR_HOST_BTN_MENU);
 
 		m_prevHostButtons[hand] = now;
 	}
+
+	applyControllerRemap();
 
 	// Unfocused frames are flat frames: no stereo pass, no eye copies, no controller input.
 	// The snapshot above still ran, so focus returning is seen on the very next game frame.
@@ -2469,18 +2713,41 @@ void OpenXRManager::hostedSubmitFrame(Bool worldRendered)
 			VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
 			0, 0, nullptr, 0, nullptr, 2, pre);
 
-		VkImageCopy copy = {};
-		copy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-		copy.srcSubresource.layerCount = 1;
-		copy.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-		copy.dstSubresource.layerCount = 1;
-		copy.extent.width = (uint32_t)m_eyeWidth;
-		copy.extent.height = (uint32_t)m_eyeHeight;
-		copy.extent.depth = 1;
-		g_vk.cmdCopyImage(m_vkCommandBuffer,
-			src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-			m_exportImages[eye], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-			1, &copy);
+		if (m_renderWidth != m_eyeWidth || m_renderHeight != m_eyeHeight)
+		{
+			// Supersampled: filter the big render down into the host's image. The linear
+			// filter in this blit IS the anti-aliasing.
+			VkImageBlit blit = {};
+			blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			blit.srcSubresource.layerCount = 1;
+			blit.srcOffsets[1].x = m_renderWidth;
+			blit.srcOffsets[1].y = m_renderHeight;
+			blit.srcOffsets[1].z = 1;
+			blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			blit.dstSubresource.layerCount = 1;
+			blit.dstOffsets[1].x = m_eyeWidth;
+			blit.dstOffsets[1].y = m_eyeHeight;
+			blit.dstOffsets[1].z = 1;
+			g_vk.cmdBlitImage(m_vkCommandBuffer,
+				src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+				m_exportImages[eye], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				1, &blit, VK_FILTER_LINEAR);
+		}
+		else
+		{
+			VkImageCopy copy = {};
+			copy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			copy.srcSubresource.layerCount = 1;
+			copy.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			copy.dstSubresource.layerCount = 1;
+			copy.extent.width = (uint32_t)m_eyeWidth;
+			copy.extent.height = (uint32_t)m_eyeHeight;
+			copy.extent.depth = 1;
+			g_vk.cmdCopyImage(m_vkCommandBuffer,
+				src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+				m_exportImages[eye], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				1, &copy);
+		}
 
 		VkImageMemoryBarrier post = pre[0];
 		post.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -2717,6 +2984,14 @@ void OpenXRManager::beginFrame()
 				m_sessionRunning = FALSE;
 			}
 		}
+		else if (ev.type == XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB)
+		{
+			const XrEventDataDisplayRefreshRateChangedFB* rr =
+				(const XrEventDataDisplayRefreshRateChangedFB*)&ev;
+			m_currentRefreshRate = rr->toDisplayRefreshRate;
+			DEBUG_LOG(("OpenXR: display refresh rate changed: %.0f -> %.0f Hz",
+				rr->fromDisplayRefreshRate, rr->toDisplayRefreshRate));
+		}
 		else if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING)
 		{
 			m_sessionRunning = FALSE;
@@ -2730,6 +3005,8 @@ void OpenXRManager::beginFrame()
 
 	if (!m_sessionRunning)
 		return;
+
+	flushDesiredRefreshRate();
 
 	XrFrameWaitInfo waitInfo = {XR_TYPE_FRAME_WAIT_INFO};
 	XrFrameState frameState = {XR_TYPE_FRAME_STATE};
@@ -2863,19 +3140,42 @@ Bool OpenXRManager::recordAndSubmitCopies(const UnsignedInt* imageIndices, Bool 
 			VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
 			0, 0, nullptr, 0, nullptr, 2, pre);
 
-		VkImageCopy copy = {};
-		copy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-		copy.srcSubresource.layerCount = 1;
-		copy.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-		copy.dstSubresource.layerCount = 1;
-		copy.extent.width = (uint32_t)m_eyeWidth;
-		copy.extent.height = (uint32_t)m_eyeHeight;
-		copy.extent.depth = 1;
+		if (m_renderWidth != m_eyeWidth || m_renderHeight != m_eyeHeight)
+		{
+			// Supersampled: filter the big render down into the swapchain image. The linear
+			// filter in this blit IS the anti-aliasing.
+			VkImageBlit blit = {};
+			blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			blit.srcSubresource.layerCount = 1;
+			blit.srcOffsets[1].x = m_renderWidth;
+			blit.srcOffsets[1].y = m_renderHeight;
+			blit.srcOffsets[1].z = 1;
+			blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			blit.dstSubresource.layerCount = 1;
+			blit.dstOffsets[1].x = m_eyeWidth;
+			blit.dstOffsets[1].y = m_eyeHeight;
+			blit.dstOffsets[1].z = 1;
+			g_vk.cmdBlitImage(m_vkCommandBuffer,
+				src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+				dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				1, &blit, VK_FILTER_LINEAR);
+		}
+		else
+		{
+			VkImageCopy copy = {};
+			copy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			copy.srcSubresource.layerCount = 1;
+			copy.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			copy.dstSubresource.layerCount = 1;
+			copy.extent.width = (uint32_t)m_eyeWidth;
+			copy.extent.height = (uint32_t)m_eyeHeight;
+			copy.extent.depth = 1;
 
-		g_vk.cmdCopyImage(m_vkCommandBuffer,
-			src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-			dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-			1, &copy);
+			g_vk.cmdCopyImage(m_vkCommandBuffer,
+				src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+				dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				1, &copy);
+		}
 
 		// Restore the source to the layout DXVK believes it is in, and hand the swapchain
 		// image to the compositor in the layout OpenXR requires.

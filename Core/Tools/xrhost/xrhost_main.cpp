@@ -73,6 +73,12 @@ struct Host
 	XrSpace aimSpace[2] = {};
 
 	uint32_t recenterSeen = 0;
+
+	// XR_FB_display_refresh_rate (optional): lets the game ask the headset for 72/80/90/120 Hz
+	PFN_xrEnumerateDisplayRefreshRatesFB pEnumRefreshRates = nullptr;
+	PFN_xrGetDisplayRefreshRateFB pGetRefreshRate = nullptr;
+	PFN_xrRequestDisplayRefreshRateFB pRequestRefreshRate = nullptr;
+	uint32_t refreshSeen = 0;
 };
 
 static void writePose(VRHostPose& out, const XrPosef& p, uint32_t valid)
@@ -324,11 +330,27 @@ int main(int argc, char** argv)
 	h.gameProcess = OpenProcess(SYNCHRONIZE, FALSE, gamePid);
 
 	// --- OpenXR bring-up (the recipe both 64-bit probes proved) ---
-	const char* exts[] = { XR_KHR_D3D11_ENABLE_EXTENSION_NAME };
+	// Refresh-rate control is an optional extension: probe for it, enable it when the runtime
+	// has it, and say so in the log either way - whether Link exposes it decides whether the
+	// game's Headset Hz setting can work at all.
+	const char* exts[2] = { XR_KHR_D3D11_ENABLE_EXTENSION_NAME };
+	uint32_t extCount = 1;
+	bool haveRefreshExt = false;
+	{
+		uint32_t n = 0;
+		xrEnumerateInstanceExtensionProperties(nullptr, 0, &n, nullptr);
+		std::vector<XrExtensionProperties> props(n, { XR_TYPE_EXTENSION_PROPERTIES });
+		if (n > 0 && XR_SUCCEEDED(xrEnumerateInstanceExtensionProperties(nullptr, n, &n, props.data())))
+			for (uint32_t i = 0; i < n; ++i)
+				if (strcmp(props[i].extensionName, XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME) == 0)
+					haveRefreshExt = true;
+		L("%s: %s", XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME, haveRefreshExt ? "available" : "NOT offered by this runtime");
+		if (haveRefreshExt) exts[extCount++] = XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME;
+	}
 	XrInstanceCreateInfo ici = { XR_TYPE_INSTANCE_CREATE_INFO };
 	strcpy(ici.applicationInfo.applicationName, "GeneralsVR");
 	ici.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
-	ici.enabledExtensionCount = 1; ici.enabledExtensionNames = exts;
+	ici.enabledExtensionCount = extCount; ici.enabledExtensionNames = exts;
 	if (XR_FAILED(xrCreateInstance(&ici, &h.instance)))
 	{ h.shm->state = VRHOST_STATE_NO_RUNTIME; L("xrCreateInstance failed"); return 4; }
 
@@ -379,6 +401,38 @@ int main(int argc, char** argv)
 	if (XR_FAILED(xrCreateSession(h.instance, &sci, &h.session)))
 	{ h.shm->state = VRHOST_STATE_NO_RUNTIME; L("xrCreateSession failed"); return 8; }
 	L("session created (64-bit path)");
+
+	// Publish the refresh-rate menu before the game connects: by the time it sees our resources
+	// it can already read what the headset offers. Count 0 = no extension = no choice to offer.
+	if (haveRefreshExt)
+	{
+		xrGetInstanceProcAddr(h.instance, "xrEnumerateDisplayRefreshRatesFB", (PFN_xrVoidFunction*)&h.pEnumRefreshRates);
+		xrGetInstanceProcAddr(h.instance, "xrGetDisplayRefreshRateFB", (PFN_xrVoidFunction*)&h.pGetRefreshRate);
+		xrGetInstanceProcAddr(h.instance, "xrRequestDisplayRefreshRateFB", (PFN_xrVoidFunction*)&h.pRequestRefreshRate);
+		if (h.pEnumRefreshRates)
+		{
+			uint32_t n = 0;
+			h.pEnumRefreshRates(h.session, 0, &n, nullptr);
+			std::vector<float> rates(n);
+			if (n > 0 && XR_SUCCEEDED(h.pEnumRefreshRates(h.session, n, &n, rates.data())))
+			{
+				if (n > VR_HOST_MAX_REFRESH_RATES) n = VR_HOST_MAX_REFRESH_RATES;
+				char list[160] = ""; size_t at = 0;
+				for (uint32_t i = 0; i < n; ++i)
+				{
+					h.shm->refreshRates[i] = rates[i];
+					at += snprintf(list + at, sizeof(list) - at, "%s%.0f", i ? ", " : "", rates[i]);
+				}
+				h.shm->refreshRateCount = n;
+				L("display refresh rates offered: %s Hz", list);
+			}
+			else
+				L("xrEnumerateDisplayRefreshRatesFB returned no rates");
+		}
+		float cur = 0.0f;
+		if (h.pGetRefreshRate && XR_SUCCEEDED(h.pGetRefreshRate(h.session, &cur)))
+		{ h.shm->currentRefreshRate = cur; L("current display refresh rate: %.0f Hz", cur); }
+	}
 
 	XrReferenceSpaceCreateInfo rsci = { XR_TYPE_REFERENCE_SPACE_CREATE_INFO };
 	rsci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
@@ -463,6 +517,12 @@ int main(int argc, char** argv)
 				else if (h.sessionState == XR_SESSION_STATE_EXITING || h.sessionState == XR_SESSION_STATE_LOSS_PENDING)
 				{ L("session lost"); h.shm->state = VRHOST_STATE_SESSION_LOST; quit = true; }
 			}
+			else if (ev.type == XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB)
+			{
+				const XrEventDataDisplayRefreshRateChangedFB* rr = (const XrEventDataDisplayRefreshRateChangedFB*)&ev;
+				h.shm->currentRefreshRate = rr->toDisplayRefreshRate;
+				L("display refresh rate changed: %.0f -> %.0f Hz", rr->fromDisplayRefreshRate, rr->toDisplayRefreshRate);
+			}
 			ev = { XR_TYPE_EVENT_DATA_BUFFER };
 		}
 		if (quit) break;
@@ -509,6 +569,25 @@ int main(int argc, char** argv)
 		pumpControllers(h, fs.predictedDisplayTime);
 		h.shm->hostFrameIndex = ++frame;
 		h.shm->frameSeq++;
+
+		// The game's Headset Hz wish. It is only ever a REQUEST: the runtime may refuse (result
+		// logged), and the actual rate comes back through the CHANGED event above. Polled once
+		// per request too, for runtimes that switch without sending the event.
+		if (h.shm->refreshRateRequestSeq != h.refreshSeen)
+		{
+			h.refreshSeen = h.shm->refreshRateRequestSeq;
+			if (h.pRequestRefreshRate)
+			{
+				const float want = h.shm->requestedRefreshRate;
+				XrResult r = h.pRequestRefreshRate(h.session, want);
+				h.shm->refreshRateResult = (int32_t)r;
+				L("refresh rate request %.0f Hz -> %s (%d)", want, XR_SUCCEEDED(r) ? "accepted" : "REFUSED", (int)r);
+				float cur = 0.0f;
+				if (h.pGetRefreshRate && XR_SUCCEEDED(h.pGetRefreshRate(h.session, &cur)))
+					h.shm->currentRefreshRate = cur;
+			}
+			h.shm->refreshRateAppliedSeq = h.refreshSeen;
+		}
 
 		if (h.shm->recenterRequests != h.recenterSeen)
 		{

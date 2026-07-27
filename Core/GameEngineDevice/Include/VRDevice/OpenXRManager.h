@@ -77,10 +77,18 @@ struct VRControllerState
 	Real stickX, stickY;  ///< -1..1
 	Bool primaryButton;   ///< A / X  - hold while clicking a group slot to ASSIGN it
 	Bool primaryPressed;
+	Bool primaryReleased = FALSE;
 	Bool secondaryButton; ///< B / Y  - left one forces attack; right one toggles the panel
 	Bool secondaryPressed;
+	Bool secondaryReleased = FALSE; ///< the panel toggle fires on a SHORT release (long = radial)
 	Bool stickClick;      ///< pressing the thumbstick in
 	Bool stickClickPressed;
+
+	// The three-bar menu button (left controller only; stays FALSE on the right). Raw state -
+	// the POLICY (short press = recenter, long press = follow) lives in VRControls.
+	Bool menuButton = FALSE;
+	Bool menuPressed = FALSE;
+	Bool menuReleased = FALSE;
 };
 
 enum VRHand { VR_HAND_LEFT = 0, VR_HAND_RIGHT = 1, VR_HAND_COUNT = 2 };
@@ -119,8 +127,21 @@ public:
 	void beginFrame();
 
 	Int getEyeCount() const { return m_eyeCount; }
-	Int getEyeWidth() const { return m_eyeWidth; }
-	Int getEyeHeight() const { return m_eyeHeight; }
+	/// The size the ENGINE renders eyes at. With supersampling on this is larger than what the
+	/// headset receives; the downscale happens in the submit copy.
+	Int getEyeWidth() const { return (m_renderWidth > 0) ? m_renderWidth : m_eyeWidth; }
+	Int getEyeHeight() const { return (m_renderHeight > 0) ? m_renderHeight : m_eyeHeight; }
+
+	/// The headset refresh rates the runtime offers (XR_FB_display_refresh_rate). A count of 0
+	/// means the extension is missing - the rate is then whatever the runtime (or the Meta Link
+	/// app's device settings) is configured to, and there is no choice to put on a menu.
+	Int getDisplayRefreshRateCount() const;
+	Real getDisplayRefreshRate(Int i) const;    ///< Hz; 0 for an out-of-range index
+	Real getCurrentDisplayRefreshRate() const;  ///< Hz the runtime reports now (0 = unknown)
+	/// Ask the headset to run at \a hz (0 = let the runtime choose). Safe to call at any time,
+	/// including before the session exists: the wish is stored and pushed once the rates are
+	/// known - which is how the value saved in vr-settings.ini gets applied at startup.
+	void setDesiredRefreshRate(Real hz) { m_desiredRefreshRate = hz; m_refreshRateDirty = TRUE; }
 
 	/// Valid only while isFrameActive().
 	const VREyeView& getEyeView(Int eye) const { return m_eyeViews[eye]; }
@@ -174,6 +195,32 @@ public:
 	/// secondary button, so it never floats in the way while they are moving units.
 	void toggleWristPanel(Int hand);
 	Bool isWristPanelOpen(Int hand) const { return m_wristPanelOpen[hand]; }
+	/// Matches start with the HUD panel already on the hand; VRControls sets this on entry.
+	void setWristPanelOpen(Int hand, Bool open)
+	{ if (hand >= 0 && hand < VR_HAND_COUNT) m_wristPanelOpen[hand] = open; }
+
+	/// A radial dial is open: keep the left panel summoned so the dial has somewhere to be
+	/// seen, WITHOUT the menu gating (the battlefield stays live under a dial).
+	void setUiDialOpen(Bool open) { m_uiDialOpen = open; }
+
+	/// Apply the player's controller remap (left-handed mirror, A-B swap) to the states just
+	/// read from the runtime. Both input paths call it last, so every consumer - rays, panels,
+	/// group bar, radials - sees the remapped world and mirrors by construction.
+	void applyControllerRemap();
+
+	/// A radial (pie) menu is being shown: hang the crop of the interface texture VRControls
+	/// painted it into as a panel at the given pose (VR reference space, metres). The pose is
+	/// captured when the radial opens so the dial holds still while the stick flicks at it.
+	void setRadialPanel(Bool active,
+		Real posX = 0.0f, Real posY = 0.0f, Real posZ = 0.0f,
+		Real quatX = 0.0f, Real quatY = 0.0f, Real quatZ = 0.0f, Real quatW = 1.0f,
+		Int cropX = 0, Int cropY = 0, Int cropW = 0, Int cropH = 0)
+	{
+		m_radialActive = active;
+		m_radialPosX = posX; m_radialPosY = posY; m_radialPosZ = posZ;
+		m_radialQuatX = quatX; m_radialQuatY = quatY; m_radialQuatZ = quatZ; m_radialQuatW = quatW;
+		m_radialCropX = cropX; m_radialCropY = cropY; m_radialCropW = cropW; m_radialCropH = cropH;
+	}
 
 	/// What a hand's ray is currently pointing at.
 	enum VRPickKind { VR_PICK_NONE = 0, VR_PICK_SCREEN, VR_PICK_GROUP_SLOT };
@@ -183,7 +230,11 @@ public:
 	///                       the engine can feed to the mouse as if it were a real cursor.
 	/// VR_PICK_GROUP_SLOT -> outX is the control group (0-9) under the ray.
 	/// Also reports how far away the hit was, so the laser can be drawn stopping at the panel.
-	VRPickKind pickUiPanel(Int hand, Int &outX, Int &outY, Real *outDistanceMeters = nullptr) const;
+	/// outHandPixelX/Y is the HAND's own position dropped perpendicular onto the panel, as a
+	/// frame pixel (may lie outside the frame): the 2D beam drawn ON the panel runs from there
+	/// to the hit, which is how the laser stays visible when a hosted quad would cover it.
+	VRPickKind pickUiPanel(Int hand, Int &outX, Int &outY, Real *outDistanceMeters = nullptr,
+		Int *outHandPixelX = nullptr, Int *outHandPixelY = nullptr) const;
 
 	/// The surface the engine draws the game's real 2D interface into, once per frame, with a
 	/// transparent background. Showing THAT beats copying the finished frame: a crop of the
@@ -330,12 +381,28 @@ private:
 	Bool m_menuButtonDown;
 	XrPath m_handPaths[VR_HAND_COUNT];
 	XrSpace m_aimSpaces[VR_HAND_COUNT];
-	VRControllerState m_controllers[VR_HAND_COUNT];
+	VRControllerState m_controllers[VR_HAND_COUNT];      ///< what consumers see: raw + player remap
+	VRControllerState m_controllersRaw[VR_HAND_COUNT];   ///< straight from the runtime; edges live here
 	Bool m_actionsReady;
 
 	Bool m_supportsVulkan;   ///< XR_KHR_vulkan_enable2
 	Bool m_supportsVulkan1;  ///< XR_KHR_vulkan_enable (accepts DXVK's existing VkDevice)
 	Bool m_supportsD3D11;
+
+	// XR_FB_display_refresh_rate: the Headset Hz setting. Direct mode talks to the runtime
+	// itself; hosted mode reads/writes the same information through the shared block.
+	enum { MAX_REFRESH_RATES = 8 };
+	Bool m_supportsRefreshRate;
+	PFN_xrEnumerateDisplayRefreshRatesFB m_pEnumRefreshRates;
+	PFN_xrGetDisplayRefreshRateFB m_pGetRefreshRate;
+	PFN_xrRequestDisplayRefreshRateFB m_pRequestRefreshRate;
+	Int m_refreshRateCount;
+	Real m_refreshRates[MAX_REFRESH_RATES];
+	Real m_currentRefreshRate;
+	Real m_desiredRefreshRate;   ///< Hz the player wants; 0 = runtime's choice
+	Bool m_refreshRateDirty;     ///< wish not yet pushed to the runtime/host
+	void queryDisplayRefreshRates();  ///< direct mode, once the session exists
+	void flushDesiredRefreshRate();   ///< per frame until the stored wish has been pushed
 
 	// DXVK / Vulkan interop
 	struct ID3D9VkInteropDevice* m_dxvkInterop;
@@ -400,6 +467,18 @@ private:
 	Real m_fixedHudForward; ///< metres in front the frame's near edge sits
 	Real m_fixedHudAlpha;   ///< HUD opacity 0..1 (faded when the mouse is not over it)
 	Bool m_uiMenuOpen;      ///< an in-game menu/dialog is up: give it a panel the ray can reach
+	Bool m_uiDialOpen = FALSE; ///< a radial dial is up: same panel summon, none of the gating
+
+	// Supersampling: the engine renders eyes at this size; the submit blit filters down to
+	// m_eyeWidth/Height (what the runtime/host actually receives). Equal sizes = plain copy.
+	Int m_renderWidth = 0;
+	Int m_renderHeight = 0;
+
+	// The radial menu panel, set per open by VRControls (pose frozen at open).
+	Bool m_radialActive = FALSE;
+	Real m_radialPosX = 0.0f, m_radialPosY = 0.0f, m_radialPosZ = 0.0f;
+	Real m_radialQuatX = 0.0f, m_radialQuatY = 0.0f, m_radialQuatZ = 0.0f, m_radialQuatW = 1.0f;
+	Int m_radialCropX = 0, m_radialCropY = 0, m_radialCropW = 0, m_radialCropH = 0;
 	Bool m_uiReady;
 	Bool m_showFlatFrame;   ///< capture the backbuffer, not the UI layer (movies)
 	UiPanel m_uiPanels[UI_PANEL_COUNT];
