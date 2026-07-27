@@ -201,6 +201,8 @@ if(RTS_BUILD_OPTION_VR AND (WIN32 OR "${CMAKE_SYSTEM}" MATCHES "Windows"))
     target_sources(z_gameenginedevice PRIVATE
         Include/VRDevice/VRControls.h
         Source/VRDevice/VRControls.cpp
+        Include/VRDevice/VRSettingsMenu.h
+        Source/VRDevice/VRSettingsMenu.cpp
     )
 endif()
 

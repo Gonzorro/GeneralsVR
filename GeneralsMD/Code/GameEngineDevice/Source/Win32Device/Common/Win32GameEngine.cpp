@@ -41,6 +41,7 @@
 #ifdef RTS_HAS_OPENXR
 #include "VRDevice/OpenXRManager.h"
 #include "VRDevice/VRControls.h"
+#include "VRDevice/VRSettingsMenu.h"
 #include "GameClient/GameClient.h"
 #include "dx8wrapper.h"
 
@@ -72,6 +73,8 @@ Win32GameEngine::~Win32GameEngine()
 	// GeneralsVR @feature Tear down VR after the engine has shut down. The hook must go first:
 	// it points at a manager that is about to stop existing.
 	GameClient::setMovieAbortHook(nullptr);
+	delete TheVRSettingsMenu;
+	TheVRSettingsMenu = nullptr;
 	delete TheVRControls;
 	TheVRControls = nullptr;
 	delete TheOpenXR;
@@ -100,6 +103,12 @@ void Win32GameEngine::init()
 		TheOpenXR = NEW OpenXRManager;
 		if (TheOpenXR->init())
 		{
+			// The settings menu FIRST: its constructor loads vr-settings.ini, and graphics
+			// init below reads those values (render quality sizes the eye targets). Loading
+			// after graphics meant supersampling silently never applied.
+			if (TheVRSettingsMenu == nullptr)
+				TheVRSettingsMenu = NEW VRSettingsMenu;
+
 			// The D3D device exists by now (created during GameEngine::init), so the session
 			// can be built on the Vulkan device DXVK created behind it.
 			TheOpenXR->initGraphics(DX8Wrapper::_Get_D3D_Device8());

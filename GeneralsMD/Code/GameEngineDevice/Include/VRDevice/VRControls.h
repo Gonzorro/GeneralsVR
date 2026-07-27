@@ -78,6 +78,19 @@ public:
 	/// panel for a beam that is pointing somewhere else entirely.
 	Bool isRayOnScreenPanel() const { return m_rayOnScreenPanel; }
 
+	/// An in-game menu or dialog is up (measured from the window system each frame).
+	Bool isMenuOpen() const { return m_menuOpen; }
+	/// Specifically a MODAL menu (the Escape menu and what it opens) - the promotion screen is
+	/// not modal, and only modal menus get the solid black backing on the panel.
+	Bool isModalMenuOpen() const { return m_modalMenuOpen; }
+	/// The screen rect of the window that menu detection found (the biggest one), while a menu
+	/// is up. The VR settings badge rides its bottom-right corner.
+	Bool getMenuWindowRect(Int &x, Int &y, Int &w, Int &h) const;
+
+	/// Paint the open radial menu (if any) into the VR interface capture. Called by the display
+	/// from inside the capture pass, after the game's own UI.
+	void drawRadialsIntoCapture();
+
 	/// True while the on-screen cursor should be shown on the VR menu panel: the cursor has moved
 	/// recently, whether by the physical mouse or a controller ray. Fades after a few idle seconds.
 	Bool isCursorActive() const { return m_cursorActive; }
@@ -193,6 +206,22 @@ private:
 	void updatePanelToggles();
 	void applyControlGroup(Int slot, Bool assign);
 
+	/// The radial (pie) menus: tap the LEFT stick in for commands (stop, attack-move, guard...),
+	/// LONG-press the right B for control groups 1-10. Flick the stick to a sector, let it
+	/// return to centre and the sector fires - both radials are one-thumb gestures, which is
+	/// why they open on a TAP and stay (a thumb cannot hold B and flick the stick it sits on).
+	void updateRadials();
+	void openRadial(Int kind);
+	void closeRadial();
+	void fireRadialSector(Int kind, Int sector);
+	/// Radial geometry shared by input and drawing: centre/radius in screen pixels.
+	void getRadialGeometry(Int &cx, Int &cy, Int &radius) const;
+	/// The 2D laser drawn ON the panel image (hosted quads have no depth to respect the 3D one).
+	void drawPanelBeam();
+	/// Short menu-button press recenters; a long press locks the camera to the selection.
+	void updateMenuButton();
+	void toggleFollowSelected();
+
 	// Grab-drag state: where the world was gripped, and the camera position at that moment.
 	Bool m_grabbing[2];
 	Vector3 m_grabHandWorld[2];   ///< hand position in world units when the grip closed
@@ -242,6 +271,32 @@ private:
 	Real m_fixedHudAlpha;             ///< eased HUD opacity, full over the HUD and faded off it
 	Bool m_mouseOverHud;              ///< the cursor is on the control-bar strip (hide the world marker there)
 	Bool m_menuOpen;                 ///< an in-game menu/dialog is up (Escape menu, options, quit-confirm, promotion)
+	Bool m_menuOpenExternal;         ///< same, but NOT counting the radial dial (the dial gates on this)
+	Bool m_modalMenuOpen;            ///< a MODAL window is up (Escape menu family): black-backed on the panel
+	Int m_menuWinX, m_menuWinY;      ///< screen rect of the biggest window menu detection found
+	Int m_menuWinW, m_menuWinH;
+
+	// The radial menus.
+	enum { VR_RADIAL_NONE = 0, VR_RADIAL_COMMANDS, VR_RADIAL_GROUPS };
+	Int m_radialKind;
+	Int m_radialSector;              ///< sector the stick last pointed at; -1 = none yet
+	UnsignedInt m_radialOpenTime;
+	Bool m_radialStickWasOut;        ///< deflected past the pick threshold (fire on the way back)
+	UnsignedInt m_bDownTime;         ///< right B press time: short = panel toggle, long = groups radial
+	Bool m_bLongFired;
+	Int m_lastGroupRecalled;         ///< recall the same group twice quickly = jump the camera to it
+	UnsignedInt m_lastGroupTime;
+	Int m_armedOrder;                ///< 0 none, 1 attack-move, 2 guard: next trigger places it
+	UnsignedInt m_lastOwnSelectTime; ///< double-tap a unit = select all matching on screen
+	UnsignedInt m_lastStickJumpTime; ///< double-click the right stick = last radar event
+	UnsignedInt m_menuBtnDownTime;   ///< three-bar button: short recenters, long follows selection
+	Bool m_menuBtnLongFired;
+	Bool m_followActive;
+	class DisplayString *m_radialStrings[16]; ///< pooled labels for the radial drawing
+	UnsignedInt m_clickGuardUntil;   ///< after a dial fires, the trigger is dead this long (its own release must not click)
+	Bool m_panelBeamValid;           ///< the 2D beam ON the panel this frame (hosted quads cover the 3D one)
+	Int m_panelBeamX0, m_panelBeamY0; ///< the hand dropped onto the panel, frame pixels (may be off-frame)
+	Int m_panelBeamX1, m_panelBeamY1; ///< where the ray strikes the panel, frame pixels
 	Line3DClass *m_groupDigit[MAX_SELECTION_MARKERS][7]; ///< seven-segment control-group numeral per unit
 };
 

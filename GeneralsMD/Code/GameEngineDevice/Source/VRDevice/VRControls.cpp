@@ -24,10 +24,12 @@
 #include <windowsx.h>
 
 #include "VRDevice/VRControls.h"
+#include "VRDevice/VRSettingsMenu.h"
 #include "VRDevice/OpenXRManager.h"
 
 #include "Common/Debug.h"
 #include "Common/FramePacer.h"
+#include "Common/GameCommon.h"
 #include "Common/GlobalData.h"
 #include "Common/MessageStream.h"
 #include "GameClient/Display.h"
@@ -38,12 +40,16 @@
 #include "GameClient/GameWindow.h"
 #include "GameClient/GameWindowManager.h"
 #include "GameClient/CommandXlat.h"
+#include "GameClient/ControlBar.h"
 #include "GameLogic/Object.h"
 #include "Common/ThingTemplate.h"
 #include "GameClient/View.h"
 #include "GameClient/Mouse.h"
 #include "GameClient/Keyboard.h"
 #include "GameClient/KeyDefs.h"
+#include "GameClient/DisplayString.h"
+#include "GameClient/DisplayStringManager.h"
+#include "GameClient/GameFont.h"
 #include "GameLogic/GameLogic.h"
 #include "GameLogic/TerrainLogic.h"
 #include "Common/Player.h"
@@ -63,6 +69,10 @@
 #include "WWMath/plane.h"
 #include "WWMath/quat.h"
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 VRControls *TheVRControls = nullptr;
 
 namespace
@@ -81,7 +91,7 @@ namespace
 	// The map may be scaled between these (world units per metre). Small = the world is huge
 	// around you; large = a small table you look down on.
 	const Real MIN_SCALE           = 80.0f;
-	const Real MAX_SCALE           = 4000.0f;
+	const Real MAX_SCALE           = 900.0f;
 
 	// Dragging the world. The grab is 1:1 - the ground stays stuck to your hand, which is the
 	// whole point of grabbing it - and releasing mid-sweep lets it coast a little further.
@@ -106,6 +116,16 @@ namespace
 		if (v < -STICK_DEADZONE) return (v + STICK_DEADZONE) / (1.0f - STICK_DEADZONE);
 		return 0.0f;
 	}
+
+	// The radial dials.
+	const Int RADIAL_CMD_SECTORS = 7;
+	const wchar_t *RADIAL_CMD_NAMES[RADIAL_CMD_SECTORS] =
+	{ L"Stop", L"Attack move", L"Guard", L"Scatter", L"Cheer", L"Idle worker", L"Menu" };
+
+	const Real RADIAL_PICK = 0.55f;    ///< stick deflection that picks a sector
+	const Real RADIAL_RELEASE = 0.25f; ///< returning under this fires the picked sector
+	const UnsignedInt RADIAL_TIMEOUT_MS = 6000;
+	const UnsignedInt B_HOLD_MS = 350;  ///< right B held this long = groups radial
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -246,6 +266,29 @@ VRControls::VRControls()
 	m_fixedHudAlpha = 1.0f;
 	m_mouseOverHud = FALSE;
 	m_menuOpen = FALSE;
+	m_menuOpenExternal = FALSE;
+	m_modalMenuOpen = FALSE;
+	m_menuWinX = m_menuWinY = m_menuWinW = m_menuWinH = 0;
+
+	m_radialKind = VR_RADIAL_NONE;
+	m_radialSector = -1;
+	m_radialOpenTime = 0;
+	m_radialStickWasOut = FALSE;
+	m_bDownTime = 0;
+	m_bLongFired = FALSE;
+	m_lastGroupRecalled = -1;
+	m_lastGroupTime = 0;
+	m_armedOrder = 0;
+	m_lastOwnSelectTime = 0;
+	m_lastStickJumpTime = 0;
+	m_menuBtnDownTime = 0;
+	m_menuBtnLongFired = FALSE;
+	m_followActive = FALSE;
+	for (Int i = 0; i < 16; ++i)
+		m_radialStrings[i] = nullptr;
+	m_clickGuardUntil = 0;
+	m_panelBeamValid = FALSE;
+	m_panelBeamX0 = m_panelBeamY0 = m_panelBeamX1 = m_panelBeamY1 = 0;
 }
 
 VRControls::~VRControls()
@@ -259,6 +302,13 @@ VRControls::~VRControls()
 			m_rayLines[hand]->Release_Ref();
 			m_rayLines[hand] = nullptr;
 		}
+	}
+
+	for (Int i = 0; i < 16; ++i)
+	{
+		if (m_radialStrings[i] != nullptr && TheDisplayStringManager != nullptr)
+			TheDisplayStringManager->freeDisplayString(m_radialStrings[i]);
+		m_radialStrings[i] = nullptr;
 	}
 	if (m_rayScene != nullptr)
 	{
@@ -848,6 +898,17 @@ void VRControls::updateInputMode()
 	if (ctrlMoved)
 		m_ctrlLastMoveTime = now;
 
+	// "Controllers only" pinned in the VR settings menu overrides the auto-switch entirely.
+	// There is deliberately NO mouse-only pin: pinned in the headset it would take the rays
+	// away along with the only menu that could give them back.
+	const Int modePref = (TheGlobalData != nullptr) ? TheGlobalData->m_vrInputMode : 0;
+	if (modePref == 1)
+	{
+		m_mouseKbMode = FALSE;
+		m_rayPressCount = 0;
+		return;
+	}
+
 	// Moving the mouse takes over immediately. Otherwise, once the mouse has been idle for 3s and a
 	// controller is currently in use, hand it back to the rays.
 	const Bool mouseJustMoved = (m_mouseLastMoveTime != 0) && ((now - m_mouseLastMoveTime) < 250);
@@ -863,7 +924,8 @@ void VRControls::updateInputMode()
 	// Three squeezes inside 1.5 seconds flip back to the rays; a single stray squeeze while
 	// mousing does not. The flip completes on the RELEASE of the last squeeze, so the squeeze
 	// that causes it can never land a ray click on whatever the laser happens to cross.
-	if (m_mouseKbMode)
+	// (Optional: the settings menu can turn the gesture off for players who squeeze idly.)
+	if (m_mouseKbMode && (TheGlobalData == nullptr || TheGlobalData->m_vrTriggerMashEnabled))
 	{
 		Bool pressEdge = FALSE, releaseEdge = FALSE, anyDown = FALSE;
 		for (Int hand = 0; hand < 2; ++hand)
@@ -1582,9 +1644,29 @@ void VRControls::getReticleColor(const Vector3 &origin, const Vector3 &dir,
 
 	if (TheGameClient == nullptr || TheInGameUI == nullptr)
 		return;
+
+	// Guard and attack-move pending buttons never reach the context evaluation (it would call
+	// them a plain move and colour the beam green, a lie): colour them by type directly.
+	const CommandButton *pendingCmd = TheInGameUI->getGUICommand();
+	if (pendingCmd != nullptr)
+	{
+		const Int t = (Int)pendingCmd->getCommandType();
+		if (t == GUI_COMMAND_GUARD || t == GUI_COMMAND_GUARD_WITHOUT_PURSUIT
+			|| t == GUI_COMMAND_GUARD_FLYING_UNITS_ONLY)
+		{
+			outR = 0.15f; outG = 0.95f; outB = 0.80f;	// guard: teal
+			return;
+		}
+		if (t == GUI_COMMAND_ATTACK_MOVE)
+		{
+			outR = 0.85f; outG = 0.30f; outB = 1.00f;	// attack move: violet
+			return;
+		}
+	}
+
 	// A pending command button (spy drone, satellite scan, paradrop) targets with the beam even
 	// when nothing is selected - the shortcut powers usually have nothing selected at all.
-	if (TheInGameUI->getGUICommand() == nullptr
+	if (pendingCmd == nullptr
 		&& (TheInGameUI->getAllSelectedDrawables() == nullptr
 			|| TheInGameUI->getAllSelectedDrawables()->empty()))
 		return;	// nothing selected and no power pending: nothing would happen, promise nothing
@@ -1608,6 +1690,11 @@ void VRControls::getReticleColor(const Vector3 &origin, const Vector3 &dir,
 		case GameMessage::MSG_DO_WEAPON_AT_OBJECT:
 		case GameMessage::MSG_DO_WEAPON_AT_LOCATION:
 			outR = 1.00f; outG = 0.20f; outB = 0.15f;	// attack
+			break;
+
+		case GameMessage::MSG_DO_GUARD_POSITION:
+		case GameMessage::MSG_DO_GUARD_OBJECT:
+			outR = 0.15f; outG = 0.95f; outB = 0.80f;	// guard: teal, matching the armed beam
 			break;
 
 		case GameMessage::MSG_DO_SPECIAL_POWER_AT_OBJECT:
@@ -1713,11 +1800,20 @@ void VRControls::updateLocomotion(W3DView *view)
 		m_twoHandGrab = FALSE;
 	}
 
-	// Thumbsticks: left pans, right turns and zooms.
+	// Thumbsticks: left pans, right turns and zooms. The settings menu's stick-speed knob
+	// multiplies the pan and turn rates (resizing keeps its own feel).
+	// An open dial owns ONLY the stick that is flicking at it; the other stick keeps moving
+	// the battlefield - the war does not wait for a menu choice.
 	const Real dt = TheFramePacer != nullptr ? TheFramePacer->getUpdateTime() : (1.0f / 90.0f);
+	const Real stickSpeed = (TheGlobalData != nullptr) ? TheGlobalData->m_vrStickSpeed : 1.0f;
 
-	const Real panX = applyDeadzone(left.stickX);
-	const Real panY = applyDeadzone(left.stickY);
+	Real panX = applyDeadzone(left.stickX);
+	Real panY = applyDeadzone(left.stickY);
+	if (m_radialKind == VR_RADIAL_COMMANDS)
+	{
+		panX = 0.0f;	// the left stick is choosing a command sector
+		panY = 0.0f;
+	}
 	if (panX != 0.0f || panY != 0.0f)
 	{
 		// Pan along the way the PLAYER is looking, not the way the tactical camera happens to
@@ -1746,7 +1842,7 @@ void VRControls::updateLocomotion(W3DView *view)
 			right2.Normalize();
 		}
 
-		const Real step = STICK_PAN_SPEED * scale * dt;
+		const Real step = STICK_PAN_SPEED * scale * dt * stickSpeed;
 
 		Coord3D pos = view->getPosition();
 		pos.x += (forward.X * panY + right2.X * panX) * step;
@@ -1756,15 +1852,20 @@ void VRControls::updateLocomotion(W3DView *view)
 
 	// The right stick does ONE thing at a time - whichever way you pushed it hardest. Letting a
 	// diagonal both turn and resize meant every rotation quietly changed your size as well.
-	const Real turn = applyDeadzone(right.stickX);
-	const Real grow = applyDeadzone(right.stickY);
+	Real turn = applyDeadzone(right.stickX);
+	Real grow = applyDeadzone(right.stickY);
+	if (m_radialKind == VR_RADIAL_GROUPS)
+	{
+		turn = 0.0f;	// the right stick is choosing a group sector
+		grow = 0.0f;
+	}
 
 	if (fabsf(turn) > fabsf(grow))
 	{
 		if (turn != 0.0f)
 		{
 			// Push right, turn right.
-			const Real delta = -turn * STICK_TURN_SPEED * dt;
+			const Real delta = -turn * STICK_TURN_SPEED * dt * stickSpeed;
 
 			// Turn on the spot. The RTS camera orbits its look-at point, so turning swung the
 			// player around a pivot far out on the battlefield - you were on the end of a boom,
@@ -1821,6 +1922,16 @@ void VRControls::updateLocomotion(W3DView *view)
 
 
 //-------------------------------------------------------------------------------------------------
+Bool VRControls::getMenuWindowRect(Int &x, Int &y, Int &w, Int &h) const
+{
+	if (m_menuWinW <= 0 || m_menuWinH <= 0)
+		return FALSE;
+	x = m_menuWinX; y = m_menuWinY;
+	w = m_menuWinW; h = m_menuWinH;
+	return TRUE;
+}
+
+//-------------------------------------------------------------------------------------------------
 void VRControls::releasePointerButtons(Win32Mouse *mouse)
 {
 	const DWORD now = GetTickCount();
@@ -1864,6 +1975,7 @@ void VRControls::updatePointer(W3DView *view)
 {
 	m_hasAimPoint = FALSE;
 	m_rayOnScreenPanel = FALSE;
+	m_panelBeamValid = FALSE;
 
 	Win32Mouse *mouse = (Win32Mouse *)TheMouse;
 	if (mouse == nullptr || TheOpenXR == nullptr)
@@ -1877,9 +1989,68 @@ void VRControls::updatePointer(W3DView *view)
 	// A UI panel always wins over the world behind it: if the ray lands on the menu screen or on
 	// a wrist panel, the cursor goes there. The panel already knows which pixel of the game's own
 	// frame the ray hit, so the engine's GUI sees an ordinary cursor over an ordinary button.
+	// A radial dial does NOT pause the war. Only a ray actually ON the dial's disc belongs to
+	// it (point a sector, trigger fires; the stick flick works in parallel); pointing anywhere
+	// else - the battlefield, the HUD below the dial - behaves exactly as if no dial were up.
+	if (m_radialKind != VR_RADIAL_NONE)
+	{
+		Int px = 0, py = 0, hx = 0, hy = 0;
+		if (TheOpenXR->pickUiPanel(VR_HAND_RIGHT, px, py, nullptr, &hx, &hy)
+			== OpenXRManager::VR_PICK_SCREEN)
+		{
+			Int cx, cy, radius;
+			getRadialGeometry(cx, cy, radius);
+			const Real dx = (Real)(px - cx);
+			const Real dy = (Real)(py - cy);
+			const Real dist = (Real)sqrt(dx * dx + dy * dy);
+			if (dist < radius * 1.08f)
+			{
+				m_panelBeamValid = TRUE;
+				m_panelBeamX0 = hx; m_panelBeamY0 = hy;
+				m_panelBeamX1 = px; m_panelBeamY1 = py;
+
+				if (dist > radius * 0.18f)
+				{
+					const Bool isGroups = (m_radialKind == VR_RADIAL_GROUPS);
+					const Int sectorCount = isGroups ? 10 : RADIAL_CMD_SECTORS;
+					Real angle = (Real)atan2(dx, -dy);	// screen y grows downward; up = -dy
+					if (angle < 0.0f)
+						angle += 2.0f * (Real)M_PI;
+					m_radialSector = (Int)(angle / (2.0f * (Real)M_PI) * (Real)sectorCount + 0.5f)
+						% sectorCount;
+					m_radialOpenTime = GetTickCount();	// active use keeps the timeout away
+
+					if (rightState.triggerPressed)
+					{
+						const Int kind = m_radialKind;
+						const Int sector = m_radialSector;
+						closeRadial();
+						fireRadialSector(kind, sector);
+					}
+				}
+
+				// The disc swallows the pixel; the game's UI under it sees nothing.
+				releasePointerButtons(mouse);
+				parkCursor(mouse);
+				return;
+			}
+		}
+		// Off the disc: fall through - the battlefield and the rest of the panel stay live.
+	}
+
 	Int panelX = 0, panelY = 0;
-	const OpenXRManager::VRPickKind pick = TheOpenXR->pickUiPanel(VR_HAND_RIGHT, panelX, panelY);
+	Int handPx = 0, handPy = 0;
+	const OpenXRManager::VRPickKind pick = TheOpenXR->pickUiPanel(VR_HAND_RIGHT, panelX, panelY,
+		nullptr, &handPx, &handPy);
 	m_rayOnScreenPanel = (pick == OpenXRManager::VR_PICK_SCREEN);
+	if (m_rayOnScreenPanel)
+	{
+		// The 2D beam ON the panel: hosted panels are depthless quads composited over the eye
+		// image, so an opaque menu swallows the 3D laser - this one is part of the panel itself.
+		m_panelBeamValid = TRUE;
+		m_panelBeamX0 = handPx; m_panelBeamY0 = handPy;
+		m_panelBeamX1 = panelX; m_panelBeamY1 = panelY;
+	}
 
 	if (pick == OpenXRManager::VR_PICK_GROUP_SLOT)
 	{
@@ -1900,6 +2071,16 @@ void VRControls::updatePointer(W3DView *view)
 
 	if (pick == OpenXRManager::VR_PICK_SCREEN)
 	{
+		// The VR settings layer sees the pixel FIRST: its badge on the in-game menu, and the
+		// whole panel while the settings are open. When it takes the pixel, the game's UI gets
+		// nothing at all - no cursor, no clicks - which is exactly what "on top of the in-game
+		// menu" has to mean.
+		if (TheVRSettingsMenu != nullptr && TheVRSettingsMenu->handlePointer(panelX, panelY))
+		{
+			releasePointerButtons(mouse);
+			parkCursor(mouse);
+			return;
+		}
 		screen.x = panelX;
 		screen.y = panelY;
 		haveTarget = TRUE;
@@ -1983,6 +2164,7 @@ void VRControls::updatePointer(W3DView *view)
 	// selection is client-side and works even while the game sits paused, so a stray trigger
 	// pull would silently rewrite the player's selection behind the Escape menu.
 	if (pick == OpenXRManager::VR_PICK_NONE && !m_menuOpen && view != nullptr
+		&& GetTickCount() >= m_clickGuardUntil
 		&& TheGameLogic != nullptr && TheGameLogic->isInGame()
 		&& (TheInGameUI == nullptr || TheInGameUI->getPendingPlaceType() == nullptr))
 	{
@@ -1996,18 +2178,110 @@ void VRControls::updatePointer(W3DView *view)
 				&& TheInGameUI->getGUICommand() != nullptr);
 
 			const Bool wasBoxing = m_boxing;
-			// While a command button waits for a target, a held trigger is AIMING, not the start
-			// of a band box - sweeping the beam to line up a strike must not select an army.
-			if (!pendingTarget)
+			// While a command button waits for a target - or a radial order is armed - a held
+			// trigger is AIMING, not the start of a band box.
+			if (!pendingTarget && m_armedOrder == 0)
 				updateBoxSelect(origin, dir);
 
-			if (rightState.triggerReleased && !wasBoxing && pendingTarget)
+			if (rightState.triggerReleased && !wasBoxing && !pendingTarget && m_armedOrder != 0)
 			{
-				// A command button is waiting for a target (spy drone, satellite scan, paradrop):
-				// this release IS the target, wherever the beam lands. It must bypass the
-				// selection logic below - a shortcut power often has NOTHING selected, and that
-				// read as "a click on nothing clears" and quietly swallowed the power.
-				commandUnderRay(origin, dir);
+				// An order armed from the radial dial: this release IS its target.
+				if (m_armedOrder == 1 && TheMessageStream != nullptr)
+				{
+					// Attack move: a unit or building under the beam is ATTACKED outright
+					// (that is what pointing at a target means); bare ground is attack-moved
+					// to - walk there, engaging everything met on the way.
+					Drawable *under = pickDrawable(origin, dir);
+					const Bool attackable = (under != nullptr && under->getObject() != nullptr
+						&& !under->getObject()->isLocallyControlled());
+					Coord3D spot;
+					if (attackable)
+					{
+						GameMessage *msg = TheMessageStream->appendMessage(GameMessage::MSG_DO_ATTACK_OBJECT);
+						msg->appendObjectIDArgument(under->getObject()->getID());
+						DEBUG_LOG(("OpenXR: armed attack: ATTACK_OBJECT id %d",
+							(int)under->getObject()->getID()));
+					}
+					else if (traceTerrain(origin, dir, spot))
+					{
+						GameMessage *msg = TheMessageStream->appendMessage(GameMessage::MSG_DO_ATTACKMOVETO);
+						msg->appendLocationArgument(spot);
+						DEBUG_LOG(("OpenXR: armed attack: ATTACKMOVETO (%.0f %.0f %.0f)",
+							spot.x, spot.y, spot.z));
+					}
+					else
+					{
+						DEBUG_LOG(("OpenXR: armed attack: NO TARGET (no drawable, no terrain hit)"));
+					}
+				}
+				else if (TheMessageStream != nullptr)
+				{
+					Coord3D spot;
+					if (traceTerrain(origin, dir, spot))
+					{
+						GameMessage *msg = TheMessageStream->appendMessage(GameMessage::MSG_DO_GUARD_POSITION);
+						msg->appendLocationArgument(spot);
+						msg->appendIntegerArgument(GUARDMODE_NORMAL);
+					}
+				}
+
+				m_armedOrder = 0;	// one placement ends the order
+			}
+			else if (rightState.triggerReleased && !wasBoxing && pendingTarget)
+			{
+				// A command button is waiting for a target: this release IS the target. GUARD
+				// (all three variants) and the native attack-move NEVER go through the context
+				// evaluation - the flat game routes them in its own GUI command translator, and
+				// the evaluation, knowing nothing of guard, resolved the click to a plain MOVE.
+				// Route by type exactly as GUICommandTranslator::doGuardCommand does.
+				const CommandButton *cmd = TheInGameUI->getGUICommand();
+				const Int cmdType = (cmd != nullptr) ? (Int)cmd->getCommandType() : -1;
+
+				if (cmdType == GUI_COMMAND_GUARD
+					|| cmdType == GUI_COMMAND_GUARD_WITHOUT_PURSUIT
+					|| cmdType == GUI_COMMAND_GUARD_FLYING_UNITS_ONLY)
+				{
+					Int guardMode = GUARDMODE_NORMAL;
+					if (cmdType == GUI_COMMAND_GUARD_WITHOUT_PURSUIT)
+						guardMode = GUARDMODE_GUARD_WITHOUT_PURSUIT;
+					else if (cmdType == GUI_COMMAND_GUARD_FLYING_UNITS_ONLY)
+						guardMode = GUARDMODE_GUARD_FLYING_UNITS_ONLY;
+
+					Drawable *under = (BitIsSet(cmd->getOptions(), COMMAND_OPTION_NEED_OBJECT_TARGET))
+						? pickDrawable(origin, dir) : nullptr;
+					Coord3D spot;
+					if (under != nullptr && under->getObject() != nullptr
+						&& TheMessageStream != nullptr)
+					{
+						GameMessage *msg = TheMessageStream->appendMessage(GameMessage::MSG_DO_GUARD_OBJECT);
+						msg->appendObjectIDArgument(under->getObject()->getID());
+						msg->appendIntegerArgument(guardMode);
+					}
+					else if (traceTerrain(origin, dir, spot) && TheMessageStream != nullptr)
+					{
+						GameMessage *msg = TheMessageStream->appendMessage(GameMessage::MSG_DO_GUARD_POSITION);
+						msg->appendLocationArgument(spot);
+						msg->appendIntegerArgument(guardMode);
+					}
+				}
+				else if (cmdType == GUI_COMMAND_ATTACK_MOVE)
+				{
+					Coord3D spot;
+					if (traceTerrain(origin, dir, spot) && TheMessageStream != nullptr)
+					{
+						GameMessage *msg = TheMessageStream->appendMessage(GameMessage::MSG_DO_ATTACKMOVETO);
+						msg->appendLocationArgument(spot);
+					}
+				}
+				else
+				{
+					// Special powers and true context commands: the evaluation handles these.
+					commandUnderRay(origin, dir);
+				}
+
+				// One target ends the mode, exactly as it does on the flat screen.
+				if (TheInGameUI != nullptr)
+					TheInGameUI->setGUICommand(nullptr);
 			}
 			else if (rightState.triggerReleased && !wasBoxing)
 			{
@@ -2043,7 +2317,17 @@ void VRControls::updatePointer(W3DView *view)
 				if (actionable)
 					commandUnderRay(origin, dir);	// finish it, repair it, enter it, attack it
 				else if (isOwn)
+				{
 					selectUnderRay(origin, dir);	// your own unit, and nothing to do with it: take it
+
+					// A second tap on a unit right away means "and everything LIKE it" - the
+					// flat game's double-click, squeezed twice.
+					const UnsignedInt tapNow = GetTickCount();
+					if (m_lastOwnSelectTime != 0 && (tapNow - m_lastOwnSelectTime) < 450
+						&& TheMessageStream != nullptr)
+						TheMessageStream->appendMessage(GameMessage::MSG_META_SELECT_MATCHING_UNITS);
+					m_lastOwnSelectTime = tapNow;
+				}
 				else if (haveSelection)
 					commandUnderRay(origin, dir);	// bare ground, or theirs: an order
 				else
@@ -2055,15 +2339,19 @@ void VRControls::updatePointer(W3DView *view)
 			if (rightState.primaryPressed)
 				commandUnderRay(origin, dir);
 
-			// The left trigger drops the selection - or, while a command button is waiting for a
-			// target, it cancels that instead: the flat game's right-click-to-cancel, without
-			// which a pending power could not be backed out of in the headset at all.
+			// The left trigger: while an order or command is waiting for a target it backs the
+			// mode out (the flat game's right-click cancel); with nothing pending it drops the
+			// selection, as always.
 			const VRControllerState &leftState = TheOpenXR->getController(VR_HAND_LEFT);
 			if (leftState.triggerPressed && TheInGameUI != nullptr && TheMessageStream != nullptr)
 			{
 				if (TheInGameUI->getGUICommand() != nullptr)
 				{
 					TheInGameUI->setGUICommand(nullptr);
+				}
+				else if (m_armedOrder != 0)
+				{
+					m_armedOrder = 0;
 				}
 				else
 				{
@@ -2107,8 +2395,9 @@ void VRControls::updatePointer(W3DView *view)
 	if (!clickThroughCursor)
 		return;
 
-	// Right trigger = left click (select, band box, confirm).
-	if (right.trigger && !m_leftDown)
+	// Right trigger = left click (select, band box, confirm). Not while the post-dial guard
+	// runs: the squeeze that fired a sector must spend itself without clicking anything.
+	if (right.trigger && !m_leftDown && now >= m_clickGuardUntil)
 	{
 		m_leftDown = TRUE;
 		mouse->addWin32Event(WM_LBUTTONDOWN, MK_LBUTTON, packed, now);
@@ -2140,12 +2429,433 @@ void VRControls::updatePanelToggles()
 	// The RIGHT hand's B summons the panel - onto the LEFT hand, where it belongs: you point with
 	// the right and read with the left, and a hand cannot aim at the panel it is holding anyway.
 	// The left hand's Y is no longer a toggle at all; it is the force-attack modifier.
-	if (TheOpenXR->getController(VR_HAND_RIGHT).secondaryPressed)
-		TheOpenXR->toggleWristPanel(VR_HAND_LEFT);
+	//
+	// The toggle moved from the PRESS to a short RELEASE: holding B for a third of a second is
+	// now the control-groups radial (updateRadials watches the same clock), and the panel must
+	// not flap open on the way into it.
+	const VRControllerState &rightB = TheOpenXR->getController(VR_HAND_RIGHT);
+	const UnsignedInt now = GetTickCount();
+	if (rightB.secondaryPressed)
+	{
+		m_bDownTime = now;
+		m_bLongFired = FALSE;
+	}
+	if (rightB.secondaryReleased)
+	{
+		if (!m_bLongFired && m_bDownTime != 0 && (now - m_bDownTime) < 350)
+			TheOpenXR->toggleWristPanel(VR_HAND_LEFT);
+		m_bDownTime = 0;
+	}
 
 	// Click the right stick to jump the view to what you have selected - the headset's spacebar.
-	if (TheOpenXR->getController(VR_HAND_RIGHT).stickClickPressed)
-		jumpToSelection();
+	// Click it twice quickly and the view goes to the LAST RADAR EVENT instead - the flat game's
+	// other spacebar, for "something just happened over there".
+	if (rightB.stickClickPressed)
+	{
+		if (m_lastStickJumpTime != 0 && (now - m_lastStickJumpTime) < 400)
+		{
+			if (TheMessageStream != nullptr)
+				TheMessageStream->appendMessage(GameMessage::MSG_META_VIEW_LAST_RADAR_EVENT);
+			m_lastStickJumpTime = 0;
+		}
+		else
+		{
+			jumpToSelection();
+			m_lastStickJumpTime = now;
+		}
+	}
+}
+
+//-------------------------------------------------------------------------------------------------
+/** The radial menus. Tap the LEFT stick in and a dial of commands opens in front of you; hold
+	* the right B a beat and a dial of the ten control groups opens instead. Flick the stick to a
+	* sector, let it spring back to centre, and the sector fires. One thumb does everything -
+	* which is exactly why the dials open on a tap and STAY: a thumb cannot hold a button down
+	* and flick the stick it is resting on at the same time. */
+//-------------------------------------------------------------------------------------------------
+void VRControls::updateRadials()
+{
+	const UnsignedInt now = GetTickCount();
+
+	// The dials only mean something over a live battlefield. Gated on the EXTERNAL menu state:
+	// the dial itself holds m_menuOpen while open, and must not close itself over it.
+	if (m_menuOpenExternal || TheGameLogic == nullptr || !TheGameLogic->isInGame())
+	{
+		if (m_radialKind != VR_RADIAL_NONE)
+			closeRadial();
+		return;
+	}
+
+	const VRControllerState &left = TheOpenXR->getController(VR_HAND_LEFT);
+	const VRControllerState &right = TheOpenXR->getController(VR_HAND_RIGHT);
+
+	if (m_radialKind == VR_RADIAL_NONE)
+	{
+		// Tap the left stick in: the command dial.
+		if (left.stickClickPressed)
+			openRadial(VR_RADIAL_COMMANDS);
+		// Hold the right B: the groups dial (a short B is still the panel toggle).
+		else if (right.secondaryButton && !m_bLongFired
+			&& m_bDownTime != 0 && (now - m_bDownTime) >= B_HOLD_MS)
+		{
+			m_bLongFired = TRUE;	// the release must not ALSO toggle the panel
+			openRadial(VR_RADIAL_GROUPS);
+		}
+		return;
+	}
+
+	// ---- a dial is open ----
+	const Bool isGroups = (m_radialKind == VR_RADIAL_GROUPS);
+	const Int sectorCount = isGroups ? 10 : RADIAL_CMD_SECTORS;
+	// The dial reads the stick of the thumb that OPENED it.
+	const Real sx = isGroups ? right.stickX : left.stickX;
+	const Real sy = isGroups ? right.stickY : left.stickY;
+	const Real deflect = (Real)sqrt(sx * sx + sy * sy);
+
+	// Cancel: the opening gesture again, the left trigger, or being forgotten.
+	const Bool cancelTap = isGroups ? right.secondaryPressed : left.stickClickPressed;
+	if (cancelTap || left.triggerPressed
+		|| (now - m_radialOpenTime) > RADIAL_TIMEOUT_MS)
+	{
+		// A cancelling B-tap must not ALSO toggle the wrist panel when it is released.
+		if (isGroups && right.secondaryPressed)
+			m_bLongFired = TRUE;
+		closeRadial();
+		return;
+	}
+
+	if (deflect >= RADIAL_PICK)
+	{
+		// Sector 0 sits at 12 o'clock, the rest run clockwise.
+		Real angle = (Real)atan2(sx, sy);	// 0 = up, positive = clockwise
+		if (angle < 0.0f)
+			angle += 2.0f * (Real)M_PI;
+		Int sector = (Int)(angle / (2.0f * (Real)M_PI) * (Real)sectorCount + 0.5f) % sectorCount;
+		m_radialSector = sector;
+		m_radialStickWasOut = TRUE;
+		m_radialOpenTime = now;	// active use keeps the timeout away
+	}
+	else if (deflect <= RADIAL_RELEASE && m_radialStickWasOut && m_radialSector >= 0)
+	{
+		// The flick sprang back: fire what it pointed at.
+		const Int kind = m_radialKind;
+		const Int sector = m_radialSector;
+		closeRadial();
+		fireRadialSector(kind, sector);
+		return;
+	}
+}
+
+//-------------------------------------------------------------------------------------------------
+void VRControls::openRadial(Int kind)
+{
+	// No floating panel of its own: the dial lives on the SAME left-hand panel the menus use
+	// (updateUiCrop counts an open dial as an open menu, which summons that panel), so there
+	// is exactly one place interface ever appears.
+	m_radialKind = kind;
+	m_radialSector = -1;
+	m_radialStickWasOut = FALSE;
+	m_radialOpenTime = GetTickCount();
+
+	DEBUG_LOG(("OpenXR: radial %s opened", kind == VR_RADIAL_GROUPS ? "groups" : "commands"));
+}
+
+//-------------------------------------------------------------------------------------------------
+void VRControls::closeRadial()
+{
+	m_radialKind = VR_RADIAL_NONE;
+	m_radialSector = -1;
+	m_radialStickWasOut = FALSE;
+
+	// The trigger goes dead for a beat: firing a sector with the trigger meant its RELEASE
+	// landed one frame later as a battlefield click at wherever the beam happened to rest.
+	m_clickGuardUntil = GetTickCount() + 250;
+}
+
+//-------------------------------------------------------------------------------------------------
+void VRControls::fireRadialSector(Int kind, Int sector)
+{
+	const UnsignedInt now = GetTickCount();
+
+	DEBUG_LOG(("OpenXR: radial fire: %s sector %d",
+		kind == VR_RADIAL_GROUPS ? "groups" : "commands", sector));
+
+	if (kind == VR_RADIAL_GROUPS)
+	{
+		// Sector i = group slot i (shown 1..9 then 0). The TRIGGER held while the flick fires
+		// is the assign modifier: squeeze-and-flick files your selection under that number.
+		const Bool assign = TheOpenXR->getController(VR_HAND_RIGHT).trigger;
+		applyControlGroup(sector, assign);
+		if (!assign)
+		{
+			// Recalling the same group again quickly also brings the view to it - the flat
+			// game's double-tapped number.
+			if (m_lastGroupRecalled == sector && (now - m_lastGroupTime) < 1200)
+				jumpToSelection();
+			m_lastGroupRecalled = sector;
+			m_lastGroupTime = now;
+		}
+		return;
+	}
+
+	if (TheMessageStream == nullptr)
+		return;
+
+	switch (sector)
+	{
+		case 0:	// Stop
+			TheMessageStream->appendMessage(GameMessage::MSG_DO_STOP);
+			break;
+		case 1:	// Attack move arms; the next trigger pull on the battlefield places it
+			m_armedOrder = 1;
+			break;
+		case 2:	// Guard: the game's OWN targeting mode, exactly as its palette button enters it.
+		{
+			// The pending-command machinery already carries everything guard needs in VR: the
+			// game's guard circle rides the beam's ground hit, the trigger places it, and the
+			// left trigger backs out - the same flow the superweapons use.
+			const CommandButton *guard = (TheControlBar != nullptr)
+				? TheControlBar->findCommandButton("Command_Guard") : nullptr;
+			if (guard != nullptr && TheInGameUI != nullptr)
+				TheInGameUI->setGUICommand(guard);
+			else
+				m_armedOrder = 2;	// data missing: the plain armed order still works
+			break;
+		}
+		case 3:	// Scatter
+			TheMessageStream->appendMessage(GameMessage::MSG_DO_SCATTER);
+			break;
+		case 4:	// Cheer
+			TheMessageStream->appendMessage(GameMessage::MSG_DO_CHEER);
+			break;
+		case 5:	// Next idle worker
+			TheMessageStream->appendMessage(GameMessage::MSG_META_SELECT_NEXT_IDLE_WORKER);
+			break;
+		case 6:	// The game's own menu - the Escape the headset never had
+			TheMessageStream->appendMessage(GameMessage::MSG_META_OPTIONS);
+			break;
+		default:
+			break;
+	}
+}
+
+//-------------------------------------------------------------------------------------------------
+void VRControls::getRadialGeometry(Int &cx, Int &cy, Int &radius) const
+{
+	const Int sw = (TheDisplay != nullptr) ? (Int)TheDisplay->getWidth() : 800;
+	const Int sh = (TheDisplay != nullptr) ? (Int)TheDisplay->getHeight() : 600;
+	// The whole menu-frame area (everything above the control bar), dial as big as fits.
+	cx = sw / 2;
+	cy = (Int)(sh * 0.33f);
+	radius = (Int)(sh * 0.30f);
+	if (radius > sw / 2 - 8)
+		radius = sw / 2 - 8;
+}
+
+//-------------------------------------------------------------------------------------------------
+/** Paint the open dial into the VR interface capture. Wireframe on a dark disc, in the beam's
+	* own cyan - the dial is part of the pointing instrument, and it should look like it. */
+//-------------------------------------------------------------------------------------------------
+void VRControls::drawRadialsIntoCapture()
+{
+	if (TheDisplay == nullptr)
+		return;
+
+	if (m_radialKind == VR_RADIAL_NONE)
+	{
+		drawPanelBeam();	// the on-panel laser still draws over plain menus
+		return;
+	}
+
+	Int cx, cy, radius;
+	getRadialGeometry(cx, cy, radius);
+
+	const Bool isGroups = (m_radialKind == VR_RADIAL_GROUPS);
+	const Int sectorCount = isGroups ? 10 : RADIAL_CMD_SECTORS;
+
+	const UnsignedInt back   = GameMakeColor(10, 16, 28, 215);
+	const UnsignedInt ring   = GameMakeColor(45, 95, 118, 255);
+	const UnsignedInt accent = GameMakeColor(89, 217, 255, 255);
+	const UnsignedInt textC  = GameMakeColor(235, 240, 245, 255);
+	const UnsignedInt dim    = GameMakeColor(150, 160, 175, 255);
+	const UnsignedInt drop   = GameMakeColor(0, 0, 0, 200);
+
+	// Just the dial, no backdrop: the disc drawn as ONE-PIXEL rows - this 2D layer has no
+	// filled-circle call, and coarse strips read as staircase edges.
+	for (Int row = -radius; row <= radius; ++row)
+	{
+		const Real t = (Real)row / (Real)radius;
+		const Real half = (Real)sqrt(1.0f - t * t) * radius;
+		TheDisplay->drawFillRect(cx - (Int)half, cy + row, (Int)half * 2, 1, back);
+	}
+
+	// Ring and sector spokes.
+	const Int SEGS = 96;
+	for (Int i = 0; i < SEGS; ++i)
+	{
+		const Real a0 = (Real)i / SEGS * 2.0f * (Real)M_PI;
+		const Real a1 = (Real)(i + 1) / SEGS * 2.0f * (Real)M_PI;
+		// Wide enough to bury the one-pixel stairs of the disc's own edge under it.
+		TheDisplay->drawLine(cx + (Int)(sin(a0) * radius), cy - (Int)(cos(a0) * radius),
+			cx + (Int)(sin(a1) * radius), cy - (Int)(cos(a1) * radius), 4.0f, ring);
+	}
+	for (Int s = 0; s < sectorCount; ++s)
+	{
+		const Real a = ((Real)s - 0.5f) / sectorCount * 2.0f * (Real)M_PI;
+		TheDisplay->drawLine(cx + (Int)(sin(a) * radius * 0.35f),
+			cy - (Int)(cos(a) * radius * 0.35f),
+			cx + (Int)(sin(a) * radius), cy - (Int)(cos(a) * radius), 1.5f, ring);
+	}
+
+	// The picked sector: its slice of the ring redrawn hot, plus a pointer from the centre.
+	if (m_radialSector >= 0)
+	{
+		const Real mid = (Real)m_radialSector / sectorCount * 2.0f * (Real)M_PI;
+		const Real span = (Real)M_PI / sectorCount;
+		const Int HSEGS = 24;
+		for (Int i = 0; i < HSEGS; ++i)
+		{
+			const Real a0 = mid - span + (span * 2.0f) * i / HSEGS;
+			const Real a1 = mid - span + (span * 2.0f) * (i + 1) / HSEGS;
+			TheDisplay->drawLine(cx + (Int)(sin(a0) * radius), cy - (Int)(cos(a0) * radius),
+				cx + (Int)(sin(a1) * radius), cy - (Int)(cos(a1) * radius), 5.0f, accent);
+		}
+		TheDisplay->drawLine(cx, cy,
+			cx + (Int)(sin(mid) * radius * 0.9f), cy - (Int)(cos(mid) * radius * 0.9f),
+			2.0f, accent);
+	}
+
+	// Labels, and the centre hint.
+	if (TheDisplayStringManager != nullptr)
+	{
+		for (Int s = 0; s < sectorCount; ++s)
+		{
+			DisplayString *&str = m_radialStrings[s];
+			if (str == nullptr)
+			{
+				str = TheDisplayStringManager->newDisplayString();
+				if (str != nullptr && TheFontLibrary != nullptr)
+					str->setFont(TheFontLibrary->getFont("Arial", 36, TRUE));
+			}
+			if (str == nullptr)
+				continue;
+
+			UnicodeString u;
+			if (isGroups)
+				u.format(L"%d", (s + 1) % 10);
+			else
+				u.set(RADIAL_CMD_NAMES[s]);
+			str->setText(u);
+
+			const Real mid = (Real)s / sectorCount * 2.0f * (Real)M_PI;
+			Int tw = 0, th = 0;
+			str->getSize(&tw, &th);
+			str->draw(cx + (Int)(sin(mid) * radius * 0.68f) - tw / 2,
+				cy - (Int)(cos(mid) * radius * 0.68f) - th / 2,
+				(s == m_radialSector) ? accent : textC, drop);
+		}
+
+		DisplayString *&hint = m_radialStrings[15];
+		if (hint == nullptr)
+		{
+			hint = TheDisplayStringManager->newDisplayString();
+			if (hint != nullptr && TheFontLibrary != nullptr)
+				hint->setFont(TheFontLibrary->getFont("Arial", 20, FALSE));
+		}
+		if (hint != nullptr)
+		{
+			UnicodeString u;
+			u.set(isGroups ? L"flick = recall    trigger + flick = assign"
+			               : L"flick and release");
+			hint->setText(u);
+			Int tw = 0, th = 0;
+			hint->getSize(&tw, &th);
+			hint->draw(cx - tw / 2, cy - th / 2, dim, drop);
+		}
+	}
+
+	drawPanelBeam();	// the ray, over the dial, leading to what it points at
+}
+
+//-------------------------------------------------------------------------------------------------
+/** The laser's touch ON the panel: a bright dot with a soft glow where the beam strikes.
+	* Hosted panels are depthless quads composited over the eye image, so an opaque menu can
+	* swallow the 3D beam - the dot is part of the panel image and cannot be covered. (A full
+	* 2D beam line was tried and read as a SECOND ray hanging off the menu; just the dot.) */
+//-------------------------------------------------------------------------------------------------
+void VRControls::drawPanelBeam()
+{
+	if (!m_panelBeamValid || TheDisplay == nullptr)
+		return;
+
+	const UnsignedInt glowC = GameMakeColor(89, 217, 255, 90);
+	const UnsignedInt beamC = GameMakeColor(89, 217, 255, 235);
+	TheDisplay->drawFillRect(m_panelBeamX1 - 10, m_panelBeamY1 - 10, 20, 20, glowC);
+	TheDisplay->drawFillRect(m_panelBeamX1 - 6, m_panelBeamY1 - 6, 12, 12,
+		GameMakeColor(0, 0, 0, 200));
+	TheDisplay->drawFillRect(m_panelBeamX1 - 4, m_panelBeamY1 - 4, 8, 8, beamC);
+}
+
+//-------------------------------------------------------------------------------------------------
+/** The three-bar menu button: a short press recenters (as always); holding it locks the camera
+	* to the selection, holding it again lets go. Works from the title screen on. */
+//-------------------------------------------------------------------------------------------------
+void VRControls::updateMenuButton()
+{
+	// The three-bar button is HARDWARE on the physical left controller; under the left-handed
+	// mirror its state travels to the other logical slot, so read both and OR them.
+	const VRControllerState &l = TheOpenXR->getController(VR_HAND_LEFT);
+	const VRControllerState &r = TheOpenXR->getController(VR_HAND_RIGHT);
+	const Bool pressed = l.menuPressed || r.menuPressed;
+	const Bool held = l.menuButton || r.menuButton;
+	const Bool released = l.menuReleased || r.menuReleased;
+	const UnsignedInt now = GetTickCount();
+
+	if (pressed)
+	{
+		m_menuBtnDownTime = now;
+		m_menuBtnLongFired = FALSE;
+	}
+	if (held && m_menuBtnDownTime != 0 && !m_menuBtnLongFired
+		&& (now - m_menuBtnDownTime) >= 450)
+	{
+		m_menuBtnLongFired = TRUE;
+		toggleFollowSelected();
+	}
+	if (released)
+	{
+		if (!m_menuBtnLongFired && m_menuBtnDownTime != 0)
+			TheOpenXR->recenter();
+		m_menuBtnDownTime = 0;
+		m_menuBtnLongFired = FALSE;
+	}
+}
+
+//-------------------------------------------------------------------------------------------------
+void VRControls::toggleFollowSelected()
+{
+	if (TheTacticalView == nullptr || TheInGameUI == nullptr)
+		return;
+
+	if (m_followActive)
+	{
+		TheTacticalView->userSetCameraLock(INVALID_ID);
+		TheTacticalView->userSetCameraLockDrawable(nullptr);
+		m_followActive = FALSE;
+		DEBUG_LOG(("OpenXR: follow released"));
+		return;
+	}
+
+	const DrawableList *selected = TheInGameUI->getAllSelectedDrawables();
+	if (selected == nullptr || selected->empty())
+		return;
+	Drawable *first = selected->front();
+	if (first == nullptr || first->getObject() == nullptr)
+		return;
+
+	TheTacticalView->userSetCameraLock(first->getObject()->getID());
+	m_followActive = TRUE;
+	DEBUG_LOG(("OpenXR: following selected object"));
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -2311,6 +3021,14 @@ void VRControls::updateRays(W3DView *view)
 			{
 				line->Re_Color(0.35f, 0.85f, 1.00f);	// the pointer's own cyan, as in the menus
 			}
+			else if (m_armedOrder == 1)
+			{
+				line->Re_Color(0.85f, 0.30f, 1.00f);	// attack-move armed: violet
+			}
+			else if (m_armedOrder == 2)
+			{
+				line->Re_Color(0.15f, 0.95f, 0.80f);	// guard armed: teal
+			}
 			else
 			{
 				Real r, g, b;
@@ -2422,10 +3140,20 @@ void VRControls::update()
 		m_prevInGame = inGame;
 		const UnsignedInt now = GetTickCount();
 		const Bool mouseWasDriving = (m_mouseLastMoveTime != 0) && ((now - m_mouseLastMoveTime) < 2000);
-		m_mouseKbMode = mouseWasDriving;
+		// A "controllers only" pin is not up for grabs at the transition either.
+		const Int modePref = (TheGlobalData != nullptr) ? TheGlobalData->m_vrInputMode : 0;
+		if (modePref == 0)
+			m_mouseKbMode = mouseWasDriving;
+		else
+			m_mouseKbMode = FALSE;
 		m_mouseSeeded = FALSE;
 		m_mouseLastMoveTime = 0;
 		m_modeGraceUntil = now + 1500;
+
+		// A match starts with the HUD panel already on the hand: the interface should not be
+		// something you have to know a button to find.
+		if (inGame)
+			TheOpenXR->setWristPanelOpen(VR_HAND_LEFT, TRUE);
 	}
 
 	// Watch the mouse first, so both the menu cursor and the in-game frame have a fresh answer.
@@ -2442,6 +3170,10 @@ void VRControls::update()
 			TheOpenXR->recenter();
 		m_ctrlSpaceWasDown = recenterCombo;
 
+		// The controller's three-bar button: short press recenters, long press follows the
+		// selection. Policy lives here now; the runtime layers just report the button.
+		updateMenuButton();
+
 		// Ctrl+O pulls the whole battlefield CLOSER, Ctrl+L pushes it FURTHER, by scaling the VR
 		// world size (world-units-per-metre). The tactical camera and its render limits do not move
 		// at all - only how big the map feels around you. Held to ease in; clamped to a sane range.
@@ -2450,8 +3182,8 @@ void VRControls::update()
 			Real s = TheOpenXR->getWorldUnitsPerMeter();
 			if (TheKeyboard->isKeyDown(KEY_O)) s *= 0.99f;	// fewer units/metre -> map bigger -> closer
 			if (TheKeyboard->isKeyDown(KEY_L)) s *= 1.01f;	// further
-			if (s < 40.0f) s = 40.0f;
-			if (s > 4000.0f) s = 4000.0f;
+			if (s < 80.0f) s = 80.0f;
+			if (s > 900.0f) s = 900.0f;
 			TheOpenXR->setWorldUnitsPerMeter(s);
 		}
 	}
@@ -2466,6 +3198,7 @@ void VRControls::update()
 	if (TheDisplay != nullptr && TheDisplay->isMoviePlaying())
 	{
 		m_rayOnScreenPanel = FALSE;	// nothing is being pointed at during a film
+		m_panelBeamValid = FALSE;
 
 		// No lasers across the intro. There is nothing to point at, and leaving them lit means
 		// two beams hanging over the film - this path returns early, so they must be put away
@@ -2494,9 +3227,12 @@ void VRControls::update()
 	if (m_mouseKbMode)
 	{
 		// The physical mouse owns the cursor here: the ray is not on any panel, and the cursor
-		// is wherever the player put it, not parked.
+		// is wherever the player put it, not parked. Any open dial is put away with the rays.
 		m_rayOnScreenPanel = FALSE;
+		m_panelBeamValid = FALSE;
 		m_cursorParked = FALSE;
+		if (m_radialKind != VR_RADIAL_NONE)
+			closeRadial();
 
 		for (Int hand = 0; hand < 2; ++hand)
 		{
@@ -2520,6 +3256,9 @@ void VRControls::update()
 	}
 
 	updatePanelToggles();
+
+	// The radial dials, before locomotion: while one is open its stick belongs to the dial.
+	updateRadials();
 
 	// Locomotion only means something when there is a battlefield to move over. In the menus the
 	// controllers must not fling the tactical camera around behind the player's back - and that
@@ -2585,6 +3324,10 @@ void VRControls::updateUiCrop()
 	Real top = BOTTOM_STRIP;
 	Bool menuOpen = FALSE;
 
+	// Re-measured every pass; a zero width afterwards means no GAME menu window is up right
+	// now (the VR settings menu may still be holding menuOpen on its own).
+	m_menuWinX = m_menuWinY = m_menuWinW = m_menuWinH = 0;
+
 	if (TheWindowManager != nullptr)
 	{
 		const Real screenW = (Real)TheDisplay->getWidth();
@@ -2624,9 +3367,53 @@ void VRControls::updateUiCrop()
 			if (screenW > 0.0f && screenH > 0.0f
 				&& winTop < 0.5f
 				&& (Real)wh / screenH > 0.10f && (Real)ww / screenW > 0.15f)
+			{
+				// Remember the biggest such window: the VR settings badge rides its corner.
+				if (ww * wh > m_menuWinW * m_menuWinH)
+				{
+					m_menuWinX = x; m_menuWinY = y;
+					m_menuWinW = ww; m_menuWinH = wh;
+				}
 				menuOpen = TRUE;
+			}
 		}
 	}
+
+	// Modality is the truth the size heuristic can only guess at: the quit menu is a narrow
+	// column that slipped under the width filter, and the game sat paused behind a menu the
+	// ray could not reach. A visible modal window IS an open menu, whatever its size - and
+	// only the modal family (Escape menu and what it opens) earns the solid black backing;
+	// the promotion screen is not modal and stays as it was.
+	m_modalMenuOpen = FALSE;
+	if (TheWindowManager != nullptr)
+	{
+		GameWindow *modal = TheWindowManager->winGetTopModalWindow();
+		if (modal != nullptr && !modal->winIsHidden())
+		{
+			m_modalMenuOpen = TRUE;
+			if (!menuOpen)
+			{
+				Int mx = 0, my = 0, mw = 0, mh = 0;
+				modal->winGetPosition(&mx, &my);
+				modal->winGetSize(&mw, &mh);
+				m_menuWinX = mx; m_menuWinY = my;
+				m_menuWinW = mw; m_menuWinH = mh;
+			}
+			menuOpen = TRUE;
+		}
+	}
+
+	// The VR settings menu holds the "menu open" state by itself: the wrist panel stays
+	// summoned and the battlefield stays gated even if the game menu underneath was closed.
+	if (TheVRSettingsMenu != nullptr && TheVRSettingsMenu->isOpen())
+		menuOpen = TRUE;
+
+	// What the radial dial gates on: everything above, but not itself. The dial deliberately
+	// does NOT count as a menu any more - the war keeps running and the battlefield stays
+	// clickable while it is up; it only borrows the panel to be seen on.
+	m_menuOpenExternal = menuOpen;
+	if (TheOpenXR != nullptr)
+		TheOpenXR->setUiDialOpen(m_radialKind != VR_RADIAL_NONE);
 
 	if (top < 0.0f) top = 0.0f;
 	if (top > BOTTOM_STRIP) top = BOTTOM_STRIP;
@@ -2634,7 +3421,16 @@ void VRControls::updateUiCrop()
 	TheWritableGlobalData->m_vrUiCropTop = top;
 
 	if (menuOpen != m_menuOpen)
+	{
 		DEBUG_LOG(("OpenXR: ui: in-game menu %s", menuOpen ? "opened" : "closed"));
+
+		// A menu opening or closing warps and re-captures the REAL cursor; none of that is the
+		// player reaching for the mouse. Same guard as the match-start transition - without it,
+		// opening the menu from the dial flipped the game into mouse+keyboard style.
+		m_mouseSeeded = FALSE;
+		m_mouseLastMoveTime = 0;
+		m_modeGraceUntil = GetTickCount() + 1000;
+	}
 	m_menuOpen = menuOpen;
 	// Both modes read this when laying out the panels: mouse+keyboard stands the HUD upright,
 	// rays raises the big menu screen.

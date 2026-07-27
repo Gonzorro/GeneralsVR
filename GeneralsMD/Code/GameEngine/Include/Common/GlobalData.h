@@ -146,9 +146,25 @@ public:
 	// while the monitor's own pass keeps them. Nothing else may key off this.
 	Bool m_vrUiCapture;
 
-	// GeneralsVR @feature Hide those readouts (FPS, system time, game time) on the VR panels.
-	// Defaults on; the in-VR settings menu will carry the toggle so a player can bring them back.
-	Bool m_vrHideHudReadouts;
+	// GeneralsVR @feature Hide those readouts on the VR panels, separately: the frame rate,
+	// and the clocks (system time + game time). Both default hidden; the in-VR settings menu
+	// carries the two toggles.
+	Bool m_vrHideFps;
+	Bool m_vrHideClocks;
+
+	// GeneralsVR @feature The player's knobs from the in-VR settings menu. All applied live and
+	// persisted by VRSettingsMenu (vr-settings.ini in the install folder).
+	Int  m_vrInputMode;           ///< 0 = auto-switch ("both"), 1 = controllers only
+	Bool m_vrTriggerMashEnabled;  ///< triple trigger squeeze takes control back from the mouse
+	Real m_vrStickSpeed;          ///< multiplier on thumbstick pan/turn rates
+	Bool m_vrShadowsEnabled;      ///< unit shadow volumes in the headset
+	Bool m_vrLeftHanded;          ///< mirror the whole controller scheme (beam on the left hand)
+	Bool m_vrSwapFaceButtons;     ///< A-B / X-Y swapped on both controllers (dormant, no UI)
+	Int  m_vrSkyColorIndex;       ///< the void around the battlefield: preset index, 0 = black
+	                              ///< (palette lives in W3DDisplay's eye pass, names in VRSettingsMenu - keep in step)
+	Int  m_vrHeadsetHz;           ///< requested headset refresh rate in Hz; 0 = runtime's choice (dormant, no UI - Link ignored the request)
+	Int  m_vrSuperSample;         ///< render-quality index: 0 = 100%, 1 = 130%, 2 = 150% (plumbing dormant - no UI)
+	Bool m_vrEnhancedAssets;      ///< files under <exe>\Enhanced\ shadow the game's originals (read-only overlay)
 
 	// GeneralsVR @feature Interpolate drawable motion between 30Hz sim ticks (-smoothmotion).
 	// Implied by -vr, where 30Hz stepping is nauseating. Render-only; the sim is untouched.

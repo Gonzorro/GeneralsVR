@@ -323,6 +323,11 @@ public:
 
 	virtual GameWindow *getWindowUnderCursor( Int x, Int y, Bool ignoreEnabled = FALSE );	///< find the top window at the given coordinates
 
+	/// GeneralsVR The topmost modal window, if any. The VR layer asks this to learn that a menu
+	/// (quit, options, a message box) owns the screen: window sizes and positions can slip a
+	/// heuristic, modality cannot - the quit menu is a narrow column that did exactly that.
+	GameWindow *winGetTopModalWindow() const { return m_modalHead ? m_modalHead->window : nullptr; }
+
 	//---------------------------------------------------------------------------
 	/////////////////////////////////////////////////////////////////////////////
 	//---------------------------------------------------------------------------
