@@ -93,6 +93,8 @@ static void drawFramerateBar();
 #include "WWMath/quat.h"
 #include "VRDevice/OpenXRManager.h"
 #include "VRDevice/VRControls.h"
+#include "VRDevice/VRSettingsMenu.h"
+#include <zlib.h>	// GeneralsVR: the sky PNG reader inflates with the build's own zlib
 #endif
 #include "WW3D2/predlod.h"
 #include "WW3D2/part_emt.h"
@@ -1950,6 +1952,9 @@ void W3DDisplay::composeVRUiPanel()
 // GeneralsVR Same as SC_VR_PANEL but ignores depth (PASS_ALWAYS, no depth write): the flat HUD sits
 // on the ground and would otherwise be hidden by any rise in the terrain.
 #define SC_VR_PANEL_ONTOP ( SHADE_CNST(ShaderClass::PASS_ALWAYS, ShaderClass::DEPTH_WRITE_DISABLE, ShaderClass::COLOR_WRITE_ENABLE, ShaderClass::SRCBLEND_SRC_ALPHA, 	ShaderClass::DSTBLEND_ONE_MINUS_SRC_ALPHA, ShaderClass::FOG_DISABLE, ShaderClass::GRADIENT_MODULATE, ShaderClass::SECONDARY_GRADIENT_DISABLE, ShaderClass::TEXTURING_ENABLE, 	ShaderClass::ALPHATEST_ENABLE, ShaderClass::CULL_MODE_DISABLE, 	ShaderClass::DETAILCOLOR_DISABLE, ShaderClass::DETAILALPHA_DISABLE) )
+// GeneralsVR The sky dome: opaque texture, no depth test or write (drawn first, the battlefield
+// paints straight over it), no fog, no culling (seen from inside), no alpha anything.
+#define SC_VR_SKY ( SHADE_CNST(ShaderClass::PASS_ALWAYS, ShaderClass::DEPTH_WRITE_DISABLE, ShaderClass::COLOR_WRITE_ENABLE, ShaderClass::SRCBLEND_ONE, 	ShaderClass::DSTBLEND_ZERO, ShaderClass::FOG_DISABLE, ShaderClass::GRADIENT_MODULATE, ShaderClass::SECONDARY_GRADIENT_DISABLE, ShaderClass::TEXTURING_ENABLE, 	ShaderClass::ALPHATEST_DISABLE, ShaderClass::CULL_MODE_DISABLE, 	ShaderClass::DETAILCOLOR_DISABLE, ShaderClass::DETAILALPHA_DISABLE) )
 
 // W3DDisplay::drawVRPanels ===================================================
 /** GeneralsVR @feature Draw the interface panels as real quads in the world.
@@ -2081,6 +2086,473 @@ void W3DDisplay::drawVRPanels( const Matrix3D &anchor, Real scale )
 	DX8Wrapper::Set_Texture(0, nullptr);
 }
 
+// GeneralsVR ---- sky pictures ------------------------------------------------------------------
+// Optional skies (Skies\*.png or *.bmp next to the exe): a seamless space tile wrapped around
+// an inward dome, drawn before the battlefield with depth off. The files ship in the package
+// (CC0 art) as PNG - lossless, a quarter of the BMP size, decoded with the zlib the build
+// already links. Asset policy: ship lossless where possible; never trade more than a sliver
+// of quality for size.
+namespace
+{
+	const Int VR_SKY_MAX = 8;
+	struct VRSkyFile { char name[64]; char path[MAX_PATH]; };
+	VRSkyFile s_vrSkies[VR_SKY_MAX];
+	Int s_vrSkyCount = -1;	// -1 = not enumerated yet
+	IDirect3DTexture8 *s_vrSkyTexture = nullptr;
+	TextureClass *s_vrSkyTexClass = nullptr;	// wrapper so the draw can ride DX8Wrapper
+	Int s_vrSkyLoaded = -1;
+
+	// The material system only knows TextureClass, so the raw texture gets a wrapper (which
+	// AddRefs it) whenever a new sky is loaded. Wrap addressing on both axes: the seamless
+	// tile repeats four times around the dome and twice up it.
+	void vrWrapSkyTexture()
+	{
+		REF_PTR_RELEASE(s_vrSkyTexClass);
+		s_vrSkyTexClass = NEW_REF(TextureClass, (s_vrSkyTexture));
+		s_vrSkyTexClass->Get_Filter().Set_U_Addr_Mode(TextureFilterClass::TEXTURE_ADDRESS_REPEAT);
+		s_vrSkyTexClass->Get_Filter().Set_V_Addr_Mode(TextureFilterClass::TEXTURE_ADDRESS_REPEAT);
+	}
+
+	void vrEnumerateSkiesPattern(const char *dir, const char *ext)
+	{
+		char pattern[MAX_PATH];
+		_snprintf(pattern, MAX_PATH, "%sSkies\\*.%s", dir, ext);
+
+		WIN32_FIND_DATAA fd;
+		HANDLE h = FindFirstFileA(pattern, &fd);
+		if (h == INVALID_HANDLE_VALUE)
+			return;
+		do
+		{
+			if (s_vrSkyCount >= VR_SKY_MAX)
+				break;
+			VRSkyFile &sky = s_vrSkies[s_vrSkyCount];
+			_snprintf(sky.path, MAX_PATH, "%sSkies\\%s", dir, fd.cFileName);
+			strncpy(sky.name, fd.cFileName, 63);
+			sky.name[63] = 0;
+			char *dot = strrchr(sky.name, '.');
+			if (dot != nullptr)
+				*dot = 0;
+			++s_vrSkyCount;
+		} while (FindNextFileA(h, &fd));
+		FindClose(h);
+	}
+
+	void vrEnumerateSkies()
+	{
+		if (s_vrSkyCount >= 0)
+			return;
+		s_vrSkyCount = 0;
+
+		char dir[MAX_PATH];
+		GetModuleFileNameA(nullptr, dir, MAX_PATH);
+		char *slash = strrchr(dir, '\\');
+		if (slash != nullptr)
+			slash[1] = 0;
+
+		vrEnumerateSkiesPattern(dir, "png");
+		vrEnumerateSkiesPattern(dir, "bmp");
+		DEBUG_LOG(("OpenXR: sky: %d sky pictures found", s_vrSkyCount));
+	}
+
+	// A deliberately small PNG reader: 8-bit RGB/RGBA, non-interlaced - which is exactly what
+	// the packaged skies are. The zlib doing the heavy lifting is the one the build links.
+	Bool vrDecodePng(const char *path, UnsignedByte **outPixels, Int *outW, Int *outH,
+		Int *outBpp)
+	{
+		FILE *f = fopen(path, "rb");
+		if (f == nullptr)
+			return FALSE;
+		fseek(f, 0, SEEK_END);
+		const long fileSize = ftell(f);
+		fseek(f, 0, SEEK_SET);
+		if (fileSize < 45)
+		{
+			fclose(f);
+			return FALSE;
+		}
+		UnsignedByte *file = NEW UnsignedByte[fileSize];
+		const Bool readOk = (fread(file, fileSize, 1, f) == 1);
+		fclose(f);
+
+		static const UnsignedByte PNG_SIG[8] = { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
+		if (!readOk || memcmp(file, PNG_SIG, 8) != 0)
+		{
+			delete [] file;
+			return FALSE;
+		}
+
+		Int w = 0, h = 0, bpp = 0;
+		UnsignedByte *idat = nullptr;
+		UnsignedInt idatSize = 0, idatCap = 0;
+		Bool headerOk = FALSE;
+
+		long pos = 8;
+		while (pos + 8 <= fileSize)
+		{
+			const UnsignedInt len = ((UnsignedInt)file[pos] << 24) | ((UnsignedInt)file[pos+1] << 16)
+				| ((UnsignedInt)file[pos+2] << 8) | file[pos+3];
+			const char *type = (const char *)&file[pos + 4];
+			const UnsignedByte *data = &file[pos + 8];
+			if (pos + 8 + (long)len > fileSize)
+				break;
+
+			if (memcmp(type, "IHDR", 4) == 0 && len >= 13)
+			{
+				w = ((Int)data[0] << 24) | ((Int)data[1] << 16) | ((Int)data[2] << 8) | data[3];
+				h = ((Int)data[4] << 24) | ((Int)data[5] << 16) | ((Int)data[6] << 8) | data[7];
+				const Int depth = data[8], colour = data[9], interlace = data[12];
+				if (depth == 8 && (colour == 2 || colour == 6) && interlace == 0
+					&& w > 0 && h > 0 && w <= 4096 && h <= 4096)
+				{
+					bpp = (colour == 2) ? 3 : 4;
+					headerOk = TRUE;
+				}
+			}
+			else if (memcmp(type, "IDAT", 4) == 0)
+			{
+				if (idatSize + len > idatCap)
+				{
+					idatCap = (idatSize + len) * 2;
+					UnsignedByte *grown = NEW UnsignedByte[idatCap];
+					if (idat != nullptr)
+					{
+						memcpy(grown, idat, idatSize);
+						delete [] idat;
+					}
+					idat = grown;
+				}
+				memcpy(idat + idatSize, data, len);
+				idatSize += len;
+			}
+			else if (memcmp(type, "IEND", 4) == 0)
+				break;
+
+			pos += 8 + (long)len + 4;	// length + type + data + crc
+		}
+		delete [] file;
+
+		if (!headerOk || idat == nullptr)
+		{
+			delete [] idat;
+			return FALSE;
+		}
+
+		// Inflate the filtered scanlines, then undo the per-row filters in place.
+		const UnsignedInt rawSize = (UnsignedInt)h * (1 + (UnsignedInt)w * bpp);
+		UnsignedByte *raw = NEW UnsignedByte[rawSize];
+
+		z_stream zs = {};
+		Bool ok = (inflateInit(&zs) == Z_OK);
+		if (ok)
+		{
+			zs.next_in = idat;
+			zs.avail_in = idatSize;
+			zs.next_out = raw;
+			zs.avail_out = rawSize;
+			const int zr = inflate(&zs, Z_FINISH);
+			ok = (zr == Z_STREAM_END || (zr == Z_OK && zs.avail_out == 0));
+			inflateEnd(&zs);
+		}
+		delete [] idat;
+		if (!ok)
+		{
+			delete [] raw;
+			return FALSE;
+		}
+
+		const Int stride = w * bpp;
+		UnsignedByte *pixels = NEW UnsignedByte[(UnsignedInt)h * stride];
+		for (Int y = 0; y < h; ++y)
+		{
+			const UnsignedByte filter = raw[y * (stride + 1)];
+			const UnsignedByte *src = &raw[y * (stride + 1) + 1];
+			UnsignedByte *dst = &pixels[y * stride];
+			const UnsignedByte *up = (y > 0) ? &pixels[(y - 1) * stride] : nullptr;
+
+			for (Int x = 0; x < stride; ++x)
+			{
+				const Int a = (x >= bpp) ? dst[x - bpp] : 0;
+				const Int b = (up != nullptr) ? up[x] : 0;
+				const Int c = (up != nullptr && x >= bpp) ? up[x - bpp] : 0;
+				Int pred = 0;
+				switch (filter)
+				{
+					case 1: pred = a; break;
+					case 2: pred = b; break;
+					case 3: pred = (a + b) / 2; break;
+					case 4:
+					{
+						const Int p = a + b - c;
+						const Int pa = (p > a) ? p - a : a - p;
+						const Int pb = (p > b) ? p - b : b - p;
+						const Int pc = (p > c) ? p - c : c - p;
+						pred = (pa <= pb && pa <= pc) ? a : ((pb <= pc) ? b : c);
+						break;
+					}
+					default: break;
+				}
+				dst[x] = (UnsignedByte)((src[x] + pred) & 0xFF);
+			}
+		}
+		delete [] raw;
+
+		*outPixels = pixels;
+		*outW = w;
+		*outH = h;
+		*outBpp = bpp;
+		return TRUE;
+	}
+
+	Bool vrLoadSkyTexture(Int index, IDirect3DDevice8 *device)
+	{
+		if (index == s_vrSkyLoaded && s_vrSkyTexture != nullptr)
+			return TRUE;
+		if (index < 0 || index >= s_vrSkyCount || device == nullptr)
+			return FALSE;
+
+		// PNG first: the shipped skies are lossless PNG; BMP stays as the fallback format.
+		const char *ext = strrchr(s_vrSkies[index].path, '.');
+		if (ext != nullptr && _stricmp(ext, ".png") == 0)
+		{
+			UnsignedByte *pixels = nullptr;
+			Int w = 0, h = 0, bpp = 0;
+			if (!vrDecodePng(s_vrSkies[index].path, &pixels, &w, &h, &bpp))
+			{
+				DEBUG_LOG(("OpenXR: sky: could not decode %s", s_vrSkies[index].path));
+				return FALSE;
+			}
+
+			if (s_vrSkyTexture != nullptr)
+			{
+				s_vrSkyTexture->Release();
+				s_vrSkyTexture = nullptr;
+			}
+			if (FAILED(device->CreateTexture(w, h, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED,
+				&s_vrSkyTexture)))
+			{
+				delete [] pixels;
+				return FALSE;
+			}
+
+			D3DLOCKED_RECT locked;
+			if (FAILED(s_vrSkyTexture->LockRect(0, &locked, nullptr, 0)))
+			{
+				delete [] pixels;
+				return FALSE;
+			}
+			for (Int y = 0; y < h; ++y)
+			{
+				const UnsignedByte *src = &pixels[y * w * bpp];
+				UnsignedInt *dest = (UnsignedInt *)((UnsignedByte *)locked.pBits + y * locked.Pitch);
+				for (Int x = 0; x < w; ++x)
+				{
+					const UnsignedByte r = src[x * bpp + 0];
+					const UnsignedByte g = src[x * bpp + 1];
+					const UnsignedByte b = src[x * bpp + 2];
+					dest[x] = 0xFF000000u | ((UnsignedInt)r << 16) | ((UnsignedInt)g << 8) | b;
+				}
+			}
+			s_vrSkyTexture->UnlockRect(0);
+			delete [] pixels;
+
+			s_vrSkyLoaded = index;
+			vrWrapSkyTexture();
+			DEBUG_LOG(("OpenXR: sky: loaded '%s' (%dx%d png)", s_vrSkies[index].name, w, h));
+			return TRUE;
+		}
+
+		FILE *f = fopen(s_vrSkies[index].path, "rb");
+		if (f == nullptr)
+			return FALSE;
+
+	#pragma pack(push, 1)
+		struct { UnsignedShort magic; UnsignedInt size; UnsignedInt reserved; UnsignedInt offset; } fh;
+		struct { UnsignedInt hsize; Int w; Int h; UnsignedShort planes; UnsignedShort bpp;
+			UnsignedInt compression; UnsignedInt imageSize; Int xppm; Int yppm;
+			UnsignedInt clrUsed; UnsignedInt clrImportant; } ih;
+	#pragma pack(pop)
+
+		if (fread(&fh, sizeof(fh), 1, f) != 1 || fread(&ih, sizeof(ih), 1, f) != 1
+			|| fh.magic != 0x4D42 || ih.bpp != 24 || ih.compression != 0 || ih.w <= 0)
+		{
+			DEBUG_LOG(("OpenXR: sky: %s is not a 24-bit uncompressed BMP", s_vrSkies[index].path));
+			fclose(f);
+			return FALSE;
+		}
+
+		const Int w = ih.w;
+		const Int h = (ih.h < 0) ? -ih.h : ih.h;
+		const Bool bottomUp = (ih.h > 0);
+		const Int rowSize = (w * 3 + 3) & ~3;
+
+		if (s_vrSkyTexture != nullptr)
+		{
+			REF_PTR_RELEASE(s_vrSkyTexClass);
+			s_vrSkyTexture->Release();
+			s_vrSkyTexture = nullptr;
+		}
+		if (FAILED(device->CreateTexture(w, h, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED,
+			&s_vrSkyTexture)))
+		{
+			fclose(f);
+			return FALSE;
+		}
+
+		D3DLOCKED_RECT locked;
+		if (FAILED(s_vrSkyTexture->LockRect(0, &locked, nullptr, 0)))
+		{
+			fclose(f);
+			return FALSE;
+		}
+
+		UnsignedByte *row = NEW UnsignedByte[rowSize];
+		fseek(f, (long)fh.offset, SEEK_SET);
+		for (Int y = 0; y < h; ++y)
+		{
+			if (fread(row, rowSize, 1, f) != 1)
+				break;
+			const Int destY = bottomUp ? (h - 1 - y) : y;
+			UnsignedInt *dest = (UnsignedInt *)((UnsignedByte *)locked.pBits + destY * locked.Pitch);
+			for (Int x = 0; x < w; ++x)
+			{
+				const UnsignedByte b = row[x * 3 + 0];
+				const UnsignedByte g = row[x * 3 + 1];
+				const UnsignedByte r = row[x * 3 + 2];
+				dest[x] = 0xFF000000u | ((UnsignedInt)r << 16) | ((UnsignedInt)g << 8) | b;
+			}
+		}
+		delete [] row;
+		s_vrSkyTexture->UnlockRect(0);
+		fclose(f);
+
+		s_vrSkyLoaded = index;
+		vrWrapSkyTexture();
+		DEBUG_LOG(("OpenXR: sky: loaded '%s' (%dx%d)", s_vrSkies[index].name, w, h));
+		return TRUE;
+	}
+
+	// The dome mesh: a unit sphere cap from a little below the horizon to the zenith, z-up as
+	// the world is. The seamless tile repeats four times around and twice up, which is what
+	// seamless art is for - no visible pole pinch, no seam.
+	const Int VR_SKY_RINGS = 12;
+	const Int VR_SKY_SEGS = 24;
+	struct VRSkyVert { float x, y, z, u, v; };
+	VRSkyVert s_skyVerts[(VR_SKY_RINGS + 1) * (VR_SKY_SEGS + 1)];
+	UnsignedShort s_skyIndices[VR_SKY_RINGS * VR_SKY_SEGS * 6];
+	Bool s_skyMeshBuilt = FALSE;
+
+	void vrBuildSkyMesh()
+	{
+		if (s_skyMeshBuilt)
+			return;
+		s_skyMeshBuilt = TRUE;
+
+		Int v = 0;
+		for (Int r = 0; r <= VR_SKY_RINGS; ++r)
+		{
+			const Real t = (Real)r / VR_SKY_RINGS;
+			const Real el = (Real)(-0.25 * M_PI) + t * (Real)(0.75 * M_PI);
+			for (Int s = 0; s <= VR_SKY_SEGS; ++s)
+			{
+				const Real az = (Real)s / VR_SKY_SEGS * 2.0f * (Real)M_PI;
+				s_skyVerts[v].x = (float)(cos(el) * cos(az));
+				s_skyVerts[v].y = (float)(cos(el) * sin(az));
+				s_skyVerts[v].z = (float)sin(el);
+				s_skyVerts[v].u = (float)s / VR_SKY_SEGS * 4.0f;
+				s_skyVerts[v].v = (1.0f - t) * 2.0f;
+				++v;
+			}
+		}
+
+		Int i = 0;
+		for (Int r = 0; r < VR_SKY_RINGS; ++r)
+		{
+			for (Int s = 0; s < VR_SKY_SEGS; ++s)
+			{
+				const Int a = r * (VR_SKY_SEGS + 1) + s;
+				const Int b = a + VR_SKY_SEGS + 1;
+				s_skyIndices[i++] = (UnsignedShort)a;
+				s_skyIndices[i++] = (UnsignedShort)b;
+				s_skyIndices[i++] = (UnsignedShort)(a + 1);
+				s_skyIndices[i++] = (UnsignedShort)(a + 1);
+				s_skyIndices[i++] = (UnsignedShort)b;
+				s_skyIndices[i++] = (UnsignedShort)(b + 1);
+			}
+		}
+	}
+
+	// EVERY DRAW HERE GOES THROUGH DX8Wrapper, like drawVRPanels - and for the same reason. The
+	// first version of this function talked to IDirect3DDevice8 directly and paid for it twice:
+	// the wrapper's cached state went stale (the recorded one-eye-flat failure, again), and the
+	// raw states it left behind - depth test off, above all - corrupted the stencil shadow
+	// volumes drawn later in the pass. Radius and centre are baked into the vertices so even the
+	// world transform stays identity: nothing changes behind the wrapper's back.
+	void vrDrawSky(const Vector3 &centre, Real radius)
+	{
+		if (s_vrSkyTexClass == nullptr)
+			return;
+		vrBuildSkyMesh();
+
+		static VertexMaterialClass *material = nullptr;
+		if (material == nullptr)
+			material = VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
+
+		const Int vertCount = (VR_SKY_RINGS + 1) * (VR_SKY_SEGS + 1);
+		const Int triCount = VR_SKY_RINGS * VR_SKY_SEGS * 2;
+
+		Matrix3D identity(1);
+		DX8Wrapper::Set_Transform(D3DTS_WORLD, identity);
+		DX8Wrapper::Set_Material(material);
+		DX8Wrapper::Set_Shader(ShaderClass(SC_VR_SKY));
+		DX8Wrapper::Set_Texture(0, s_vrSkyTexClass);
+
+		DynamicVBAccessClass vb_access(BUFFER_TYPE_DYNAMIC_DX8, DX8_FVF_XYZNDUV2, vertCount);
+		DynamicIBAccessClass ib_access(BUFFER_TYPE_DYNAMIC_DX8, triCount * 3);
+		{
+			DynamicVBAccessClass::WriteLockClass lock(&vb_access);
+			VertexFormatXYZNDUV2 *vb = lock.Get_Formatted_Vertex_Array();
+			DynamicIBAccessClass::WriteLockClass lockib(&ib_access);
+			UnsignedShort *ib = lockib.Get_Index_Array();
+			if (vb == nullptr || ib == nullptr)
+				return;
+
+			for (Int i = 0; i < vertCount; ++i)
+			{
+				vb[i].x = centre.X + s_skyVerts[i].x * radius;
+				vb[i].y = centre.Y + s_skyVerts[i].y * radius;
+				vb[i].z = centre.Z + s_skyVerts[i].z * radius;
+				vb[i].nx = -s_skyVerts[i].x;	// inward; unused unlit, but never left garbage
+				vb[i].ny = -s_skyVerts[i].y;
+				vb[i].nz = -s_skyVerts[i].z;
+				vb[i].diffuse = 0xFFFFFFFFu;	// white: the shader modulates, texture shows as-is
+				vb[i].u1 = s_skyVerts[i].u;
+				vb[i].v1 = s_skyVerts[i].v;
+				vb[i].u2 = 0.0f;
+				vb[i].v2 = 0.0f;
+			}
+			memcpy(ib, s_skyIndices, sizeof(s_skyIndices));
+		}
+
+		DX8Wrapper::Set_Index_Buffer(ib_access, 0);
+		DX8Wrapper::Set_Vertex_Buffer(vb_access);
+		DX8Wrapper::Draw_Triangles(0, triCount, 0, vertCount);
+		DX8Wrapper::Set_Texture(0, nullptr);
+	}
+}
+
+Int W3DDisplay::getVRSkyboxCount()
+{
+	vrEnumerateSkies();
+	return s_vrSkyCount;
+}
+
+const char *W3DDisplay::getVRSkyboxName(Int index)
+{
+	vrEnumerateSkies();
+	return (index >= 0 && index < s_vrSkyCount) ? s_vrSkies[index].name : "";
+}
+
 // W3DDisplay::drawVRScene ====================================================
 /** GeneralsVR @feature Stereo pass: render the 3D scene once per eye into the OpenXR render
 	* targets, then hand them to the runtime.
@@ -2102,7 +2574,24 @@ void W3DDisplay::drawVRScene( W3DView *view )
 		return;
 
 	const Bool inGame = (TheGameLogic != nullptr && TheGameLogic->isInGame());
-	TheOpenXR->setUiInGame(inGame);
+
+	// The game counts as 'in game' BEFORE the map is loaded, and the load itself blocks the
+	// whole engine: whatever we submit in these few frames is what the headset holds for the
+	// entire load. So while the world is not ready, the player gets a proper loading card on
+	// the menu screen instead of a stuck half-frame - and when the world arrives, it fades in
+	// from black instead of slamming.
+	const Bool mapReady = (TheTerrainRenderObject != nullptr
+		&& TheTerrainRenderObject->getMap() != nullptr);
+	const Bool worldReady = inGame && mapReady;
+
+	static Bool s_wasLoading = FALSE;
+	static UnsignedInt s_fadeInStart = 0;
+	const Bool loading = inGame && !mapReady;
+	if (s_wasLoading && worldReady)
+		s_fadeInStart = GetTickCount();	// the world just arrived: start the fade-in
+	s_wasLoading = loading;
+
+	TheOpenXR->setUiInGame(worldReady);
 
 	// Hold the shadow settings where VR needs them, every frame.
 	//
@@ -2114,7 +2603,9 @@ void W3DDisplay::drawVRScene( W3DView *view )
 	// accepted); decals stay ON for the game's other ground decals (tank tracks etc.).
 	if (TheWritableGlobalData != nullptr)
 	{
-		TheWritableGlobalData->m_useShadowVolumes = TRUE;
+		// The VR settings menu can turn unit shadows off; the re-assert still runs every frame
+		// so the LOD system's Options.ini re-reads cannot flip the choice behind our back.
+		TheWritableGlobalData->m_useShadowVolumes = TheWritableGlobalData->m_vrShadowsEnabled;
 		TheWritableGlobalData->m_useShadowDecals = TRUE;
 	}
 
@@ -2137,7 +2628,7 @@ void W3DDisplay::drawVRScene( W3DView *view )
 	Matrix3D anchor;
 	Real scale;
 
-	if (inGame)
+	if (worldReady)
 	{
 		if (view == nullptr || view->get3DCamera() == nullptr || m_3DScene == nullptr)
 			return;
@@ -2191,21 +2682,41 @@ void W3DDisplay::drawVRScene( W3DView *view )
 		// Far enough to hold the whole battlefield. The flat game clips much closer because it
 		// only ever looks at a small patch of map; in VR you look across the entire thing, and a
 		// horizon that eats the far half of the map is glaring.
-		vrCamera->Set_Clip_Planes(inGame ? (0.05f * scale) : 0.02f, inGame ? 120000.0f : 100.0f);
+		vrCamera->Set_Clip_Planes(worldReady ? (0.05f * scale) : 0.02f, worldReady ? 120000.0f : 100.0f);
 		vrCamera->Set_Viewport(Vector2(0.0f, 0.0f), Vector2(1.0f, 1.0f));
 
 		DX8Wrapper::Set_Render_Target(eyeSurface, TheOpenXR->getDepthSurface());
 
-		// Menus clear to black - the floating screen provides everything the player looks at, so
-		// anything else here would just be a coloured void behind it.
-		const Vector3 clearColor = inGame ? Vector3(0.05f, 0.10f, 0.30f)
-		                                  : Vector3(0.0f, 0.0f, 0.0f);
+		// The void around the battlefield: the player's chosen sky colour (VR settings menu,
+		// Graphics tab - the preset NAMES live there, keep the two lists in step). Menus and
+		// loading always clear to black; the screen provides everything there.
+		Vector3 sky(0.0f, 0.0f, 0.0f);	// 0: black
+		switch ((TheGlobalData != nullptr) ? TheGlobalData->m_vrSkyColorIndex : 0)
+		{
+			case 1: sky = Vector3(0.05f, 0.10f, 0.30f); break;	// midnight blue (the old default)
+			case 2: sky = Vector3(0.16f, 0.07f, 0.22f); break;	// dawn purple
+			case 3: sky = Vector3(0.12f, 0.13f, 0.15f); break;	// storm grey
+			case 4: sky = Vector3(0.03f, 0.11f, 0.07f); break;	// forest green
+			case 5: sky = Vector3(0.14f, 0.04f, 0.04f); break;	// ember red
+			default: break;
+		}
+		const Vector3 clearColor = worldReady ? sky : Vector3(0.0f, 0.0f, 0.0f);
 
 		if (WW3D::Begin_Render(true, true, clearColor) == WW3D_ERROR_OK)
 		{
 			vrCamera->Apply();
 
-			if (inGame)
+			// The chosen sky picture: an inward dome around the eye, drawn first with depth
+			// off so the battlefield paints straight over it. The device pointer is for
+			// texture CREATION only - the drawing itself goes through DX8Wrapper, always.
+			if (worldReady && TheGlobalData != nullptr && TheGlobalData->m_vrSkyColorIndex >= 6)
+			{
+				vrEnumerateSkies();
+				if (vrLoadSkyTexture(TheGlobalData->m_vrSkyColorIndex - 6, DX8Wrapper::_Get_D3D_Device8()))
+					vrDrawSky(eyeTransform.Get_Translation(), 60000.0f);
+			}
+
+			if (worldReady)
 				WW3D::Render(m_3DScene, vrCamera);
 
 			// The interface panels, as real geometry with real depth. They MUST be drawn before the
@@ -2218,22 +2729,44 @@ void W3DDisplay::drawVRScene( W3DView *view )
 			if (TheVRControls != nullptr && TheVRControls->getRayScene() != nullptr)
 				WW3D::Render(TheVRControls->getRayScene(), vrCamera);
 
+			// The fade-in from the loading card: a black wash over the finished eye image,
+			// thinning out over the first half second after the world arrives. Baked into the
+			// image itself, so hosted and direct get the identical fade.
+			if (s_fadeInStart != 0)
+			{
+				const UnsignedInt elapsed = GetTickCount() - s_fadeInStart;
+				const UnsignedInt FADE_MS = 500;
+				if (elapsed < FADE_MS)
+				{
+					const Int a = (Int)(255 - (255 * elapsed) / FADE_MS);
+					TheDisplay->drawFillRect(0, 0,
+						TheOpenXR->getEyeWidth(), TheOpenXR->getEyeHeight(),
+						GameMakeColor(0, 0, 0, a));
+				}
+				else
+				{
+					s_fadeInStart = 0;
+				}
+			}
+
 			WW3D::End_Render(false);  // no present: the image belongs to the headset
 		}
 
 		DX8Wrapper::Set_Render_Target((IDirect3DSurface8 *)nullptr);
 	}
 
-	// A movie has no interface to draw - it is painted straight to the backbuffer - so during one
-	// the VR screen shows the finished flat frame, and the player watches the intro in the
-	// headset instead of staring at a frozen image.
+	// A movie is painted straight to the backbuffer on the flat side - but in here it is just
+	// another 2D quad, so it is painted into the interface texture below and rides the SAME
+	// panel pipeline as the menus: stencil silhouette, black backing, the cinema screen. That
+	// works identically in hosted and direct mode. (The old approach - a compositor layer of
+	// the finished flat frame - was direct-only, and the hosted headset went black for the
+	// whole intro. m_showFlatFrame stays FALSE now; its plumbing is dormant.)
 	const Bool moviePlaying = isMoviePlaying();
-	TheOpenXR->setShowFlatFrame(moviePlaying);
 
 	// Draw the game's REAL interface into its own transparent layer for VR. This is the whole
 	// GUI - the same windows, sprites and menus the flat game draws - on a clear background, so
 	// the VR panel shows an actual menu rather than a rectangle cut out of the flat frame.
-	if (!moviePlaying && TheOpenXR->hasUiSurface() && TheInGameUI != nullptr)
+	if (TheOpenXR->hasUiSurface() && TheInGameUI != nullptr)
 	{
 		DX8Wrapper::Set_Render_Target(TheOpenXR->getUiSurface(), true /* default depth buffer */);
 
@@ -2280,7 +2813,35 @@ void W3DDisplay::drawVRScene( W3DView *view )
 			if (TheWritableGlobalData != nullptr)
 				TheWritableGlobalData->m_vrUiCapture = TRUE;
 
-			TheInGameUI->DRAW();	// this repaints the whole window system, menus included
+			if (moviePlaying)
+			{
+				// The intro film: the same scaled quad the flat game paints, painted here
+				// instead, inside the stencil mark - the menu screen shows it like any menu.
+				if (m_videoStream != nullptr && m_videoBuffer != nullptr)
+					drawScaledVideoBuffer(m_videoBuffer, m_videoStream);
+			}
+			else
+			{
+				// With a MODAL menu up (the Escape menu and what it opens), the whole frame
+				// gets a SOLID BLACK backing before the UI paints: those menus read as screens
+				// of their own. The promotion screen is not modal and keeps its transparency.
+				if (inGame && TheVRControls != nullptr && TheVRControls->isModalMenuOpen())
+					TheDisplay->drawFillRect(0, 0, (Int)getWidth(), (Int)getHeight(),
+						GameMakeColor(0, 0, 0, 255));
+
+				TheInGameUI->DRAW();	// this repaints the whole window system, menus included
+			}
+
+			// The VR settings layer paints OVER the game's UI: its badge on the in-game menu,
+			// or the whole settings panel. It lives only in this capture - the monitor never
+			// sees it, exactly like the panel cursor below. (Self-gating: draws nothing
+			// outside a battle, so it sits movies out by itself, as do the radials below.)
+			if (TheVRSettingsMenu != nullptr)
+				TheVRSettingsMenu->drawIntoCapture();
+
+			// The radial dials paint here too; their panel crops this region back out.
+			if (TheVRControls != nullptr)
+				TheVRControls->drawRadialsIntoCapture();
 
 			if (TheWritableGlobalData != nullptr)
 				TheWritableGlobalData->m_vrUiCapture = FALSE;
@@ -2299,7 +2860,10 @@ void W3DDisplay::drawVRScene( W3DView *view )
 			// that is out on the battlefield.
 			const Bool pointerOnUi = TheVRControls == nullptr
 				|| TheVRControls->isRayOnScreenPanel() || TheVRControls->isMouseActive();
-			if (TheMouse != nullptr && !worldCursorOwnsIt && pointerOnUi
+			// While the VR settings layer owns the pixel it draws its own pointer; two would lie.
+			const Bool settingsOwnIt = (TheVRSettingsMenu != nullptr
+				&& TheVRSettingsMenu->pointerConsumed());
+			if (TheMouse != nullptr && !worldCursorOwnsIt && pointerOnUi && !settingsOwnIt
 				&& (TheVRControls == nullptr || TheVRControls->isCursorActive()))
 			{
 				const ICoord2D &mp = TheMouse->getMouseStatus()->pos;
@@ -2322,6 +2886,54 @@ void W3DDisplay::drawVRScene( W3DView *view )
 				}
 				TheDisplay->drawFillRect(mp.x - 7, mp.y - 7, 14, 14, dark);
 				TheDisplay->drawFillRect(mp.x - 5, mp.y - 5, 10, 10, white);
+			}
+
+			// The loading card, painted over everything: solid black with the game's mark. The
+			// engine BLOCKS while the map loads, so these last frames are what the headset
+			// holds for the whole load - better a title card than a stuck half-frame. (Text
+			// mark for now; a real logo bitmap needs an asset name from the game's images.)
+			if (inGame && !mapReady)
+			{
+				TheDisplay->drawFillRect(0, 0, (Int)getWidth(), (Int)getHeight(),
+					GameMakeColor(0, 0, 0, 255));
+
+				static DisplayString *s_loadLine1 = nullptr;
+				static DisplayString *s_loadLine2 = nullptr;
+				if (s_loadLine1 == nullptr && TheDisplayStringManager != nullptr)
+				{
+					s_loadLine1 = TheDisplayStringManager->newDisplayString();
+					s_loadLine2 = TheDisplayStringManager->newDisplayString();
+					if (TheFontLibrary != nullptr)
+					{
+						if (s_loadLine1 != nullptr)
+							s_loadLine1->setFont(TheFontLibrary->getFont("Arial", 32, TRUE));
+						if (s_loadLine2 != nullptr)
+							s_loadLine2->setFont(TheFontLibrary->getFont("Arial", 56, TRUE));
+					}
+					UnicodeString u;
+					if (s_loadLine1 != nullptr)
+					{
+						u.set(L"COMMAND & CONQUER");
+						s_loadLine1->setText(u);
+					}
+					if (s_loadLine2 != nullptr)
+					{
+						u.set(L"GENERALS  ZERO HOUR");
+						s_loadLine2->setText(u);
+					}
+				}
+
+				const UnsignedInt gold = GameMakeColor(222, 178, 51, 255);
+				const UnsignedInt black = GameMakeColor(0, 0, 0, 255);
+				Int w1 = 0, h1 = 0, w2 = 0, h2 = 0;
+				if (s_loadLine1 != nullptr) s_loadLine1->getSize(&w1, &h1);
+				if (s_loadLine2 != nullptr) s_loadLine2->getSize(&w2, &h2);
+				const Int cardCx = (Int)getWidth() / 2;
+				const Int cardCy = (Int)getHeight() * 2 / 5;
+				if (s_loadLine1 != nullptr)
+					s_loadLine1->draw(cardCx - w1 / 2, cardCy - h1 - 6, gold, black);
+				if (s_loadLine2 != nullptr)
+					s_loadLine2->draw(cardCx - w2 / 2, cardCy + 6, gold, black);
 			}
 
 			if (dev != nullptr)

@@ -94,6 +94,11 @@ public:
 	/// laser aimed at a panel disappeared behind it, and the panel became a hard rectangle
 	/// stamped over the battlefield.
 	void drawVRPanels( const Matrix3D &anchor, Real scale );
+
+	/// GeneralsVR The optional sky pictures (Skies\*.bmp next to the exe). The VR settings menu
+	/// lists them after the plain colours; sky index 6+ in GlobalData selects picture index-6.
+	static Int getVRSkyboxCount();
+	static const char *getVRSkyboxName( Int index );
 	/// Duplicate the interface, blacken the copy, and stand the interface back on top of it, so
 	/// the panel's backing is the menu's own silhouette rather than a box drawn around it.
 	void composeVRUiPanel();
