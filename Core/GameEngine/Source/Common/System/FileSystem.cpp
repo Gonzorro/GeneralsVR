@@ -177,6 +177,34 @@ File*		FileSystem::openFile( const Char *filename, Int access, size_t bufferSize
 	USE_PERF_TIMER(FileSystem)
 	File *file = nullptr;
 
+	// GeneralsVR Enhanced assets: with the player's toggle on, a READ of any file that also
+	// exists under <exe>\Enhanced\ opens THAT copy instead. An upscale pack dropped in there
+	// shadows the originals file by file, and not a byte of the game install changes - flip
+	// the toggle off and the originals are simply read again.
+	if ( TheGlobalData != nullptr && TheGlobalData->m_vrEnhancedAssets
+		&& instance == 0
+		&& (access & (File::CREATE | File::WRITE)) == 0
+		&& TheLocalFileSystem != nullptr
+		&& filename != nullptr && strchr(filename, ':') == nullptr )
+	{
+		static char s_enhancedRoot[_MAX_PATH] = { 0 };
+		if (s_enhancedRoot[0] == 0)
+		{
+			GetModuleFileNameA(nullptr, s_enhancedRoot, _MAX_PATH);
+			if (char *pEnd = strrchr(s_enhancedRoot, '\\'))
+				*(pEnd + 1) = 0;
+			strlcat(s_enhancedRoot, "Enhanced\\", _MAX_PATH);
+		}
+		char overridePath[_MAX_PATH * 2];
+		snprintf(overridePath, sizeof(overridePath), "%s%s", s_enhancedRoot, filename);
+		if (TheLocalFileSystem->doesFileExist(overridePath))
+		{
+			file = TheLocalFileSystem->openFile(overridePath, access, bufferSize);
+			if (file != nullptr)
+				return file;
+		}
+	}
+
 	if ( TheLocalFileSystem != nullptr )
 	{
 		if (instance != 0)

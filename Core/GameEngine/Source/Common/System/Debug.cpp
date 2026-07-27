@@ -383,6 +383,18 @@ void DebugInit(int flags)
 			*(pEnd + 1) = 0;
 		}
 
+		// GeneralsVR The packaged layout keeps the exe in Data\ with a Debug\ folder beside it;
+		// when that folder exists, every log goes there instead of littering Data. Installs
+		// without the folder (and plain dev builds) keep writing next to the exe as always.
+		{
+			char debugDir[ _MAX_PATH ];
+			strcpy(debugDir, dirbuf);
+			strlcat(debugDir, "..\\Debug\\", ARRAY_SIZE(debugDir));
+			const DWORD attrs = ::GetFileAttributesA(debugDir);
+			if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY))
+				strcpy(dirbuf, debugDir);
+		}
+
 		static_assert(ARRAY_SIZE(theLogFileNamePrev) >= ARRAY_SIZE(dirbuf), "Incorrect array size");
 		strcpy(theLogFileNamePrev, dirbuf);
 		strlcat(theLogFileNamePrev, gAppPrefix, ARRAY_SIZE(theLogFileNamePrev));
