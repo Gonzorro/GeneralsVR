@@ -246,6 +246,25 @@ void MoveRectIntoOtherRect(const RECT& inner, const RECT& outer, int* x, int* y)
 }
 
 
+// GeneralsVR @bugfix GitHub issue #7: on at least one DXVK/Vulkan setup (Radeon Pro Vega 64 via
+// Bootcamp) Direct3DCreate8() - which DXVK backs with a Vulkan instance/ICD lookup - hard-crashes
+// instead of returning nullptr, taking the whole process down with no crash dump and no further
+// log line right after "Create Direct3D8". Guard the call so a broken driver/ICD downgrades to a
+// clean failure with a log line instead of silently killing the game. SEH needs a function with no
+// C++ objects to unwind, hence this tiny wrapper (same pattern as xrCreateSessionGuarded).
+static IDirect3D8* Direct3DCreate8Guarded(Direct3DCreate8Type createFn, UINT sdkVersion, unsigned long* crashCode)
+{
+	__try
+	{
+		return createFn(sdkVersion);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		*crashCode = GetExceptionCode();
+		return nullptr;
+	}
+}
+
 bool DX8Wrapper::Init(void * hwnd, bool lite)
 {
 	WWASSERT(!IsInitted);
@@ -303,12 +322,19 @@ bool DX8Wrapper::Init(void * hwnd, bool lite)
 		** Create the D3D interface object
 		*/
 		WWDEBUG_SAY(("Create Direct3D8"));
+		unsigned long createCrashCode = 0;
 		{
 			// TheSuperHackers @bugfix xezon 13/06/2025 Front load the system dbghelp.dll to prevent
 			// the graphics driver from potentially loading the old game dbghelp.dll and then crashing the game process.
 			DbgHelpGuard dbgHelpGuard;
 
-			D3DInterface = Direct3DCreate8Ptr(D3D_SDK_VERSION);		// TODO: handle failure cases...
+			D3DInterface = Direct3DCreate8Guarded(Direct3DCreate8Ptr, D3D_SDK_VERSION, &createCrashCode);
+		}
+		if (createCrashCode != 0) {
+			WWDEBUG_SAY(("Direct3DCreate8 CRASHED (exception 0x%08lX) - likely a broken Vulkan ICD under DXVK. "
+				"Update/verify your GPU driver's Vulkan support. Refusing to continue rather than take the process down.",
+				createCrashCode));
+			return(false);
 		}
 		if (D3DInterface == nullptr) {
 			return(false);
