@@ -228,8 +228,19 @@ OpenXRManager::~OpenXRManager()
 Bool OpenXRManager::hasExtension(const char* name) const
 {
 	uint32_t count = 0;
-	if (XR_FAILED(xrEnumerateInstanceExtensionProperties(nullptr, 0, &count, nullptr)) || count == 0)
+	// GeneralsVR @bugfix GitHub issue #5: when every extension check comes back false at once
+	// (vulkan2=0 vulkan1=0 d3d11=0 in the same log), it isn't that the runtime lacks graphics
+	// support - the loader could not enumerate ANY extensions, almost always because no OpenXR
+	// runtime is currently registered active (HKCU/HKLM ActiveRuntime). That previously looked
+	// identical to "SteamVR doesn't support Vulkan" in the log; log the XrResult so the two are
+	// distinguishable next time.
+	XrResult countResult = xrEnumerateInstanceExtensionProperties(nullptr, 0, &count, nullptr);
+	if (XR_FAILED(countResult) || count == 0)
+	{
+		DEBUG_LOG(("OpenXR: hasExtension('%s'): xrEnumerateInstanceExtensionProperties failed to list any extensions (result=%d, count=%u) - no active OpenXR runtime found? Is SteamVR (or your runtime) actually running and set active before launch?",
+			name, (int)countResult, count));
 		return FALSE;
+	}
 
 	std::vector<XrExtensionProperties> exts(count);
 	for (uint32_t i = 0; i < count; ++i)
