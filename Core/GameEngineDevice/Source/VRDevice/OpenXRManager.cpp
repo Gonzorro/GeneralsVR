@@ -32,6 +32,7 @@
 #include <d3d8.h>
 
 #include <string.h>
+#include <string>
 #include <vector>
 
 OpenXRManager* TheOpenXR = nullptr;
@@ -80,6 +81,61 @@ namespace
 	};
 
 	VulkanApi g_vk = {};
+
+	// GeneralsVR @diag GitHub issue #5: the fastest way to tell "no OpenXR runtime is active"
+	// apart from "the active runtime just has no Vulkan support" is to not trust the Steam/Meta/
+	// whatever app's own UI and read what the loader itself will actually use - the same registry
+	// keys and env var the Khronos loader consults, in the same order. Logged once, before the
+	// first enumerate call, so a report always carries the ground truth for this machine.
+	void logOpenXRRuntimeRegistration()
+	{
+		char envJson[MAX_PATH] = {};
+		DWORD envLen = GetEnvironmentVariableA("XR_RUNTIME_JSON", envJson, sizeof(envJson));
+		if (envLen > 0 && envLen < sizeof(envJson))
+		{
+			DEBUG_LOG(("OpenXR: env XR_RUNTIME_JSON='%s' (this overrides the registry and wins if set)", envJson));
+		}
+		else
+		{
+			DEBUG_LOG(("OpenXR: env XR_RUNTIME_JSON not set"));
+		}
+
+		struct { HKEY root; const char* rootName; REGSAM extraFlags; const char* viewName; } views[] =
+		{
+			{ HKEY_CURRENT_USER,  "HKCU", 0,                "native" },
+			{ HKEY_LOCAL_MACHINE, "HKLM", 0,                "native (WOW6432Node if this is a 32-bit process)" },
+			{ HKEY_LOCAL_MACHINE, "HKLM", KEY_WOW64_64KEY,  "64-bit view" },
+		};
+		for (const auto& v : views)
+		{
+			HKEY key = nullptr;
+			LONG openResult = RegOpenKeyExA(v.root, "SOFTWARE\\Khronos\\OpenXR\\1", 0,
+				KEY_QUERY_VALUE | v.extraFlags, &key);
+			if (openResult != ERROR_SUCCESS)
+			{
+				DEBUG_LOG(("OpenXR: registry %s\\SOFTWARE\\Khronos\\OpenXR\\1 (%s): not found (error %ld)",
+					v.rootName, v.viewName, openResult));
+				continue;
+			}
+			char path[MAX_PATH] = {};
+			DWORD pathSize = sizeof(path);
+			DWORD type = 0;
+			LONG readResult = RegQueryValueExA(key, "ActiveRuntime", nullptr, &type, (LPBYTE)path, &pathSize);
+			RegCloseKey(key);
+			if (readResult == ERROR_SUCCESS && type == REG_SZ)
+			{
+				DWORD attrs = GetFileAttributesA(path);
+				DEBUG_LOG(("OpenXR: registry %s\\...\\OpenXR\\1 (%s) ActiveRuntime='%s' (file %s)",
+					v.rootName, v.viewName, path,
+					attrs == INVALID_FILE_ATTRIBUTES ? "MISSING ON DISK" : "exists"));
+			}
+			else
+			{
+				DEBUG_LOG(("OpenXR: registry %s\\...\\OpenXR\\1 (%s): key exists but ActiveRuntime not readable (error %ld)",
+					v.rootName, v.viewName, readResult));
+			}
+		}
+	}
 
 	// GeneralsVR: the eye render targets are D3DFMT_A8R8G8B8, which DXVK backs with
 	// VK_FORMAT_B8G8R8A8_UNORM. Copying those bytes verbatim into a *_SRGB swapchain image of
@@ -248,8 +304,30 @@ Bool OpenXRManager::hasExtension(const char* name) const
 		exts[i] = XrExtensionProperties{};
 		exts[i].type = XR_TYPE_EXTENSION_PROPERTIES;
 	}
-	if (XR_FAILED(xrEnumerateInstanceExtensionProperties(nullptr, count, &count, exts.data())))
+	XrResult listResult = xrEnumerateInstanceExtensionProperties(nullptr, count, &count, exts.data());
+	if (XR_FAILED(listResult))
+	{
+		DEBUG_LOG(("OpenXR: hasExtension('%s'): second xrEnumerateInstanceExtensionProperties call failed (result=%d) after the count call succeeded with count=%u - odd, worth a closer look",
+			name, (int)listResult, count));
 		return FALSE;
+	}
+
+	// GeneralsVR @diag GitHub issue #5: dump the full list once (on the first extension probed
+	// each run, tagged so repeats are obvious in the log) so a report shows exactly what this
+	// runtime advertises, not just yes/no for the three bindings we care about.
+	static Bool loggedFullList = FALSE;
+	if (!loggedFullList)
+	{
+		loggedFullList = TRUE;
+		std::string joined;
+		for (uint32_t i = 0; i < count; ++i)
+		{
+			if (i > 0)
+				joined += ", ";
+			joined += exts[i].extensionName;
+		}
+		DEBUG_LOG(("OpenXR: runtime advertises %u extensions: %s", count, joined.c_str()));
+	}
 
 	for (uint32_t i = 0; i < count; ++i)
 	{
@@ -262,6 +340,9 @@ Bool OpenXRManager::hasExtension(const char* name) const
 //-------------------------------------------------------------------------------------------------
 Bool OpenXRManager::init()
 {
+	DEBUG_LOG(("OpenXR: init() starting"));
+	logOpenXRRuntimeRegistration();
+
 	m_supportsVulkan = hasExtension(XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME);
 	m_supportsVulkan1 = hasExtension(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
 	m_supportsD3D11 = hasExtension("XR_KHR_D3D11_enable");
